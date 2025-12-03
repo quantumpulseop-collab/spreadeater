@@ -15,12 +15,12 @@ if missing:
     sys.exit(1)
 
 # CONFIG
-SYMBOLS = ["TRADOORUSDT"]
-KUCOIN_SYMBOLS = ["TRADOORUSDTM"]
-NOTIONAL = float(os.getenv('NOTIONAL', "30.0"))
-LEVERAGE = int(os.getenv('LEVERAGE', "5"))
-ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "0.6"))
-PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "0.5"))
+SYMBOLS = ["PIPPINUSDT"]
+KUCOIN_SYMBOLS = ["PIPPINUSDTM"]
+NOTIONAL = float(os.getenv('NOTIONAL', "35.0"))
+LEVERAGE = int(os.getenv('LEVERAGE', "7"))
+ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "2.6"))
+PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "1.1"))
 MARGIN_BUFFER = float(os.getenv('MARGIN_BUFFER', "1.02"))
 
 # Liquidation watcher config (tunable)
