@@ -19,7 +19,7 @@ SYMBOLS = ["AIAUSDT"]
 KUCOIN_SYMBOLS = ["AIAUSDTM"]
 NOTIONAL = float(os.getenv('NOTIONAL', "50.0"))
 LEVERAGE = int(os.getenv('LEVERAGE', "10"))
-ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "3.6"))
+ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "3.45"))
 PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "0.55"))
 MARGIN_BUFFER = float(os.getenv('MARGIN_BUFFER', "1.02"))
 
