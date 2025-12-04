@@ -1,7 +1,9 @@
+ (1).py
 #!/usr/bin/env python3
 # MULTI-COIN 4x LIVE ARB BOT – Single coin TRUSTUSDT
 # Integrated improved liquidation protection (sustained-zero detection + targeted counterparty close)
-# FIXED: better KuCoin executed price/qty extraction and improved notional matching by base exposure
+# Modified to NEVER close positions if a rebalance attempt fails; instead we accept residual mismatch and keep positions active.
+# Also retains robust executed price/qty extraction and per-exchange notional matching.
 import os, sys, time, math, requests
 from datetime import datetime
 from dotenv import load_dotenv
@@ -16,12 +18,12 @@ if missing:
     sys.exit(1)
 
 # CONFIG
-SYMBOLS = ["RECALLUSDT"]
-KUCOIN_SYMBOLS = ["RECALLUSDTM"]
+SYMBOLS = ["HEIUSDT"]
+KUCOIN_SYMBOLS = ["HEIUSDTM"]
 NOTIONAL = float(os.getenv('NOTIONAL', "50.0"))
 LEVERAGE = int(os.getenv('LEVERAGE', "10"))
-ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "0.75"))
-PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "0.52"))
+ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "0.69"))
+PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "0.51"))
 MARGIN_BUFFER = float(os.getenv('MARGIN_BUFFER', "1.02"))
 
 # Liquidation watcher config (tunable)
@@ -743,10 +745,8 @@ def safe_create_order(exchange, side, notional, price, symbol, trigger_time=None
                 contract_size = float(market.get('contractSize') or market.get('info', {}).get('contractSize') or 1.0) if market else 1.0
                 # For Binance (base units) and KuCoin (contracts) the executed_qty we need is base units / contracts
                 if exchange.id == 'binance':
-                    # base units = notional / exec_price approximately
                     executed_qty = round_down(notional / exec_price, prec) if prec is not None else (notional / exec_price)
                 else:
-                    # KuCoin: contracts = (notional / exec_price) / contract_size
                     executed_qty = round_down((notional / exec_price) / contract_size, prec) if prec is not None else ((notional / exec_price) / contract_size)
             except Exception:
                 executed_qty = None
@@ -769,8 +769,6 @@ def safe_create_order(exchange, side, notional, price, symbol, trigger_time=None
             market = get_market(exchange, symbol)
             contract_size = float(market.get('contractSize') or market.get('info', {}).get('contractSize') or 1.0) if market else 1.0
             if executed_qty is not None and exec_price is not None:
-                # For Binance: executed_qty is base units -> implied = base * price * contract_size
-                # For KuCoin: executed_qty is contracts -> implied = contracts * contract_size * price
                 implied_exec_notional = float(executed_qty) * float(contract_size) * float(exec_price)
         except Exception:
             implied_exec_notional = None
@@ -1264,13 +1262,43 @@ while True:
                                             except Exception as e:
                                                 print(f"{datetime.now().isoformat()} Failed to start liquidation watcher: {e}")
                                         else:
-                                            print("Rebalance insufficient — closing both sides to avoid naked exposure")
-                                            close_all_and_wait()
+                                            # Previously we closed positions here. User requested NOT to close on rebalance failure.
+                                            print("Rebalance insufficient to meet mismatch tolerance, but per configuration we WILL NOT close positions.")
+                                            print(f"Residual mismatch remains: new_mismatch={new_mismatch:.3f}% -> accepting residual and keeping positions active.")
+                                            # Accept the trade with residual mismatch and continue
+                                            real_entry_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin
+                                            final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
+                                            entry_prices[sym]['kucoin'] = exec_price_kc
+                                            entry_prices[sym]['binance'] = exec_price_bin
+                                            entry_actual[sym]['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': exec_time_kc, 'exec_qty': exec_qty_kc, 'implied_notional': implied_kc, 'residual_mismatch_pct': new_mismatch, 'residual_diff_usd': abs(new_implied_bin-new_implied_kc)}
+                                            entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin, 'exec_qty': exec_qty_bin, 'implied_notional': implied_bin, 'residual_mismatch_pct': new_mismatch, 'residual_diff_usd': abs(new_implied_bin-new_implied_kc)}
+                                            entry_spreads[sym] = final_entry_spread
+                                            positions[sym] = 'caseA'
+                                            trade_start_balances[sym] = start_total_balance
                                             entry_confirm_count[sym] = 0
+                                            try:
+                                                _start_liquidation_watcher_for_symbol(sym, sym, kc_trade_sym)
+                                            except Exception as e:
+                                                print(f"{datetime.now().isoformat()} Failed to start liquidation watcher: {e}")
                                     else:
-                                        print("Rebalance order failed — closing both sides to avoid naked exposure")
-                                        close_all_and_wait()
+                                        # Rebalance failed (e.g., minimum order size or exchange rejection).
+                                        print("Rebalance order failed (possible min order size or rejection). Per configuration, DO NOT close positions.")
+                                        print(f"Residual mismatch: mismatch_pct={mismatch_pct:.3f}% diff=${diff_dollars:.6f}. Accepting residual and keeping positions active.")
+                                        # Accept with residual mismatch
+                                        real_entry_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin
+                                        final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
+                                        entry_prices[sym]['kucoin'] = exec_price_kc
+                                        entry_prices[sym]['binance'] = exec_price_bin
+                                        entry_actual[sym]['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': exec_time_kc, 'exec_qty': exec_qty_kc, 'implied_notional': implied_kc, 'residual_mismatch_pct': mismatch_pct, 'residual_diff_usd': diff_dollars}
+                                        entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin, 'exec_qty': exec_qty_bin, 'implied_notional': implied_bin, 'residual_mismatch_pct': mismatch_pct, 'residual_diff_usd': diff_dollars}
+                                        entry_spreads[sym] = final_entry_spread
+                                        positions[sym] = 'caseA'
+                                        trade_start_balances[sym] = start_total_balance
                                         entry_confirm_count[sym] = 0
+                                        try:
+                                            _start_liquidation_watcher_for_symbol(sym, sym, kc_trade_sym)
+                                        except Exception as e:
+                                            print(f"{datetime.now().isoformat()} Failed to start liquidation watcher: {e}")
                                 else:
                                     # diff too tiny to rebalance (rounded out), accept small mismatch
                                     print("Mismatch below REBALANCE_MIN_DOLLARS — accepting small residual exposure and proceeding.")
@@ -1438,13 +1466,41 @@ while True:
                                             except Exception as e:
                                                 print(f"{datetime.now().isoformat()} Failed to start liquidation watcher: {e}")
                                         else:
-                                            print("Rebalance insufficient — closing both sides to avoid naked exposure")
-                                            close_all_and_wait()
+                                            # Do NOT close positions on rebalance insufficient - accept residual
+                                            print("Rebalance insufficient to meet mismatch tolerance, but per configuration we WILL NOT close positions.")
+                                            print(f"Residual mismatch remains: new_mismatch={new_mismatch:.3f}% -> accepting residual and keeping positions active.")
+                                            real_entry_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc
+                                            final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
+                                            entry_prices[sym]['kucoin'] = exec_price_kc
+                                            entry_prices[sym]['binance'] = exec_price_bin
+                                            entry_actual[sym]['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': exec_time_kc, 'exec_qty': exec_qty_kc, 'implied_notional': implied_kc, 'residual_mismatch_pct': new_mismatch, 'residual_diff_usd': abs(new_implied_bin-new_implied_kc)}
+                                            entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin, 'exec_qty': exec_qty_bin, 'implied_notional': implied_bin, 'residual_mismatch_pct': new_mismatch, 'residual_diff_usd': abs(new_implied_bin-new_implied_kc)}
+                                            entry_spreads[sym] = final_entry_spread
+                                            positions[sym] = 'caseB'
+                                            trade_start_balances[sym] = start_total_balance
                                             entry_confirm_count[sym] = 0
+                                            try:
+                                                _start_liquidation_watcher_for_symbol(sym, sym, kc_trade_sym)
+                                            except Exception as e:
+                                                print(f"{datetime.now().isoformat()} Failed to start liquidation watcher: {e}")
                                     else:
-                                        print("Rebalance order failed — closing both sides to avoid naked exposure")
-                                        close_all_and_wait()
+                                        # Rebalance order failed (e.g., minimum contract order amount)
+                                        print("Rebalance order failed (possible min order size or rejection). Per configuration, DO NOT close positions.")
+                                        print(f"Residual mismatch: mismatch_pct={mismatch_pct:.3f}% diff=${diff_dollars:.6f}. Accepting residual and keeping positions active.")
+                                        real_entry_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc
+                                        final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
+                                        entry_prices[sym]['kucoin'] = exec_price_kc
+                                        entry_prices[sym]['binance'] = exec_price_bin
+                                        entry_actual[sym]['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': exec_time_kc, 'exec_qty': exec_qty_kc, 'implied_notional': implied_kc, 'residual_mismatch_pct': mismatch_pct, 'residual_diff_usd': diff_dollars}
+                                        entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin, 'exec_qty': exec_qty_bin, 'implied_notional': implied_bin, 'residual_mismatch_pct': mismatch_pct, 'residual_diff_usd': diff_dollars}
+                                        entry_spreads[sym] = final_entry_spread
+                                        positions[sym] = 'caseB'
+                                        trade_start_balances[sym] = start_total_balance
                                         entry_confirm_count[sym] = 0
+                                        try:
+                                            _start_liquidation_watcher_for_symbol(sym, sym, kc_trade_sym)
+                                        except Exception as e:
+                                            print(f"{datetime.now().isoformat()} Failed to start liquidation watcher: {e}")
                                 else:
                                     # diff too tiny to rebalance (rounded out), accept small mismatch
                                     print("Mismatch below REBALANCE_MIN_DOLLARS — accepting small residual exposure and proceeding.")
