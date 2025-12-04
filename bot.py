@@ -27,12 +27,12 @@ if missing:
     sys.exit(1)
 
 # CONFIG
-SYMBOLS = ["ARIAUSDT"]
-KUCOIN_SYMBOLS = ["ARIAUSDTM"]
+SYMBOLS = ["AIAUSDT"]
+KUCOIN_SYMBOLS = ["AIAUSDTM"]
 NOTIONAL = float(os.getenv('NOTIONAL', "50.0"))
 LEVERAGE = int(os.getenv('LEVERAGE', "10"))
-ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "0.7"))
-PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "0.6"))
+ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "2.5"))
+PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "0.55"))
 MARGIN_BUFFER = float(os.getenv('MARGIN_BUFFER', "1.02"))
 
 # Liquidation watcher config (tunable)
