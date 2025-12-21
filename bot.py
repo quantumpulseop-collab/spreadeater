@@ -41,7 +41,7 @@ SYMBOLS = ["LIGHTUSDT"]
 KUCOIN_SYMBOLS = ["LIGHTUSDTM"]
 NOTIONAL = float(os.getenv('NOTIONAL', "45.0"))
 LEVERAGE = int(os.getenv('LEVERAGE', "5"))
-ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "1.7"))
+ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "1.5"))
 PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "0.8"))
 MARGIN_BUFFER = float(os.getenv('MARGIN_BUFFER', "1.02"))
 
