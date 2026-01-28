@@ -99,15 +99,13 @@ def fix_time_offset():
 
 fix_time_offset()
 
-# Logging
+# Logging - FIXED: Set console handler to DEBUG for Railway visibility
 logger = logging.getLogger("arb_integrated")
 logger.setLevel(logging.DEBUG)
-# Force StreamHandler to stdout so hosted platforms (e.g. Railway) capture logs reliably
-ch = logging.StreamHandler(stream=sys.stdout)
-ch.setLevel(logging.DEBUG)
+ch = logging.StreamHandler()
+ch.setLevel(logging.DEBUG)  # Changed from INFO to DEBUG
 ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
 logger.addHandler(ch)
-logger.propagate = False
 fh = RotatingFileHandler("arb_integrated.log", maxBytes=8_000_000, backupCount=5)
 fh.setLevel(logging.DEBUG)
 fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
@@ -1902,6 +1900,54 @@ def funding_round_accounting_loop():
             logger.exception("Funding accounting loop fatal error")
             time.sleep(5)
 
+def periodic_summary_loop():
+    """Send status updates every 60 seconds"""
+    while True:
+        try:
+            time.sleep(60)  # Every 1 minute
+            
+            if active_trade.get('symbol'):
+                sym = active_trade['symbol']
+                case = active_trade.get('case', 'N/A')
+                avg_spread = active_trade.get('avg_entry_spread', 0.0)
+                avg_count = active_trade.get('avg_count', 0)
+                total_not = active_trade.get('total_notional', 0.0)
+                funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
+                
+                # Get current spread
+                with candidates_shared_lock:
+                    info = candidates_shared.get(sym)
+                current_spread = info.get('max_spread', 0.0) if info else 0.0
+                
+                summary = (
+                    f"📊 *BOT STATUS SUMMARY*\n"
+                    f"Active Trade: `{sym}` ({case})\n"
+                    f"Entry Spread: `{avg_spread:.4f}%` (avg of {avg_count} entries)\n"
+                    f"Current Spread: `{current_spread:.4f}%`\n"
+                    f"Total Notional: `${total_not:.2f}`\n"
+                    f"Funding Cost: `{funding_acc:.4f}%`\n"
+                    f"{timestamp()}"
+                )
+            else:
+                # No active trade
+                with candidates_shared_lock:
+                    num_candidates = len(candidates_shared)
+                
+                summary = (
+                    f"📊 *BOT STATUS SUMMARY*\n"
+                    f"Status: `SCANNING`\n"
+                    f"Active Trade: `None`\n"
+                    f"Candidates Found: `{num_candidates}`\n"
+                    f"{timestamp()}"
+                )
+            
+            logger.info("Sending periodic summary")
+            send_telegram(summary)
+            
+        except Exception:
+            logger.exception("Error in periodic_summary_loop")
+            time.sleep(5)
+
 def periodic_trade_maintenance_loop():
     last_full_scan = 0
     while True:
@@ -2010,12 +2056,15 @@ def start_background_threads():
     t_maint.start()
     t_fund = threading.Thread(target=funding_round_accounting_loop, daemon=True)
     t_fund.start()
-    logger.info("Background threads started")
+    t_summary = threading.Thread(target=periodic_summary_loop, daemon=True)  # NEW
+    t_summary.start()
+    logger.info("Background threads started (including summary loop)")
 
 start_background_threads()
 
 terminate_bot = False
-send_telegram("Integrated Arb Bot started — spread alerts and trade updates will be posted to Telegram.")
+logger.info("🚀 Bot initialization complete - sending startup message")
+send_telegram("🚀 Integrated Arb Bot started — spread alerts and trade updates will be posted to Telegram.")
 
 # Main loop — with 3 confirmations for entry
 try:
