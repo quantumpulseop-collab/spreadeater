@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
-# FULL BOT - single-file copy
-# Goal: ensure correct executed price for KuCoin by polling REST endpoints (no websockets).
-# Includes:
-#  - robust extraction of executed price/qty/time
-#  - poll_kucoin_until_filled() that aggregates fetch_order / fetch_my_trades until authoritative fill info is found
-#  - safe_create_order uses poller for KuCoin to ensure correct exec price/qty
-#  - rebalance behavior: KuCoin left unchanged after entry; only Binance adjusted
-#  - stop placement (reduceOnly stop-market) attempted after entries
-#  - liquidation watcher with immediate single-confirm action when counterpart drops to zero
-#
-# NOTE: This file is intended to be pasted as a full replacement for your bot.py.
-# Test on dry-run or testnet before running live.
+# Integrated Arb Bot: dynamic scanner + spreadeater trading engine
+# - Monitors market, picks max positive and max negative spreads each scan
+# - Evaluates funding-aware entry cases and executes pair trades (one at a time)
+# - Averaging, stop updates, liquidation watcher, funding-round accounting, big-spread takeover
+# - Sends spread alerts and trade updates to same TELEGRAM_CHAT_IDS (from spreadwatcher)
+# WARNING: This is a live trading bot (DRY_RUN=False by default). Test carefully.
 
 import os
 import sys
@@ -21,9 +15,13 @@ import threading
 from datetime import datetime
 from dotenv import load_dotenv
 import ccxt
+import logging
+from logging.handlers import RotatingFileHandler
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv()
 
+# -------------------- ENV / REQUIRED KEYS --------------------
 REQUIRED = [
     'BINANCE_API_KEY',
     'BINANCE_API_SECRET',
@@ -36,38 +34,57 @@ if missing:
     print(f"ERROR: Missing .env keys: {', '.join(missing)}")
     sys.exit(1)
 
-# CONFIG
-SYMBOLS = ["LIGHTUSDT"]
-KUCOIN_SYMBOLS = ["LIGHTUSDTM"]
-NOTIONAL = float(os.getenv('NOTIONAL', "45.0"))
+# -------------------- Configuration (defaults + your cases) --------------------
+NOTIONAL = float(os.getenv('NOTIONAL', "10.0"))            # initial notional per side
 LEVERAGE = int(os.getenv('LEVERAGE', "5"))
+# ENTRY_SPREAD and PROFIT_TARGET from spreadeater retained but primary logic comes from cases below
 ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "1.3"))
 PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "0.7"))
-MARGIN_BUFFER = float(os.getenv('MARGIN_BUFFER', "1.02"))
 
-# Liquidation watcher config
 WATCHER_POLL_INTERVAL = float(os.getenv('WATCHER_POLL_INTERVAL', "0.5"))
 WATCHER_DETECT_CONFIRM = int(os.getenv('WATCHER_DETECT_CONFIRM', "2"))
 
-# Notional / rebalance config
 MAX_NOTIONAL_MISMATCH_PCT = float(os.getenv('MAX_NOTIONAL_MISMATCH_PCT', "0.5"))
 REBALANCE_MIN_DOLLARS = float(os.getenv('REBALANCE_MIN_DOLLARS', "0.5"))
-
-# Stop order buffer (2% from liquidation by default)
 STOP_BUFFER_PCT = float(os.getenv('STOP_BUFFER_PCT', "0.02"))
-
-# KuCoin transient error handling
 KC_TRANSIENT_ERROR_THRESHOLD = int(os.getenv('KC_TRANSIENT_ERROR_THRESHOLD', "10"))
 KC_TRANSIENT_BACKOFF_SECONDS = float(os.getenv('KC_TRANSIENT_BACKOFF_SECONDS', "2.0"))
 
+# Your specified cases and behavior
+FR_ADVANTAGE_THRESHOLD = 0.3               # percent (0.3%)
+CASE1_MIN_SPREAD = 1.5                     # percent
+CASE2_MULT = 13.0
+CASE3_MULT = 15.0
+BIG_SPREAD_THRESHOLD = 7.5                 # percent
+BIG_SPREAD_ENTRY_MULTIPLIER = 2            # 2x notional for big-spread takeover
+MAX_AVERAGES = 2                           # allow up to 2 averages
+AVERAGE_TRIGGER_MULTIPLIER = 2.0           # average when current spread >= 2x avg_entry
+TAKE_PROFIT_FACTOR = 0.5                   # target = 50% of entry spread
+SCAN_THRESHOLD = 0.25
+ALERT_THRESHOLD = 5.0
+ALERT_COOLDOWN = 60
+CONFIRM_RETRY_DELAY = 0.5
+CONFIRM_RETRIES = 2
+MONITOR_DURATION = 60
+MONITOR_POLL = 2
+MAX_WORKERS = 12
+SCANNER_FULL_INTERVAL = 120  # seconds between full scans during active trade
+
+# Telegram (kept from spreadwatcher)
+TELEGRAM_TOKEN = "8589870096:AAHahTpg6LNXbUwUMdt3q2EqVa2McIo14h8"
+TELEGRAM_CHAT_IDS = ["5054484162", "497819952"]
+
+# Live mode as requested
+DRY_RUN = False
+
 print(f"\n{'='*72}")
-print(f"SINGLE COIN 4x LIVE ARB BOT | NOTIONAL ${NOTIONAL} @ {LEVERAGE}x | ENTRY >= {ENTRY_SPREAD}% | PROFIT TARGET {PROFIT_TARGET}%")
-print(f"Tracking symbol: {SYMBOLS[0]}")
-print(f"NOTIONAL mismatch tolerance: {MAX_NOTIONAL_MISMATCH_PCT}% | REBALANCE_MIN_DOLLARS: ${REBALANCE_MIN_DOLLARS}")
-print(f"STOP_BUFFER_PCT: {STOP_BUFFER_PCT*100:.1f}%")
+print(f"INTEGRATED ARB BOT | NOTIONAL ${NOTIONAL} @ {LEVERAGE}x")
+print(f"Monitoring entire market; will evaluate top +ve and -ve spreads each scan.")
+print(f"Telegram alerts -> chat_ids: {TELEGRAM_CHAT_IDS}")
+print(f"DRY_RUN={DRY_RUN} | MAX_AVERAGES={MAX_AVERAGES} | BIG_SPREAD_THRESHOLD={BIG_SPREAD_THRESHOLD}%")
 print(f"{'='*72}\n")
 
-# Exchanges
+# -------------------- Exchanges --------------------
 binance = ccxt.binance({
     'apiKey': os.getenv('BINANCE_API_KEY'),
     'secret': os.getenv('BINANCE_API_SECRET'),
@@ -81,7 +98,6 @@ kucoin = ccxt.kucoinfutures({
     'enableRateLimit': True
 })
 
-# Time sync (best-effort)
 def fix_time_offset():
     try:
         server = requests.get("https://fapi.binance.com/fapi/v1/time", timeout=5).json().get('serverTime')
@@ -98,7 +114,273 @@ def fix_time_offset():
 
 fix_time_offset()
 
-# Helpers
+# -------------------- Logging --------------------
+logger = logging.getLogger("arb_integrated")
+logger.setLevel(logging.DEBUG)
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+ch_formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+ch.setFormatter(ch_formatter)
+logger.addHandler(ch)
+fh = RotatingFileHandler("arb_integrated.log", maxBytes=8_000_000, backupCount=5)
+fh.setLevel(logging.DEBUG)
+fh_formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+fh.setFormatter(fh_formatter)
+logger.addHandler(fh)
+
+def timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# -------------------- Telegram helper --------------------
+def send_telegram(message, chat_ids=None):
+    if chat_ids is None:
+        chat_ids = TELEGRAM_CHAT_IDS
+    for chat_id in chat_ids:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            resp = requests.get(url, params={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True
+            }, timeout=10)
+            if resp.status_code != 200:
+                logger.warning("Telegram non-200 response: %s %s", resp.status_code, resp.text[:200])
+        except Exception:
+            logger.exception("Failed to send Telegram message")
+
+# -------------------- Spreadwatcher scanner (kept logic) --------------------
+BINANCE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+BINANCE_BOOK_URL = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
+BINANCE_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol={symbol}"
+KUCOIN_ACTIVE_URL = "https://api-futures.kucoin.com/api/v1/contracts/active"
+KUCOIN_TICKER_URL = "https://api-futures.kucoin.com/api/v1/ticker?symbol={symbol}"
+
+def normalize(sym):
+    if not sym:
+        return sym
+    s = sym.upper()
+    if s.endswith("USDTM"):
+        return s[:-1]
+    if s.endswith("USDTP"):
+        return s[:-1]
+    if s.endswith("M"):
+        return s[:-1]
+    return s
+
+def get_binance_symbols(retries=2):
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(BINANCE_INFO_URL, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            syms = [s["symbol"] for s in data.get("symbols", [])
+                    if s.get("contractType") == "PERPETUAL" and s.get("status") == "TRADING"]
+            logger.debug("[BINANCE] fetched %d symbols (sample: %s)", len(syms), syms[:6])
+            return syms
+        except Exception as e:
+            logger.warning("[BINANCE] attempt %d error: %s", attempt, str(e))
+            if attempt == retries:
+                logger.exception("[BINANCE] final failure fetching symbols")
+                return []
+            time.sleep(0.7)
+
+def get_kucoin_symbols(retries=2):
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(KUCOIN_ACTIVE_URL, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            raw = data.get("data", []) if isinstance(data, dict) else []
+            syms = [s["symbol"] for s in raw if s.get("status", "").lower() == "open"]
+            logger.debug("[KUCOIN] fetched %d symbols (sample: %s)", len(syms), syms[:6])
+            return syms
+        except Exception as e:
+            logger.warning("[KUCOIN] attempt %d error: %s", attempt, str(e))
+            if attempt == retries:
+                logger.exception("[KUCOIN] final failure fetching symbols")
+                return []
+            time.sleep(0.7)
+
+def get_common_symbols():
+    bin_syms = get_binance_symbols()
+    ku_syms = get_kucoin_symbols()
+    bin_set = {normalize(s) for s in bin_syms}
+    ku_set = {normalize(s) for s in ku_syms}
+    common = bin_set.intersection(ku_set)
+    ku_map = {}
+    dup_count = 0
+    for s in ku_syms:
+        n = normalize(s)
+        if n in ku_map and ku_map[n] != s:
+            dup_count += 1
+        else:
+            ku_map[n] = s
+    if dup_count:
+        logger.warning("Duplicate normalized KuCoin symbols detected: %d (kept first)", dup_count)
+    logger.info("Common symbols: %d (sample: %s)", len(common), list(common)[:8])
+    return common, ku_map
+
+def get_binance_book(retries=1):
+    for attempt in range(1, retries+1):
+        try:
+            r = requests.get(BINANCE_BOOK_URL, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            out = {}
+            for d in data:
+                try:
+                    out[d["symbol"]] = {"bid": float(d["bidPrice"]), "ask": float(d["askPrice"])}
+                except Exception:
+                    continue
+            logger.debug("[BINANCE_BOOK] entries: %d", len(out))
+            return out
+        except Exception:
+            logger.exception("[BINANCE_BOOK] fetch error")
+            if attempt == retries:
+                return {}
+            time.sleep(0.5)
+
+def get_binance_price(symbol, session, retries=1):
+    for attempt in range(1, retries+1):
+        try:
+            url = BINANCE_TICKER_URL.format(symbol=symbol)
+            r = session.get(url, timeout=6)
+            if r.status_code != 200:
+                logger.debug("Binance ticker non-200 %s for %s: %s", r.status_code, symbol, r.text[:200])
+                return None, None
+            d = r.json()
+            bid = float(d.get("bidPrice") or 0)
+            ask = float(d.get("askPrice") or 0)
+            if bid <= 0 or ask <= 0:
+                return None, None
+            return bid, ask
+        except Exception:
+            logger.debug("Binance price fetch failed for %s (attempt %d)", symbol, attempt)
+            if attempt == retries:
+                logger.exception("Binance price final failure for %s", symbol)
+                return None, None
+            time.sleep(0.2)
+
+def get_kucoin_price_once(symbol, session, retries=1):
+    for attempt in range(1, retries+1):
+        try:
+            url = KUCOIN_TICKER_URL.format(symbol=symbol)
+            r = session.get(url, timeout=6)
+            if r.status_code != 200:
+                logger.debug("KuCoin ticker non-200 %s for %s: %s", r.status_code, symbol, r.text[:200])
+                return None, None
+            data = r.json()
+            d = data.get("data", {}) if isinstance(data, dict) else {}
+            bid = float(d.get("bestBidPrice") or d.get("bid") or 0)
+            ask = float(d.get("bestAskPrice") or d.get("ask") or 0)
+            if bid <= 0 or ask <= 0:
+                return None, None
+            return bid, ask
+        except Exception:
+            logger.debug("KuCoin price fetch failed for %s (attempt %d)", symbol, attempt)
+            if attempt == retries:
+                logger.exception("KuCoin price final failure for %s", symbol)
+                return None, None
+            time.sleep(0.2)
+
+def threaded_kucoin_prices(symbols):
+    prices = {}
+    if not symbols:
+        return prices
+    workers = min(MAX_WORKERS, max(4, len(symbols)))
+    with requests.Session() as session:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(get_kucoin_price_once, s, session): s for s in symbols}
+            for fut in as_completed(futures):
+                s = futures[fut]
+                try:
+                    bid, ask = fut.result()
+                    if bid and ask:
+                        prices[s] = {"bid": bid, "ask": ask}
+                except Exception:
+                    logger.exception("threaded_kucoin_prices: future error for %s", s)
+    logger.debug("[KUCOIN_BATCH] fetched %d/%d", len(prices), len(symbols))
+    return prices
+
+def calculate_spread(bin_bid, bin_ask, ku_bid, ku_ask):
+    try:
+        if not all([bin_bid, bin_ask, ku_bid, ku_ask]) or bin_ask <= 0 or bin_bid <= 0:
+            return None
+        pos = ((ku_bid - bin_ask) / bin_ask) * 100
+        neg = ((ku_ask - bin_bid) / bin_bid) * 100
+        if pos > 0.01:
+            return pos
+        if neg < -0.01:
+            return neg
+        return None
+    except Exception:
+        logger.exception("calculate_spread error")
+        return None
+
+# -------------------- Funding helpers --------------------
+BINANCE_FUND_URL = "https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}"
+KUCOIN_FUND_URL = "https://api-futures.kucoin.com/api/v1/funding-rate?symbol={symbol}"
+
+def fetch_binance_funding(symbol):
+    try:
+        r = requests.get(BINANCE_FUND_URL.format(symbol=symbol), timeout=6)
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        fr_raw = d.get('fundingRate') or d.get('lastFundingRate')
+        nft = d.get('nextFundingTime') or d.get('nextFundingRateTime')
+        fr = None
+        if fr_raw is not None:
+            fr = float(fr_raw) * 100.0 if abs(float(fr_raw)) < 1.0 else float(fr_raw)
+        next_ft = int(nft) if nft else None
+        return {'fundingRatePct': fr, 'nextFundingTimeMs': next_ft}
+    except Exception:
+        logger.exception("fetch_binance_funding error for %s", symbol)
+        return None
+
+def fetch_kucoin_funding(symbol):
+    try:
+        try:
+            fr_info = kucoin.fetchFundingRate(symbol)
+            if fr_info:
+                fr = fr_info.get('fundingRate') or fr_info.get('info', {}).get('fundingRate')
+                next_ft = fr_info.get('nextFundingTime') or fr_info.get('info', {}).get('nextFundingTime')
+                fr_pct = None
+                if fr is not None:
+                    fr_pct = float(fr) * 100.0 if abs(float(fr)) < 1.0 else float(fr)
+                return {'fundingRatePct': fr_pct, 'nextFundingTimeMs': int(next_ft) if next_ft else None}
+        except Exception:
+            pass
+        r = requests.get(KUCOIN_FUND_URL.format(symbol=symbol), timeout=6)
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        data = d.get('data') or {}
+        fr_raw = data.get('fundingRate') or data.get('fundingRate24h')
+        nft = data.get('nextFundingTime')
+        fr = None
+        if fr_raw is not None:
+            fr = float(fr_raw) * 100.0 if abs(float(fr_raw)) < 1.0 else float(fr_raw)
+        next_ft = int(nft) if nft else None
+        return {'fundingRatePct': fr, 'nextFundingTimeMs': next_ft}
+    except Exception:
+        logger.exception("fetch_kucoin_funding error for %s", symbol)
+        return None
+
+def compute_net_funding_for_plan(bin_fr_pct, kc_fr_pct, plan_long='binance', plan_short='kucoin'):
+    try:
+        fb = bin_fr_pct or 0.0
+        fk = kc_fr_pct or 0.0
+        if plan_long == 'binance' and plan_short == 'kucoin':
+            return fk - fb
+        elif plan_long == 'kucoin' and plan_short == 'binance':
+            return fb - fk
+        return 0.0
+    except Exception:
+        return 0.0
+
+# -------------------- Spreadeater core helpers (preserved) --------------------
 def ensure_markets_loaded():
     for ex in (binance, kucoin):
         try:
@@ -163,89 +445,34 @@ def resolve_kucoin_trade_symbol(exchange, raw_id):
             return sym
     return None
 
-KUCOIN_TRADE_SYMBOLS = [resolve_kucoin_trade_symbol(kucoin, k) for k in KUCOIN_SYMBOLS]
-
-# Set leverage & margin
-def set_leverage_and_margin():
-    for i, sym in enumerate(SYMBOLS):
-        try:
-            binance.set_leverage(LEVERAGE, sym)
-            print(f"Binance leverage set to {LEVERAGE}x for {sym}")
-        except Exception as e:
-            print(f"Binance leverage error for {sym}: {e}")
-        kc_sym = KUCOIN_TRADE_SYMBOLS[i]
-        if kc_sym:
-            try:
-                kucoin.set_leverage(LEVERAGE, kc_sym, {'marginMode': 'cross'})
-                print(f"KuCoin leverage set to {LEVERAGE}x CROSS for {kc_sym}")
-            except Exception as e:
-                print(f"KuCoin leverage error for {kc_sym}: {e}")
-
 ensure_markets_loaded()
-set_leverage_and_margin()
+
+def set_leverage_for_symbol(exchange, symbol):
+    try:
+        if exchange.id == 'binance':
+            exchange.set_leverage(LEVERAGE, symbol)
+            logger.info("Set leverage %dx for %s on Binance", LEVERAGE, symbol)
+        else:
+            try:
+                exchange.set_leverage(LEVERAGE, symbol, {'marginMode': 'cross'})
+                logger.info("Set leverage %dx for %s on KuCoin", LEVERAGE, symbol)
+            except Exception:
+                # some versions use different params
+                exchange.set_leverage(LEVERAGE, symbol)
+                logger.info("Set leverage %dx for %s on KuCoin (fallback)", LEVERAGE, symbol)
+    except Exception as e:
+        logger.exception("Leverage set error for %s on %s: %s", symbol, exchange.id, e)
 
 # State
 closing_in_progress = False
-positions = {s: None for s in SYMBOLS}
-trade_start_balances = {s: 0.0 for s in SYMBOLS}
-entry_spreads = {s: 0.0 for s in SYMBOLS}
-entry_prices = {s: {'binance': 0, 'kucoin': 0} for s in SYMBOLS}
-entry_actual = {s: {'binance': None, 'kucoin': None, 'trigger_time': None, 'trigger_price': None} for s in SYMBOLS}
-entry_confirm_count = {s: 0 for s in SYMBOLS}
-exit_confirm_count = {s: 0 for s in SYMBOLS}
-terminate_bot = False
-_liquidation_watchers = {}
-_last_known_positions = {s: {'bin': 0.0, 'kc': 0.0, 'kc_err_count': 0} for s in SYMBOLS}
+entry_spreads = {}
+entry_prices = {}
+entry_actual = {}
+positions = {}  # dynamic map
+_last_known_positions = {}
+entry_initial_qtys = {}
 
-# --- Balance / position readers ---
-def get_total_futures_balance():
-    try:
-        bal_bin = binance.fetch_balance(params={'type': 'future'})
-        bin_usdt = float(bal_bin.get('USDT', {}).get('total', 0.0))
-        bal_kc = kucoin.fetch_balance()
-        kc_usdt = float(bal_kc.get('USDT', {}).get('total', 0.0))
-        return bin_usdt + kc_usdt, bin_usdt, kc_usdt
-    except Exception as e:
-        print(f"Error fetching balances: {e}")
-        return 0.0, 0.0, 0.0
-
-def has_open_positions():
-    try:
-        for sym in SYMBOLS:
-            pos = binance.fetch_positions([sym])
-            if pos and abs(float(pos[0].get('positionAmt') or pos[0].get('contracts') or 0)) > 0:
-                return True
-        for kc_sym in KUCOIN_TRADE_SYMBOLS:
-            if not kc_sym:
-                continue
-            pos = kucoin.fetch_positions([kc_sym])
-            if pos:
-                raw = None
-                try:
-                    raw = pos[0].get('contracts') or pos[0].get('positionAmt') or 0
-                except Exception:
-                    raw = 0
-                try:
-                    if (not raw or float(raw) == 0) and isinstance(pos[0].get('info'), dict):
-                        info = pos[0].get('info') or {}
-                        if 'currentQty' in info:
-                            raw = info.get('currentQty')
-                        elif 'data' in info and isinstance(info.get('data'), dict) and 'currentQty' in info.get('data'):
-                            raw = info.get('data', {}).get('currentQty')
-                except Exception:
-                    pass
-                try:
-                    if raw is None:
-                        raw = 0
-                    if abs(float(raw)) > 0:
-                        return True
-                except Exception:
-                    pass
-        return False
-    except Exception:
-        return True
-
-# --- Robust position signed qty extractors ---
+# --- Position read & close helpers (adapted to dynamic) ---
 def _get_signed_from_binance_pos(pos):
     info = pos.get('info') or {}
     for fld in ('positionAmt',):
@@ -341,7 +568,49 @@ def _get_signed_position_amount(pos):
         pass
     return 0.0
 
-# --- Close helpers ---
+def fetch_position_info(exchange, symbol):
+    try:
+        pos_list = exchange.fetch_positions([symbol])
+    except Exception:
+        try:
+            pos_list = exchange.fetch_positions()
+        except Exception:
+            pos_list = []
+    if not pos_list:
+        return {'signed_qty': 0.0, 'liquidationPrice': None, 'side': None}
+    pos = pos_list[0]
+    signed = 0.0
+    try:
+        if exchange.id == 'binance':
+            signed = _get_signed_from_binance_pos(pos)
+        else:
+            signed = _get_signed_from_kucoin_pos(pos)
+    except Exception:
+        signed = _get_signed_position_amount(pos)
+    liq = None
+    info = pos.get('info') or {}
+    for fld in ('liquidationPrice', 'liquidation_price', 'liquidationPriceUsd', 'liquidation'):
+        if fld in pos and pos.get(fld):
+            try:
+                liq = float(pos.get(fld))
+                break
+            except Exception:
+                pass
+        if fld in info and info.get(fld):
+            try:
+                liq = float(info.get(fld))
+                break
+            except Exception:
+                pass
+    if liq is None:
+        try:
+            if isinstance(info.get('position'), dict) and info.get('position').get('liquidationPrice'):
+                liq = float(info.get('position').get('liquidationPrice'))
+        except Exception:
+            pass
+    side = 'long' if signed > 0 else ('short' if signed < 0 else None)
+    return {'signed_qty': float(signed or 0.0), 'liquidationPrice': liq, 'side': side}
+
 def close_single_exchange_position(exchange, symbol):
     try:
         pos_list = []
@@ -353,7 +622,7 @@ def close_single_exchange_position(exchange, symbol):
             except Exception:
                 pos_list = []
         if not pos_list:
-            print(f"{datetime.now().isoformat()} No positions returned for {exchange.id} {symbol} (treated as already closed).")
+            logger.info(f"{datetime.now().isoformat()} No positions returned for {exchange.id} {symbol} (treated as already closed).")
             return True
         pos = pos_list[0]
         raw_signed = None
@@ -366,7 +635,7 @@ def close_single_exchange_position(exchange, symbol):
             raw_signed = _get_signed_position_amount(pos)
         raw_signed = float(raw_signed or 0.0)
         if abs(raw_signed) == 0:
-            print(f"{datetime.now().isoformat()} No open qty to close for {exchange.id} {symbol}.")
+            logger.info(f"{datetime.now().isoformat()} No open qty to close for {exchange.id} {symbol}.")
             return True
         side = 'sell' if raw_signed > 0 else 'buy'
         qty = abs(raw_signed)
@@ -375,140 +644,137 @@ def close_single_exchange_position(exchange, symbol):
         qty_rounded = round_down(qty, prec) if prec is not None else qty
         if qty_rounded > 0:
             try:
-                print(f"{datetime.now().isoformat()} Submitting targeted reduceOnly market close on {exchange.id} {symbol} -> {side} {qty_rounded}")
+                logger.info(f"{datetime.now().isoformat()} Submitting targeted reduceOnly market close on {exchange.id} {symbol} -> {side} {qty_rounded}")
                 try:
                     exchange.create_market_order(symbol, side, qty_rounded, params={'reduceOnly': True, 'marginMode': 'cross'})
                 except TypeError:
                     exchange.create_order(symbol=symbol, type='market', side=side, amount=qty_rounded, params={'reduceOnly': True})
-                print(f"{datetime.now().isoformat()} Targeted reduceOnly close submitted on {exchange.id} {symbol}")
+                logger.info(f"{datetime.now().isoformat()} Targeted reduceOnly close submitted on {exchange.id} {symbol}")
                 return True
             except Exception as e:
-                err_text = str(e)
-                print(f"{datetime.now().isoformat()} Targeted reduceOnly close failed on {exchange.id} {symbol}: {err_text}")
+                logger.info(f"{datetime.now().isoformat()} Targeted reduceOnly close failed on {exchange.id} {symbol}: {e}")
                 try:
-                    print(f"{datetime.now().isoformat()} Trying closePosition fallback on {exchange.id} {symbol}")
+                    logger.info(f"{datetime.now().isoformat()} Trying closePosition fallback on {exchange.id} {symbol}")
                     try:
                         exchange.create_order(symbol=symbol, type='market', side=side, amount=None, params={'closePosition': True})
                     except TypeError:
                         exchange.create_order(symbol, 'market', side, params={'closePosition': True})
-                    print(f"{datetime.now().isoformat()} closePosition fallback submitted on {exchange.id} {symbol}")
+                    logger.info(f"{datetime.now().isoformat()} closePosition fallback submitted on {exchange.id} {symbol}")
                     return True
                 except Exception as e2:
-                    print(f"{datetime.now().isoformat()} closePosition fallback failed on {exchange.id} {symbol}: {e2}")
+                    logger.info(f"{datetime.now().isoformat()} closePosition fallback failed on {exchange.id} {symbol}: {e2}")
                     return False
         else:
             try:
-                print(f"{datetime.now().isoformat()} qty rounded to 0, using closePosition fallback on {exchange.id} {symbol}")
+                logger.info(f"{datetime.now().isoformat()} qty rounded to 0, using closePosition fallback on {exchange.id} {symbol}")
                 try:
                     exchange.create_order(symbol=symbol, type='market', side=side, amount=None, params={'closePosition': True})
                 except TypeError:
                     exchange.create_order(symbol, 'market', side, params={'closePosition': True})
-                print(f"{datetime.now().isoformat()} closePosition fallback submitted on {exchange.id} {symbol}")
+                logger.info(f"{datetime.now().isoformat()} closePosition fallback submitted on {exchange.id} {symbol}")
                 return True
             except Exception as e:
-                print(f"{datetime.now().isoformat()} closePosition fallback failed on {exchange.id} {symbol}: {e}")
+                logger.info(f"{datetime.now().isoformat()} closePosition fallback failed on {exchange.id} {symbol}: {e}")
                 return False
     except Exception as e:
-        print(f"{datetime.now().isoformat()} Error in close_single_exchange_position({exchange.id},{symbol}): {e}")
+        logger.exception("Error in close_single_exchange_position(%s,%s): %s", exchange.id, symbol, e)
         return False
 
 def close_all_and_wait(timeout_s=20, poll_interval=0.5):
     global closing_in_progress
     closing_in_progress = True
-    print("\n" + "="*72)
-    print("Closing all positions...")
-    print("="*72)
-    for sym in SYMBOLS:
+    logger.info("\n" + "="*72)
+    logger.info("Closing all positions...")
+    logger.info("="*72)
+    # Close all positions on Binance
+    try:
+        all_bin_pos = binance.fetch_positions()
+    except Exception:
+        all_bin_pos = []
+    for pos in all_bin_pos:
         try:
-            positions_bin = binance.fetch_positions([sym])
-            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Binance fetched positions for {sym}: {positions_bin}")
-        except Exception as e:
-            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Binance fetch_positions error for {sym}: {e}")
-            positions_bin = None
-        if positions_bin:
-            pos = positions_bin[0]
-            raw_signed = _get_signed_position_amount(pos)
-            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Binance raw positionAmt (signed) for {sym}: {raw_signed}")
-            if abs(raw_signed) > 0:
-                side = 'sell' if raw_signed > 0 else 'buy'
-                market = get_market(binance, sym)
-                prec = market.get('precision', {}).get('amount') if market else None
-                qty = round_down(abs(raw_signed), prec) if prec is not None else abs(raw_signed)
-                if qty > 0:
+            sym = pos.get('symbol') or (pos.get('info') or {}).get('symbol')
+            if not sym:
+                continue
+            signed = _get_signed_from_binance_pos(pos)
+            if abs(float(signed or 0)) == 0:
+                continue
+            side = 'sell' if signed > 0 else 'buy'
+            market = get_market(binance, sym)
+            prec = market.get('precision', {}).get('amount') if market else None
+            qty = round_down(abs(signed), prec) if prec is not None else abs(signed)
+            if qty > 0:
+                try:
+                    logger.info(f"Closing Binance {sym} {side} {qty}")
                     try:
-                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Attempting Binance qty-based reduceOnly close for {sym} -> {side} {qty}")
-                        try:
-                            binance.create_market_order(sym, side, qty, params={'reduceOnly': True})
-                        except TypeError:
-                            binance.create_order(symbol=sym, type='market', side=side, amount=qty, params={'reduceOnly': True})
-                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Binance qty-based reduceOnly close submitted for {sym}")
-                    except Exception as e:
-                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} BINANCE qty close failed for {sym}: {e}")
-                else:
-                    try:
-                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} qty<=0, using closePosition=True for Binance {sym}")
-                        try:
-                            binance.create_order(symbol=sym, type='market', side=side, amount=None, params={'closePosition': True})
-                        except TypeError:
-                            binance.create_order(symbol=sym, type='market', side=side, params={'closePosition': True})
-                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} BINANCE closePosition submitted for {sym}")
-                    except Exception as e:
-                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} BINANCE closePosition failed for {sym}: {e}")
-        time.sleep(0.15)
-        all_kc_positions = []
+                        binance.create_market_order(sym, side, qty, params={'reduceOnly': True})
+                    except TypeError:
+                        binance.create_order(symbol=sym, type='market', side=side, amount=qty, params={'reduceOnly': True})
+                except Exception as e:
+                    logger.exception("Error closing binance position %s: %s", sym, e)
+        except Exception:
+            continue
+    # Close all positions on KuCoin
+    try:
+        all_kc_pos = kucoin.fetch_positions()
+    except Exception:
+        all_kc_pos = []
+    for pos in all_kc_pos:
         try:
-            all_kc_positions = kucoin.fetch_positions(symbols=KUCOIN_TRADE_SYMBOLS)
-            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} KuCoin fetched all positions: {all_kc_positions}")
-        except Exception as e:
-            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Error fetching KuCoin positions via ccxt: {e}")
-        if not all_kc_positions:
-            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} No open positions found on KuCoin via ccxt.")
-        else:
-            for pos in all_kc_positions:
-                ccxt_sym = pos.get('symbol')
-                raw_qty_signed = 0.0
-                if isinstance(pos.get('info'), dict):
-                    raw_qty_signed = float(pos.get('info').get('currentQty') or 0)
-                if abs(raw_qty_signed) == 0:
-                    size = float(pos.get('size') or pos.get('contracts') or pos.get('positionAmt') or 0)
-                    if size > 0:
-                        side_norm = pos.get('side')
-                        raw_qty_signed = size * (-1 if side_norm == 'short' else 1)
-                if abs(raw_qty_signed) == 0:
-                    continue
-                if ccxt_sym not in KUCOIN_TRADE_SYMBOLS:
-                    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Skipping KuCoin position for untracked symbol: {ccxt_sym}")
-                    continue
-                side = 'sell' if raw_qty_signed > 0 else 'buy'
-                qty = abs(raw_qty_signed)
-                market = get_market(kucoin, ccxt_sym)
-                prec = market.get('precision', {}).get('amount') if market else None
-                qty = round_down(qty, prec) if prec is not None else qty
-                if qty > 0:
-                    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Closing KuCoin {ccxt_sym} {side} {qty} (raw_qty_signed={raw_qty_signed})")
-                    try:
-                        kucoin.create_market_order(ccxt_sym, side, qty, params={'reduceOnly': True, 'marginMode': 'cross'})
-                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} KuCoin close order submitted for {ccxt_sym}")
-                    except Exception as e:
-                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} KUCOIN close order failed for {ccxt_sym}: {e}")
+            sym = pos.get('symbol') or (pos.get('info') or {}).get('symbol')
+            if not sym:
+                continue
+            signed = _get_signed_from_kucoin_pos(pos)
+            if abs(float(signed or 0)) == 0:
+                continue
+            side = 'sell' if signed > 0 else 'buy'
+            market = get_market(kucoin, sym)
+            prec = market.get('precision', {}).get('amount') if market else None
+            qty = round_down(abs(signed), prec) if prec is not None else abs(signed)
+            if qty > 0:
+                try:
+                    logger.info(f"Closing KuCoin {sym} {side} {qty}")
+                    kucoin.create_market_order(sym, side, qty, params={'reduceOnly': True, 'marginMode': 'cross'})
+                except Exception as e:
+                    logger.exception("Error closing kucoin position %s: %s", sym, e)
+        except Exception:
+            continue
     start = time.time()
     while time.time() - start < timeout_s:
-        open_now = has_open_positions()
-        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Checking open positions... has_open_positions() => {open_now}")
-        if not open_now:
-            closing_in_progress = False
-            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} All positions closed and confirmed.")
-            total_bal, bin_bal, kc_bal = get_total_futures_balance()
-            print(f"*** POST-TRADE Total Balance: ${total_bal:.2f} (Binance: ${bin_bal:.2f} | KuCoin: ${kc_bal:.2f}) ***")
-            print("="*72)
-            return True
+        # check if any open positions remain
+        try:
+            bin_check = binance.fetch_positions()
+            kc_check = kucoin.fetch_positions()
+            any_open = False
+            for p in (bin_check or []):
+                if abs(float(_get_signed_from_binance_pos(p) or 0)) > 0:
+                    any_open = True
+                    break
+            if not any_open:
+                for p in (kc_check or []):
+                    if abs(float(_get_signed_from_kucoin_pos(p) or 0)) > 0:
+                        any_open = True
+                        break
+            logger.info("Checking open positions... any_open=%s", any_open)
+            if not any_open:
+                closing_in_progress = False
+                total_bal, bin_bal, kc_bal = 0.0, 0.0, 0.0
+                try:
+                    total_bal, bin_bal, kc_bal = (lambda: ( (binance.fetch_balance(params={'type':'future'}).get('USDT',{}).get('total',0.0) + kucoin.fetch_balance().get('USDT',{}).get('total',0.0)), binance.fetch_balance(params={'type':'future'}).get('USDT',{}).get('total',0.0), kucoin.fetch_balance().get('USDT',{}).get('total',0.0) ))()
+                except Exception:
+                    pass
+                logger.info("*** POST-TRADE Total Balance approx: %s (Binance:%s | KuCoin:%s)", total_bal, bin_bal, kc_bal)
+                logger.info("="*72)
+                return True
+        except Exception:
+            logger.exception("Error checking open positions in close_all_and_wait")
         time.sleep(poll_interval)
     closing_in_progress = False
-    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Timeout waiting for positions to close.")
-    print("="*72)
+    logger.info("Timeout waiting for positions to close.")
+    logger.info("="*72)
     return False
 
-# --- executed price/time/qty extractor (robust) ---
+# --- executed price/time/qty extractor (preserved) ---
 def extract_executed_price_time_qty(exchange, symbol, order_obj):
     try:
         if isinstance(order_obj, dict):
@@ -582,7 +848,6 @@ def extract_executed_price_time_qty(exchange, symbol, order_obj):
                 return exec_price, exec_time_iso, executed_qty
     except Exception:
         pass
-    # fetch_my_trades fallback
     try:
         now_ms = int(time.time() * 1000)
         trades = exchange.fetch_my_trades(symbol, since=now_ms-120000, limit=200)
@@ -634,7 +899,6 @@ def extract_executed_price_time_qty(exchange, symbol, order_obj):
         pass
     return None, None, None
 
-# --- KuCoin polling fallback (new) ---
 def _resolve_order_id(order_resp):
     if not order_resp:
         return None
@@ -750,13 +1014,30 @@ def poll_kucoin_until_filled(kucoin_exchange, create_order_resp, symbol, timeout
         pass
     return None, None, None
 
-# --- safe_create_order (uses poller for KuCoin) ---
 def safe_create_order(exchange, side, notional, price, symbol, trigger_time=None, trigger_price=None):
     amt, _, _, prec = compute_amount_for_notional(exchange, symbol, notional, price)
     amt = round_down(amt, prec) if prec is not None else amt
     if amt <= 0:
-        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} computed amt <=0, skipping order for {exchange.id} {symbol} (notional=${notional} price={price})")
+        logger.info(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} computed amt <=0, skipping order for {exchange.id} {symbol} (notional=${notional} price={price})")
         return False, None, None, None
+    if DRY_RUN:
+        logger.info(f"DRY RUN: would place {side} {amt} {symbol} on {exchange.id} at notional ${notional}")
+        try:
+            t = exchange.fetch_ticker(symbol)
+            mid = None
+            if t:
+                bid = t.get('bid') or t.get('bidPrice')
+                ask = t.get('ask') or t.get('askPrice')
+                if bid and ask:
+                    mid = (float(bid) + float(ask)) / 2.0
+                elif t.get('last'):
+                    mid = float(t.get('last'))
+            exec_price = mid
+            exec_time = datetime.utcnow().isoformat() + 'Z'
+            executed_qty = amt
+            return True, exec_price, exec_time, executed_qty
+        except Exception:
+            return True, price, datetime.utcnow().isoformat() + 'Z', amt
     try:
         order = None
         if exchange.id == 'binance':
@@ -779,7 +1060,6 @@ def safe_create_order(exchange, side, notional, price, symbol, trigger_time=None
 
         exec_price, exec_time, executed_qty = extract_executed_price_time_qty(exchange, symbol, order)
 
-        # For KuCoin: poll REST until authoritative fill info is available (no websockets)
         if exchange.id != 'binance':
             try:
                 px2, ts2, qty2 = poll_kucoin_until_filled(exchange, order, symbol, timeout_s=8.0, poll_interval=0.6)
@@ -790,7 +1070,7 @@ def safe_create_order(exchange, side, notional, price, symbol, trigger_time=None
                 if qty2 is not None:
                     executed_qty = qty2
             except Exception as e:
-                print(f"KuCoin polling fallback error: {e}")
+                logger.exception("KuCoin polling fallback error: %s", e)
 
         if executed_qty is None:
             try:
@@ -833,13 +1113,17 @@ def safe_create_order(exchange, side, notional, price, symbol, trigger_time=None
         except Exception:
             implied_exec_notional = None
 
-        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} {exchange.id.upper()} ORDER EXECUTED | {side.upper()} requested_amt={amt} {symbol} at market | exec_price={exec_price} exec_time={exec_time} executed_qty={executed_qty} implied_notional={implied_exec_notional} slippage={slippage} latency_ms={latency_ms}")
+        logger.info(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} {exchange.id.upper()} ORDER EXECUTED | {side.upper()} {symbol} | exec_price={exec_price} executed_qty={executed_qty} implied_notional={implied_exec_notional}")
+        msg = f"*TRADE EXECUTED* on `{exchange.id}` — {side.upper()} {symbol}\nprice: `{exec_price}`\nqty: `{executed_qty}`\nnotional: `{implied_exec_notional}`\n{timestamp()}"
+        try:
+            send_telegram(msg)
+        except Exception:
+            logger.exception("Failed to send Telegram trade exec message")
         return True, exec_price, exec_time, executed_qty
     except Exception as e:
-        print(f"{exchange.id.upper()} order failed: {e}")
+        logger.exception("%s order failed: %s", exchange.id.upper(), e)
         return False, None, None, None
 
-# --- match exposure function (unchanged) ---
 def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_symbol, desired_usdt, bin_price, kc_price):
     m_bin = get_market(bin_exchange, bin_symbol)
     m_kc = get_market(kc_exchange, kc_symbol)
@@ -893,194 +1177,25 @@ def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_s
         notional_kc = kc_contracts * float(kc_contract_size) * float(kc_price)
     return float(notional_bin), float(notional_kc), float(bin_base_amount), float(kc_contracts)
 
-# --- Prices via REST (bookTicker / kucoin ticker) ---
-def get_prices():
-    bin_prices = {}
-    kc_prices = {}
+# --- Price fetcher for spreadeater usage ---
+def get_prices_for_symbol(sym, ku_api_sym):
+    bin_bid = bin_ask = kc_bid = kc_ask = None
     try:
         data = requests.get("https://fapi.binance.com/fapi/v1/ticker/bookTicker", timeout=5).json()
-        for s in SYMBOLS:
-            for item in data:
-                if item['symbol'] == s:
-                    bin_prices[s] = (float(item['bidPrice']), float(item['askPrice']))
-                    break
-        for raw_id in KUCOIN_SYMBOLS:
-            resp = requests.get(f"https://api-futures.kucoin.com/api/v1/ticker?symbol={raw_id}", timeout=5).json()
-            d = resp.get('data', {})
-            kc_prices[raw_id] = (float(d.get('bestBidPrice', '0') or 0), float(d.get('bestAskPrice', '0') or 0))
+        for item in data:
+            if item['symbol'] == sym:
+                bin_bid = float(item['bidPrice']); bin_ask = float(item['askPrice'])
+                break
+        resp = requests.get(f"https://api-futures.kucoin.com/api/v1/ticker?symbol={ku_api_sym}", timeout=5).json()
+        d = resp.get('data', {})
+        kc_bid = float(d.get('bestBidPrice', '0') or 0); kc_ask = float(d.get('bestAskPrice', '0') or 0)
     except Exception:
         pass
-    return bin_prices, kc_prices
+    return bin_bid, bin_ask, kc_bid, kc_ask
 
-# --- Position info fetcher (used for stops) ---
-def fetch_position_info(exchange, symbol):
-    try:
-        pos_list = exchange.fetch_positions([symbol])
-    except Exception:
-        try:
-            pos_list = exchange.fetch_positions()
-        except Exception:
-            pos_list = []
-    if not pos_list:
-        return {'signed_qty': 0.0, 'liquidationPrice': None, 'side': None}
-    pos = pos_list[0]
-    signed = 0.0
-    try:
-        if exchange.id == 'binance':
-            signed = _get_signed_from_binance_pos(pos)
-        else:
-            signed = _get_signed_from_kucoin_pos(pos)
-    except Exception:
-        signed = _get_signed_position_amount(pos)
-    liq = None
-    info = pos.get('info') or {}
-    for fld in ('liquidationPrice', 'liquidation_price', 'liquidationPriceUsd', 'liquidation'):
-        if fld in pos and pos.get(fld):
-            try:
-                liq = float(pos.get(fld))
-                break
-            except Exception:
-                pass
-        if fld in info and info.get(fld):
-            try:
-                liq = float(info.get(fld))
-                break
-            except Exception:
-                pass
-    if liq is None:
-        try:
-            if isinstance(info.get('position'), dict) and info.get('position').get('liquidationPrice'):
-                liq = float(info.get('position').get('liquidationPrice'))
-        except Exception:
-            pass
-    side = 'long' if signed > 0 else ('short' if signed < 0 else None)
-    return {'signed_qty': float(signed or 0.0), 'liquidationPrice': liq, 'side': side}
+# -------------------- Liquidation watcher adapted to dynamic symbols --------------------
+_liquidation_watchers = {}
 
-# --- place_reduce_only_stop (best-effort) ---
-def place_reduce_only_stop(exchange, symbol, position_side, position_qty, liquidation_price, buffer_pct=STOP_BUFFER_PCT, exec_price_fallback=None):
-    if position_qty is None or position_qty <= 0:
-        print(f"{datetime.now().isoformat()} Cannot place stop for {exchange.id} {symbol}: position_qty invalid ({position_qty})")
-        return False
-    stop_side = 'sell' if position_side == 'long' else 'buy'
-    if liquidation_price is None:
-        if exec_price_fallback is None:
-            print(f"{datetime.now().isoformat()} Cannot place stop for {exchange.id} {symbol}: liquidation_price unknown and no fallback exec price provided")
-            return False
-        if position_side == 'long':
-            stop_price = float(exec_price_fallback) * (1.0 - buffer_pct)
-        else:
-            stop_price = float(exec_price_fallback) * (1.0 + buffer_pct)
-        print(f"{datetime.now().isoformat()} Using exec-price fallback for stop for {exchange.id} {symbol}: exec_price={exec_price_fallback} => stop_price={stop_price:.8f}")
-    else:
-        try:
-            if position_side == 'long':
-                stop_price = float(liquidation_price) * (1.0 + buffer_pct)
-            else:
-                stop_price = float(liquidation_price) * (1.0 - buffer_pct)
-        except Exception:
-            print(f"{datetime.now().isoformat()} Error computing stop_price for {exchange.id} {symbol} with liq={liquidation_price}")
-            return False
-
-    market = get_market(exchange, symbol)
-    prec = None
-    min_amount = None
-    if market:
-        prec = market.get('precision', {}).get('amount')
-        limits = market.get('limits') or {}
-        amt_lim = limits.get('amount') or {}
-        try:
-            if isinstance(amt_lim, dict):
-                min_amount = amt_lim.get('min')
-        except Exception:
-            min_amount = None
-
-    qty = round_down(position_qty, prec) if prec is not None else position_qty
-    if qty <= 0:
-        print(f"{datetime.now().isoformat()} Stop placement for {exchange.id} {symbol} skipped because qty rounded to 0 (raw={position_qty} prec={prec})")
-        return False
-    if min_amount is not None:
-        try:
-            if float(qty) < float(min_amount):
-                print(f"{datetime.now().isoformat()} Stop placement for {exchange.id} {symbol} skipped: qty {qty} < min_amount {min_amount}")
-                return False
-        except Exception:
-            pass
-
-    err_msgs = []
-    try:
-        params = {'reduceOnly': True, 'marginMode': 'cross', 'stopPrice': stop_price}
-        try:
-            exchange.create_order(symbol, 'STOP_MARKET', stop_side, qty, None, params)
-            print(f"{datetime.now().isoformat()} Placed STOP_MARKET reduceOnly on {exchange.id} {symbol} -> {stop_side} {qty} stopPrice={stop_price}")
-            return True
-        except Exception as e:
-            err_msgs.append(f"STOP_MARKET failed: {e}")
-    except Exception as e:
-        err_msgs.append(f"STOP_MARKET exception: {e}")
-    try:
-        params = {'reduceOnly': True, 'marginMode': 'cross', 'stopPrice': stop_price}
-        try:
-            exchange.create_order(symbol, 'market', stop_side, qty, None, params)
-            print(f"{datetime.now().isoformat()} Placed market stop (params.stopPrice) reduceOnly on {exchange.id} {symbol} -> {stop_side} {qty} stopPrice={stop_price}")
-            return True
-        except Exception as e:
-            err_msgs.append(f"market+stopPrice failed: {e}")
-    except Exception as e:
-        err_msgs.append(f"market+stopPrice exception: {e}")
-    try:
-        params = {'reduceOnly': True, 'marginMode': 'cross', 'stopPrice': stop_price, 'closePosition': True}
-        try:
-            exchange.create_order(symbol, 'market', stop_side, None, None, params)
-            print(f"{datetime.now().isoformat()} Placed closePosition stop reduceOnly on {exchange.id} {symbol} -> {stop_side} closePosition stopPrice={stop_price}")
-            return True
-        except Exception as e:
-            err_msgs.append(f"closePosition stop failed: {e}")
-    except Exception as e:
-        err_msgs.append(f"closePosition stop exception: {e}")
-
-    print(f"{datetime.now().isoformat()} Failed to place reduceOnly stop on {exchange.id} {symbol}. Attempts: {err_msgs}")
-    return False
-
-def try_place_stops_after_entry(sym, kc_trade_sym, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc):
-    try:
-        pos_kc = None
-        pos_bin = None
-        try:
-            pos_kc = fetch_position_info(kucoin, kc_trade_sym)
-            _last_known_positions[sym]['kc'] = pos_kc.get('signed_qty', 0.0)
-            _last_known_positions[sym]['kc_err_count'] = 0
-        except Exception:
-            _last_known_positions[sym]['kc_err_count'] = _last_known_positions[sym].get('kc_err_count', 0) + 1
-            pos_kc = {'signed_qty': _last_known_positions[sym]['kc'], 'liquidationPrice': None, 'side': None}
-            print(f"{datetime.now().isoformat()} Using last-known KuCoin qty due to fetch error: {_last_known_positions[sym]['kc']} (error_count={_last_known_positions[sym]['kc_err_count']})")
-        try:
-            pos_bin = fetch_position_info(binance, sym)
-            _last_known_positions[sym]['bin'] = pos_bin.get('signed_qty', 0.0)
-        except Exception:
-            pos_bin = {'signed_qty': _last_known_positions[sym].get('bin', 0.0), 'liquidationPrice': None, 'side': None}
-            print(f"{datetime.now().isoformat()} Binance fetch error for pos; using last-known bin qty: {_last_known_positions[sym].get('bin', 0.0)}")
-
-        print(f"{datetime.now().isoformat()} POST-ENTRY POS INFO | kc={pos_kc} | bin={pos_bin}")
-
-        qty_kc = abs(exec_qty_kc) if exec_qty_kc is not None else abs(pos_kc.get('signed_qty') or 0.0)
-        qty_bin = abs(exec_qty_bin) if exec_qty_bin is not None else abs(pos_bin.get('signed_qty') or 0.0)
-        liq_kc = pos_kc.get('liquidationPrice')
-        liq_bin = pos_bin.get('liquidationPrice')
-        side_kc = pos_kc.get('side')
-        side_bin = pos_bin.get('side')
-
-        print(f"{datetime.now().isoformat()} ATTEMPTING STOPS | kc_qty={qty_kc} kc_liq={liq_kc} kc_side={side_kc} | bin_qty={qty_bin} bin_liq={liq_bin} bin_side={side_bin}")
-
-        placed_kc = place_reduce_only_stop(kucoin, kc_trade_sym, side_kc, qty_kc, liq_kc, buffer_pct=STOP_BUFFER_PCT, exec_price_fallback=exec_price_kc)
-        placed_bin = place_reduce_only_stop(binance, sym, side_bin, qty_bin, liq_bin, buffer_pct=STOP_BUFFER_PCT, exec_price_fallback=exec_price_bin)
-
-        print(f"{datetime.now().isoformat()} STOP_PLACED_RESULT | kc={placed_kc} | bin={placed_bin}")
-        return placed_kc, placed_bin
-    except Exception as e:
-        print(f"{datetime.now().isoformat()} Error placing stops after entry: {e}")
-        return False, False
-
-# --- Liquidation watcher (immediate single-confirm on explicit zero, resilient to KuCoin 500s) ---
 def _fetch_signed_binance(sym):
     try:
         p = binance.fetch_positions([sym])
@@ -1089,7 +1204,7 @@ def _fetch_signed_binance(sym):
         pos = p[0]
         return _get_signed_from_binance_pos(pos)
     except Exception as e:
-        print(f"{datetime.utcnow().isoformat()} BINANCE fetch error for {sym}: {e}")
+        logger.info(f"{datetime.utcnow().isoformat()} BINANCE fetch error for {sym}: {e}")
         return None
 
 def _fetch_signed_kucoin(ccxt_sym):
@@ -1111,52 +1226,52 @@ def _fetch_signed_kucoin(ccxt_sym):
     except Exception as e:
         raise
 
-def _start_liquidation_watcher_for_symbol(sym, bin_sym, kc_sym):
-    if _liquidation_watchers.get(sym):
+def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
+    key = f"{sym}:{bin_sym}:{kc_ccxt_sym}"
+    if _liquidation_watchers.get(key):
         return
     stop_flag = threading.Event()
-    _liquidation_watchers[sym] = stop_flag
+    _liquidation_watchers[key] = stop_flag
 
     def monitor():
-        print(f"{datetime.now().isoformat()} Liquidation watcher STARTED for {sym} (bin:{bin_sym} kc:{kc_sym})")
-        prev_bin = _last_known_positions[sym].get('bin', 0.0)
-        prev_kc = _last_known_positions[sym].get('kc', 0.0)
+        logger.info(f"{datetime.now().isoformat()} Liquidation watcher STARTED for {sym} (bin:{bin_sym} kc:{kc_ccxt_sym})")
+        prev_bin = _last_known_positions.get(sym, {}).get('bin', 0.0)
+        prev_kc = _last_known_positions.get(sym, {}).get('kc', 0.0)
         zero_cnt_bin = 0
         zero_cnt_kc = 0
-        seen_nonzero_bin = abs(prev_bin) > 1e-12
-        seen_nonzero_kc = abs(prev_kc) > 1e-12
         ZERO_ABS_THRESHOLD = 1e-12
-
+        entry_bin_initial = entry_initial_qtys.get(sym, {}).get('bin', 0.0)
+        entry_kc_initial = entry_initial_qtys.get(sym, {}).get('kc', 0.0)
+        seen_nonzero_bin = abs(prev_bin) > ZERO_ABS_THRESHOLD or abs(entry_bin_initial) > ZERO_ABS_THRESHOLD
+        seen_nonzero_kc = abs(prev_kc) > ZERO_ABS_THRESHOLD or abs(entry_kc_initial) > ZERO_ABS_THRESHOLD
+        logger.info(f"{datetime.now().isoformat()} Watcher initial prev_bin={prev_bin} prev_kc={prev_kc} entry_bin_initial={entry_bin_initial} entry_kc_initial={entry_kc_initial}")
         while not stop_flag.is_set():
             try:
                 if closing_in_progress or positions.get(sym) is None:
                     zero_cnt_bin = zero_cnt_kc = 0
                     if positions.get(sym) is None:
-                        print(f"{datetime.now().isoformat()} Liquidation watcher stopping for {sym} because positions[sym] is None")
+                        logger.info(f"{datetime.now().isoformat()} Liquidation watcher stopping for {sym} because positions[sym] is None")
                         break
                     time.sleep(WATCHER_POLL_INTERVAL)
                     continue
-
                 cur_bin = _fetch_signed_binance(bin_sym)
                 if cur_bin is None:
-                    cur_bin = _last_known_positions[sym].get('bin', 0.0)
-                    print(f"{datetime.now().isoformat()} WATCHER BINANCE fetch error -> using last-known bin qty {cur_bin}")
+                    cur_bin = _last_known_positions.get(sym, {}).get('bin', 0.0)
+                    logger.info(f"{datetime.now().isoformat()} WATCHER BINANCE fetch error -> using last-known bin qty {cur_bin}")
                 else:
-                    _last_known_positions[sym]['bin'] = cur_bin
-
+                    _last_known_positions.setdefault(sym, {})['bin'] = cur_bin
                 cur_kc = None
                 try:
-                    cur_kc = _fetch_signed_kucoin(kc_sym)
-                    _last_known_positions[sym]['kc'] = cur_kc
-                    _last_known_positions[sym]['kc_err_count'] = 0
+                    cur_kc = _fetch_signed_kucoin(kc_ccxt_sym)
+                    _last_known_positions.setdefault(sym, {})['kc'] = cur_kc
+                    _last_known_positions.setdefault(sym, {})['kc_err_count'] = 0
                 except Exception as e:
-                    _last_known_positions[sym]['kc_err_count'] = _last_known_positions[sym].get('kc_err_count', 0) + 1
-                    print(f"{datetime.now().isoformat()} KUCOIN fetch error for {kc_sym}: {e} (consecutive_errors={_last_known_positions[sym]['kc_err_count']})")
-                    cur_kc = _last_known_positions[sym].get('kc', None)
+                    _last_known_positions.setdefault(sym, {})['kc_err_count'] = _last_known_positions.setdefault(sym, {}).get('kc_err_count', 0) + 1
+                    logger.info(f"{datetime.now().isoformat()} KUCOIN fetch error for {kc_ccxt_sym}: {e} (consecutive_errors={_last_known_positions[sym]['kc_err_count']})")
+                    cur_kc = _last_known_positions.get(sym, {}).get('kc', None)
                     if _last_known_positions[sym]['kc_err_count'] >= KC_TRANSIENT_ERROR_THRESHOLD:
-                        print(f"{datetime.now().isoformat()} KUCOIN persistent errors >= {KC_TRANSIENT_ERROR_THRESHOLD}; backing off")
+                        logger.info(f"{datetime.now().isoformat()} KUCOIN persistent errors >= {KC_TRANSIENT_ERROR_THRESHOLD}; backing off")
                         time.sleep(KC_TRANSIENT_BACKOFF_SECONDS * _last_known_positions[sym]['kc_err_count'])
-
                 try:
                     cur_bin_f = 0.0 if cur_bin is None else float(cur_bin)
                 except Exception:
@@ -1165,102 +1280,717 @@ def _start_liquidation_watcher_for_symbol(sym, bin_sym, kc_sym):
                     cur_kc_f = None if cur_kc is None else float(cur_kc)
                 except Exception:
                     cur_kc_f = None
-
                 if cur_kc_f is None:
-                    print(f"{datetime.now().isoformat()} WATCHER SKIP (no KuCoin reading available) prev_bin={prev_bin} prev_kc={prev_kc} cur_bin={cur_bin_f} cur_kc=None")
+                    logger.info(f"{datetime.now().isoformat()} WATCHER SKIP (no KuCoin reading available) prev_bin={prev_bin} prev_kc={prev_kc} cur_bin={cur_bin_f} cur_kc=None")
                     prev_bin = cur_bin_f
                     time.sleep(WATCHER_POLL_INTERVAL)
                     continue
-
                 cur_bin_abs = abs(cur_bin_f)
                 cur_kc_abs = abs(cur_kc_f)
                 prev_bin_abs = abs(prev_bin)
                 prev_kc_abs = abs(prev_kc)
-
-                # Immediate single-confirm detection: prev non-zero -> cur zero
-                if prev_bin_abs > ZERO_ABS_THRESHOLD and cur_bin_abs <= ZERO_ABS_THRESHOLD:
-                    print(f"{datetime.now().isoformat()} Detected immediate ZERO on Binance (prev non-zero -> now zero). Triggering immediate targeted close of KuCoin.")
+                bin_initial_nonzero = abs(entry_initial_qtys.get(sym, {}).get('bin', 0.0)) > ZERO_ABS_THRESHOLD
+                kc_initial_nonzero = abs(entry_initial_qtys.get(sym, {}).get('kc', 0.0)) > ZERO_ABS_THRESHOLD
+                if (prev_bin_abs > ZERO_ABS_THRESHOLD or bin_initial_nonzero) and cur_bin_abs <= ZERO_ABS_THRESHOLD:
+                    logger.info(f"{datetime.now().isoformat()} Detected immediate ZERO on Binance (prev non-zero -> now zero). Triggering immediate targeted close of KuCoin.")
                     try:
-                        ok = close_single_exchange_position(kucoin, kc_sym)
+                        ok = close_single_exchange_position(kucoin, kc_ccxt_sym)
                         if not ok:
-                            print(f"{datetime.now().isoformat()} Targeted KuCoin close failed; falling back to global close.")
+                            logger.info(f"{datetime.now().isoformat()} Targeted KuCoin close failed; falling back to global close.")
                         close_all_and_wait()
                     except Exception as e:
-                        print(f"{datetime.now().isoformat()} Error when closing after Binance immediate zero: {e}")
+                        logger.exception("Error when closing after Binance immediate zero: %s", e)
                     global terminate_bot
                     terminate_bot = True
                     break
-
-                if prev_kc_abs > ZERO_ABS_THRESHOLD and cur_kc_abs <= ZERO_ABS_THRESHOLD:
-                    print(f"{datetime.now().isoformat()} Detected immediate ZERO on KuCoin (prev non-zero -> now zero). Triggering immediate targeted close of Binance.")
+                if (prev_kc_abs > ZERO_ABS_THRESHOLD or kc_initial_nonzero) and cur_kc_abs <= ZERO_ABS_THRESHOLD:
+                    logger.info(f"{datetime.now().isoformat()} Detected immediate ZERO on KuCoin (prev non-zero -> now zero). Triggering immediate targeted close of Binance.")
                     try:
                         ok = close_single_exchange_position(binance, bin_sym)
                         if not ok:
-                            print(f"{datetime.now().isoformat()} Targeted Binance close failed; falling back to global close.")
+                            logger.info(f"{datetime.now().isoformat()} Targeted Binance close failed; falling back to global close.")
                         close_all_and_wait()
                     except Exception as e:
-                        print(f"{datetime.now().isoformat()} Error when closing after KuCoin immediate zero: {e}")
+                        logger.exception("Error when closing after KuCoin immediate zero: %s", e)
                     terminate_bot = True
                     break
-
-                # Sustained-zero detection
                 if cur_bin_abs > ZERO_ABS_THRESHOLD:
                     seen_nonzero_bin = True
                     zero_cnt_bin = 0
                 else:
                     if seen_nonzero_bin:
                         zero_cnt_bin += 1
-
                 if cur_kc_abs > ZERO_ABS_THRESHOLD:
                     seen_nonzero_kc = True
                     zero_cnt_kc = 0
                 else:
                     if seen_nonzero_kc:
                         zero_cnt_kc += 1
-
-                print(f"{datetime.now().isoformat()} WATCHER {sym} prev_bin={prev_bin_abs:.6f} cur_bin={cur_bin_abs:.6f} prev_kc={prev_kc_abs:.6f} cur_kc={cur_kc_abs:.6f} zero_cnt_bin={zero_cnt_bin}/{WATCHER_DETECT_CONFIRM} zero_cnt_kc={zero_cnt_kc}/{WATCHER_DETECT_CONFIRM}")
-
+                logger.debug(f"{datetime.now().isoformat()} WATCHER {sym} prev_bin={prev_bin_abs:.6f} cur_bin={cur_bin_abs:.6f} prev_kc={prev_kc_abs:.6f} cur_kc={cur_kc_abs:.6f} zero_cnt_bin={zero_cnt_bin}/{WATCHER_DETECT_CONFIRM} zero_cnt_kc={zero_cnt_kc}/{WATCHER_DETECT_CONFIRM}")
                 if zero_cnt_bin >= WATCHER_DETECT_CONFIRM:
-                    print(f"{datetime.now().isoformat()} Detected sustained ZERO on Binance -> targeted close KuCoin & cleanup.")
+                    logger.info(f"{datetime.now().isoformat()} Detected sustained ZERO on Binance -> targeted close KuCoin & cleanup.")
                     try:
-                        ok = close_single_exchange_position(kucoin, kc_sym)
+                        ok = close_single_exchange_position(kucoin, kc_ccxt_sym)
                         if not ok:
-                            print(f"{datetime.now().isoformat()} Targeted KuCoin close failed; falling back to global close.")
+                            logger.info(f"{datetime.now().isoformat()} Targeted KuCoin close failed; falling back to global close.")
                         close_all_and_wait()
                     except Exception as e:
-                        print(f"{datetime.now().isoformat()} Error when closing after Binance sustained zero: {e}")
+                        logger.exception("Error when closing after Binance sustained zero: %s", e)
                     terminate_bot = True
                     break
-
                 if zero_cnt_kc >= WATCHER_DETECT_CONFIRM:
-                    print(f"{datetime.now().isoformat()} Detected sustained ZERO on KuCoin -> targeted close Binance & cleanup.")
+                    logger.info(f"{datetime.now().isoformat()} Detected sustained ZERO on KuCoin -> targeted close Binance & cleanup.")
                     try:
                         ok = close_single_exchange_position(binance, bin_sym)
                         if not ok:
-                            print(f"{datetime.now().isoformat()} Targeted Binance close failed; falling back to global close.")
+                            logger.info(f"{datetime.now().isoformat()} Targeted Binance close failed; falling back to global close.")
                         close_all_and_wait()
                     except Exception as e:
-                        print(f"{datetime.now().isoformat()} Error when closing after KuCoin sustained zero: {e}")
+                        logger.exception("Error when closing after KuCoin sustained zero: %s", e)
                     terminate_bot = True
                     break
-
                 prev_bin = cur_bin_f
                 prev_kc = cur_kc_f
                 time.sleep(WATCHER_POLL_INTERVAL)
             except Exception as e:
-                print(f"{datetime.now().isoformat()} Liquidation watcher exception for {sym}: {e}")
+                logger.exception("Liquidation watcher exception for %s: %s", sym, e)
                 time.sleep(0.5)
-
-        _liquidation_watchers.pop(sym, None)
-        print(f"{datetime.now().isoformat()} Liquidation watcher EXIT for {sym}")
+        _liquidation_watchers.pop(key, None)
+        logger.info(f"{datetime.now().isoformat()} Liquidation watcher EXIT for {sym} (key={key})")
 
     t = threading.Thread(target=monitor, daemon=True)
     t.start()
 
-# Ctrl+E listener (simple)
+# -------------------- Scanner thread and shared candidates --------------------
+candidates_shared_lock = threading.Lock()
+candidates_shared = {}  # normalized sym -> info (ku_api_symbol, bin bid/ask, ku bid/ask, max_spread, min_spread)
+
+def spread_scanner_loop():
+    http_session = requests.Session()
+    last_alert = {}
+    while True:
+        try:
+            common_symbols, ku_map = get_common_symbols()
+            if not common_symbols:
+                logger.warning("No common symbols — scanner sleeping 5s")
+                time.sleep(5)
+                continue
+            bin_book = get_binance_book()
+            ku_symbols = [ku_map.get(sym, sym + "M") for sym in common_symbols]
+            ku_prices = threaded_kucoin_prices(ku_symbols)
+            new_candidates = {}
+            for sym in common_symbols:
+                bin_tick = bin_book.get(sym)
+                ku_sym = ku_map.get(sym, sym + "M")
+                ku_tick = ku_prices.get(ku_sym)
+                if not bin_tick or not ku_tick:
+                    continue
+                spread = calculate_spread(bin_tick["bid"], bin_tick["ask"], ku_tick["bid"], ku_tick["ask"])
+                if spread is not None and abs(spread) >= SCAN_THRESHOLD:
+                    new_candidates[sym] = {
+                        "ku_sym": ku_sym,
+                        "start_spread": spread,
+                        "max_spread": spread,
+                        "min_spread": spread,
+                        "alerted": False,
+                        "bin_bid": bin_tick["bid"],
+                        "bin_ask": bin_tick["ask"],
+                        "ku_bid": ku_tick["bid"],
+                        "ku_ask": ku_tick["ask"]
+                    }
+            with candidates_shared_lock:
+                candidates_shared.clear()
+                candidates_shared.update(new_candidates)
+            logger.info("[%s] Scanner: shortlisted %d candidate(s): %s", timestamp(), len(new_candidates), list(new_candidates.keys())[:12])
+            if not new_candidates:
+                time.sleep(max(1, MONITOR_DURATION))
+                continue
+            window_start = time.time()
+            window_end = window_start + MONITOR_DURATION
+            while time.time() < window_end and new_candidates:
+                round_start = time.time()
+                workers = min(MAX_WORKERS, max(4, len(new_candidates)))
+                latest = {s: {"bin": None, "ku": None} for s in list(new_candidates.keys())}
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    fut_map = {}
+                    for sym, info in list(new_candidates.items()):
+                        ku_sym = info["ku_sym"]
+                        b_symbol = sym
+                        fut_map[ex.submit(get_binance_price, b_symbol, http_session)] = ("bin", sym)
+                        fut_map[ex.submit(get_kucoin_price_once, ku_sym, http_session)] = ("ku", sym)
+                    for fut in as_completed(fut_map):
+                        typ, sym = fut_map[fut]
+                        try:
+                            bid, ask = fut.result()
+                        except Exception:
+                            bid, ask = None, None
+                        if bid and ask:
+                            latest[sym][typ] = {"bid": bid, "ask": ask}
+                for sym in list(new_candidates.keys()):
+                    info = new_candidates.get(sym)
+                    if not info:
+                        continue
+                    b = latest[sym].get("bin")
+                    k = latest[sym].get("ku")
+                    if not b or not k:
+                        continue
+                    spread = calculate_spread(b["bid"], b["ask"], k["bid"], k["ask"])
+                    if spread is None:
+                        continue
+                    if spread > info["max_spread"]:
+                        new_candidates[sym]["max_spread"] = spread
+                    if spread < info["min_spread"]:
+                        new_candidates[sym]["min_spread"] = spread
+                    if abs(spread) >= ALERT_THRESHOLD:
+                        now = time.time()
+                        cooldown_ok = (sym not in last_alert) or (now - last_alert[sym] > ALERT_COOLDOWN)
+                        if not cooldown_ok:
+                            new_candidates[sym]["alerted"] = True
+                            continue
+                        confirmed = False
+                        for attempt in range(CONFIRM_RETRIES):
+                            time.sleep(CONFIRM_RETRY_DELAY)
+                            b2_bid, b2_ask = get_binance_price(sym, http_session, retries=1)
+                            k2_bid, k2_ask = get_kucoin_price_once(info["ku_sym"], http_session, retries=1)
+                            if b2_bid and b2_ask and k2_bid and k2_ask:
+                                spread2 = calculate_spread(b2_bid, b2_ask, k2_bid, k2_ask)
+                                logger.debug("Confirm check %d for %s: %.4f%%", attempt+1, sym, spread2 if spread2 is not None else 0)
+                                if spread2 is not None and abs(spread2) >= ALERT_THRESHOLD:
+                                    confirmed = True
+                                    b_confirm, k_confirm = {"bid": b2_bid, "ask": b2_ask}, {"bid": k2_bid, "ask": k2_ask}
+                                    break
+                        if not confirmed:
+                            logger.info("False positive avoided for %s (initial %.4f%%)", sym, spread)
+                            new_candidates[sym]["alerted"] = False
+                            continue
+                        direction = "Long Binance / Short KuCoin" if spread2 > 0 else "Long KuCoin / Short Binance"
+                        msg = (
+                            f"*BIG SPREAD ALERT*\n"
+                            f"`{sym}` → *{spread2:+.4f}%*\n"
+                            f"Direction → {direction}\n"
+                            f"Binance: `{b_confirm['bid']:.6f}` ↔ `{b_confirm['ask']:.6f}`\n"
+                            f"KuCoin : `{k_confirm['bid']:.6f}` ↔ `{k_confirm['ask']:.6f}`\n"
+                            f"{timestamp()}"
+                        )
+                        send_telegram(msg)
+                        logger.info("ALERT → %s %+.4f%% (confirmed)", sym, spread2)
+                        last_alert[sym] = time.time()
+                        new_candidates.pop(sym, None)
+                        with candidates_shared_lock:
+                            if sym in candidates_shared:
+                                candidates_shared[sym]['alerted'] = True
+                elapsed = time.time() - round_start
+                sleep_for = MONITOR_POLL - elapsed
+                if sleep_for > 0:
+                    if time.time() + sleep_for > window_end:
+                        sleep_for = max(0, window_end - time.time())
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+            time.sleep(0.5)
+        except Exception:
+            logger.exception("Scanner fatal error, sleeping briefly")
+            time.sleep(5)
+
+# -------------------- Trading orchestration (one active trade at a time) --------------------
+active_trade = {
+    'symbol': None,               # normalized symbol like BTCUSDT
+    'ku_api': None,               # raw KuCoin API symbol like BTCUSDTM
+    'ku_ccxt': None,              # resolved KuCoin CCXT symbol
+    'case': None,                 # 'caseA' or 'caseB' or 'big'
+    'entry_spread': None,
+    'avg_entry_spread': None,
+    'entry_prices': None,
+    'notional': None,
+    'averages_done': 0,
+    'final_implied_notional': None,
+    'funding_accumulated_pct': 0.0,
+    'funding_rounds_seen': set(),
+    'suppress_full_scan': False
+}
+
+def get_best_positive_and_negative():
+    with candidates_shared_lock:
+        items = list(candidates_shared.items())
+    if not items:
+        return None, None
+    best_pos = None; best_pos_spread = -1e9
+    best_neg = None; best_neg_spread = 1e9
+    for sym, info in items:
+        sp = info.get('max_spread') or info.get('start_spread') or 0.0
+        if sp is not None and sp > best_pos_spread and sp > 0:
+            best_pos_spread = sp
+            best_pos = (sym, info)
+        mn = info.get('min_spread') or info.get('start_spread') or 0.0
+        if mn is not None and mn < best_neg_spread and mn < 0:
+            best_neg_spread = mn
+            best_neg = (sym, info)
+    return best_pos, best_neg
+
+def funding_and_time_for_symbol(sym, ku_api_sym):
+    try:
+        bin_fr = fetch_binance_funding(sym)
+        kc_fr = fetch_kucoin_funding(ku_api_sym)
+        return bin_fr, kc_fr
+    except Exception:
+        return None, None
+
+def take_entry_for_candidate(sym, info):
+    if active_trade['symbol']:
+        logger.debug("Active trade present, skipping new entries unless takeover occurs")
+        return False
+    bin_bid = info.get('bin_bid'); bin_ask = info.get('bin_ask'); kc_bid = info.get('ku_bid'); kc_ask = info.get('ku_ask'); ku_api_sym = info.get('ku_sym')
+    if not all([bin_bid, bin_ask, kc_bid, kc_ask, ku_api_sym]):
+        return False
+    # Determine spread and plan
+    trigger_spread = None
+    plan = None
+    if kc_bid > bin_ask:
+        trigger_spread = 100 * (kc_bid - bin_ask) / bin_ask
+        plan = ('binance','kucoin')  # Case A
+    elif bin_bid > kc_ask:
+        trigger_spread = 100 * (bin_bid - kc_ask) / kc_ask
+        plan = ('kucoin','binance')  # Case B
+    else:
+        return False
+    # funding fetch
+    bin_fr_info, kc_fr_info = funding_and_time_for_symbol(sym, ku_api_sym)
+    bin_fr_pct = bin_fr_info.get('fundingRatePct') if bin_fr_info else None
+    kc_fr_pct = kc_fr_info.get('fundingRatePct') if kc_fr_info else None
+    bin_next = bin_fr_info.get('nextFundingTimeMs') if bin_fr_info else None
+    kc_next = kc_fr_info.get('nextFundingTimeMs') if kc_fr_info else None
+    # compute net funding according to plan
+    if plan == ('binance','kucoin'):
+        net_fr = compute_net_funding_for_plan(bin_fr_pct, kc_fr_pct, 'binance','kucoin')
+    else:
+        net_fr = compute_net_funding_for_plan(bin_fr_pct, kc_fr_pct, 'kucoin','binance')
+    # compute time left
+    now_ms = int(time.time()*1000)
+    next_ft_ms = None
+    if bin_next and kc_next:
+        next_ft_ms = min(bin_next, kc_next)
+    elif bin_next:
+        next_ft_ms = bin_next
+    elif kc_next:
+        next_ft_ms = kc_next
+    time_left_min = (next_ft_ms - now_ms)/60000.0 if next_ft_ms else None
+    logger.info("Entry check %s | spread=%.4f%% plan=%s net_fr=%.4f%% time_left=%s", sym, trigger_spread, plan, net_fr or 0.0, f"{time_left_min:.1f}m" if time_left_min is not None else "N/A")
+    # CASE 1
+    if abs(trigger_spread) >= CASE1_MIN_SPREAD and net_fr is not None and net_fr >= FR_ADVANTAGE_THRESHOLD:
+        logger.info("CASE1 satisfied for %s: spread %.4f%% net_fr %.4f%%", sym, trigger_spread, net_fr)
+        return execute_pair_trade(sym, ku_api_sym, plan, trigger_spread, bin_bid, bin_ask, kc_bid, kc_ask, net_fr, initial_multiplier=1)
+    # CASE 2: net disadvantage and spread >= 13x disadvantage and time_left < 30
+    if net_fr is not None and net_fr < 0 and time_left_min is not None and time_left_min < 30:
+        net_dis = abs(net_fr)
+        if abs(trigger_spread) >= CASE2_MULT * net_dis:
+            logger.info("CASE2 satisfied for %s", sym)
+            return execute_pair_trade(sym, ku_api_sym, plan, trigger_spread, bin_bid, bin_ask, kc_bid, kc_ask, net_fr, initial_multiplier=1)
+    # CASE 3: net disadvantage and spread >= 15x disadvantage and time_left >= 30
+    if net_fr is not None and net_fr < 0 and time_left_min is not None and time_left_min >= 30:
+        net_dis = abs(net_fr)
+        if abs(trigger_spread) >= CASE3_MULT * net_dis:
+            logger.info("CASE3 satisfied for %s", sym)
+            return execute_pair_trade(sym, ku_api_sym, plan, trigger_spread, bin_bid, bin_ask, kc_bid, kc_ask, net_fr, initial_multiplier=1)
+    return False
+
+def execute_pair_trade(sym, ku_api_sym, plan, trigger_spread, bin_bid, bin_ask, kc_bid, kc_ask, net_fr, initial_multiplier=1):
+    # Resolve KuCoin CCXT symbol
+    kc_ccxt_sym = resolve_kucoin_trade_symbol(kucoin, ku_api_sym)
+    if not kc_ccxt_sym:
+        logger.warning("Failed to resolve KuCoin CCXT symbol for %s (API symbol %s)", sym, ku_api_sym)
+        return False
+    # Set leverage for symbols
+    try:
+        set_leverage_for_symbol(binance, sym)
+        set_leverage_for_symbol(kucoin, kc_ccxt_sym)
+    except Exception:
+        pass
+    # Compute notionals to match base exposure
+    notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt_sym, NOTIONAL * initial_multiplier, (bin_ask or bin_bid), (kc_bid or kc_ask))
+    results = {}
+    trigger_time = datetime.utcnow()
+    entry_actual.setdefault(sym, {})['trigger_time'] = trigger_time
+    entry_actual.setdefault(sym, {})['trigger_price'] = {'binance': bin_ask, 'kucoin': kc_bid}
+    logger.info("Executing pair trade %s | bin_notional=%.4f kc_notional=%.4f", sym, notional_bin, notional_kc)
+    if plan == ('binance','kucoin'):
+        def exec_kc(): results['kc'] = safe_create_order(kucoin, 'sell', notional_kc, kc_bid, kc_ccxt_sym, trigger_time=trigger_time, trigger_price=kc_bid)
+        def exec_bin(): results['bin'] = safe_create_order(binance, 'buy', notional_bin, bin_ask, sym, trigger_time=trigger_time, trigger_price=bin_ask)
+    else:
+        def exec_kc(): results['kc'] = safe_create_order(kucoin, 'buy', notional_kc, kc_ask, kc_ccxt_sym, trigger_time=trigger_time, trigger_price=kc_ask)
+        def exec_bin(): results['bin'] = safe_create_order(binance, 'sell', notional_bin, bin_bid, sym, trigger_time=trigger_time, trigger_price=bin_bid)
+    t1 = threading.Thread(target=exec_kc)
+    t2 = threading.Thread(target=exec_bin)
+    t1.start(); t2.start(); t1.join(); t2.join()
+    ok_kc, exec_price_kc, exec_time_kc, exec_qty_kc = results.get('kc', (False, None, None, None))
+    ok_bin, exec_price_bin, exec_time_bin, exec_qty_bin = results.get('bin', (False, None, None, None))
+    if not (ok_kc and ok_bin and exec_price_bin is not None and exec_price_kc is not None):
+        logger.info("Partial or failed execution for %s, closing any partials", sym)
+        close_all_and_wait()
+        return False
+    # Finalize entry
+    return finalize_entry(sym, ku_api_sym, kc_ccxt_sym, 'caseA' if plan==('binance','kucoin') else 'caseB', trigger_spread, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc, notional_bin, notional_kc, net_fr)
+
+def finalize_entry(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc, implied_bin, implied_kc, net_fr):
+    try:
+        # compute implied amounts if needed
+        market_bin = get_market(binance, sym)
+        bin_contract_size = float(market_bin.get('contractSize') or market_bin.get('info', {}).get('contractSize') or 1.0) if market_bin else 1.0
+        market_kc = get_market(kucoin, kc_ccxt_sym)
+        kc_contract_size = float(market_kc.get('contractSize') or market_kc.get('info', {}).get('contractSize') or 1.0) if market_kc else 1.0
+        implied_bin_amt = float(exec_qty_bin) * bin_contract_size * float(exec_price_bin) if exec_qty_bin is not None else implied_bin
+        implied_kc_amt = float(exec_qty_kc) * kc_contract_size * float(exec_price_kc) if exec_qty_kc is not None else implied_kc
+    except Exception:
+        implied_bin_amt = implied_bin
+        implied_kc_amt = implied_kc
+    mismatch_pct = abs(implied_bin_amt - implied_kc_amt) / max(implied_bin_amt, implied_kc_amt) * 100 if max(implied_bin_amt, implied_kc_amt) > 0 else 100
+    logger.info("IMPLIED NOTIONALS | Binance: $%.6f | KuCoin: $%.6f | mismatch=%.3f%%", implied_bin_amt, implied_kc_amt, mismatch_pct)
+    # Accept entry
+    active_trade['symbol'] = sym
+    active_trade['ku_api'] = ku_api_sym
+    active_trade['ku_ccxt'] = kc_ccxt_sym
+    active_trade['case'] = case
+    active_trade['entry_spread'] = trigger_spread
+    active_trade['avg_entry_spread'] = trigger_spread
+    active_trade['entry_prices'] = {'binance': {'price': exec_price_bin, 'qty': exec_qty_bin, 'implied': implied_bin_amt}, 'kucoin': {'price': exec_price_kc, 'qty': exec_qty_kc, 'implied': implied_kc_amt}}
+    active_trade['notional'] = NOTIONAL
+    active_trade['averages_done'] = 0
+    active_trade['final_implied_notional'] = {'bin': implied_bin_amt, 'kc': implied_kc_amt}
+    active_trade['funding_accumulated_pct'] = 0.0
+    active_trade['funding_rounds_seen'] = set()
+    active_trade['suppress_full_scan'] = abs(trigger_spread) >= BIG_SPREAD_THRESHOLD
+    entry_spreads[sym] = trigger_spread
+    entry_prices.setdefault(sym, {})['kucoin'] = exec_price_kc
+    entry_prices.setdefault(sym, {})['binance'] = exec_price_bin
+    entry_actual.setdefault(sym, {})['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': None, 'exec_qty': exec_qty_kc, 'implied_notional': implied_kc_amt}
+    entry_actual.setdefault(sym, {})['binance'] = {'exec_price': exec_price_bin, 'exec_time': None, 'exec_qty': exec_qty_bin, 'implied_notional': implied_bin_amt}
+    positions[sym] = case
+    # cache initial qtys and start watcher + place stops
+    _set_initial_entry_qtys(sym, exec_qty_bin, exec_qty_kc, exec_price_bin, exec_price_kc, implied_bin_amt, implied_kc_amt, kc_ccxt_sym)
+    try:
+        try_place_stops_after_entry(sym, kc_ccxt_sym, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc)
+    except Exception:
+        logger.exception("Error placing stops immediately after entry")
+    try:
+        _start_liquidation_watcher_for_symbols(sym, sym, kc_ccxt_sym)
+    except Exception:
+        logger.exception("Failed to start liquidation watcher")
+    msg = f"*ENTRY OPENED* `{sym}`\nCase: {case}\nEntry Spread: `{trigger_spread:.4f}%`\nBinance exec: `{exec_price_bin}`\nKuCoin exec: `{exec_price_kc}`\nNotionals ~ Bin: `${implied_bin_amt:.2f}` | Kc: `${implied_kc_amt:.2f}`\nAverages allowed: {MAX_AVERAGES}\n{timestamp()}"
+    send_telegram(msg)
+    return True
+
+# Reuse _set_initial_entry_qtys, try_place_stops_after_entry from original spreadeater but ensure they accept dynamic kc symbol
+def _set_initial_entry_qtys(sym, exec_qty_bin, exec_qty_kc, exec_price_bin, exec_price_kc, notional_bin, notional_kc, kc_trade_sym):
+    try:
+        bin_qty = None
+        kc_qty = None
+        if exec_qty_bin is not None:
+            try:
+                bin_qty = float(exec_qty_bin)
+            except Exception:
+                bin_qty = None
+        if exec_qty_kc is not None:
+            try:
+                kc_qty = float(exec_qty_kc)
+            except Exception:
+                kc_qty = None
+        if (bin_qty is None or bin_qty == 0) and exec_price_bin:
+            try:
+                amt, implied, _, prec = compute_amount_for_notional(binance, sym, notional_bin, exec_price_bin)
+                bin_qty = amt
+            except Exception:
+                bin_qty = bin_qty or 0.0
+        if (kc_qty is None or kc_qty == 0) and exec_price_kc:
+            try:
+                amt, implied, _, prec = compute_amount_for_notional(kucoin, kc_trade_sym, notional_kc, exec_price_kc)
+                kc_qty = amt
+            except Exception:
+                kc_qty = kc_qty or 0.0
+        bin_qty = abs(bin_qty or 0.0)
+        kc_qty = abs(kc_qty or 0.0)
+        entry_initial_qtys.setdefault(sym, {})['bin'] = float(bin_qty)
+        entry_initial_qtys.setdefault(sym, {})['kc'] = float(kc_qty)
+        _last_known_positions.setdefault(sym, {})['bin'] = float(bin_qty)
+        _last_known_positions.setdefault(sym, {})['kc'] = float(kc_qty)
+        _last_known_positions[sym]['kc_err_count'] = 0
+        logger.info("Cached initial entry qtys for watcher: sym=%s bin=%s kc=%s", sym, bin_qty, kc_qty)
+    except Exception:
+        logger.exception("Error caching initial entry qtys")
+
+def try_place_stops_after_entry(sym, kc_trade_sym, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc):
+    try:
+        pos_kc = None
+        pos_bin = None
+        try:
+            pos_kc = fetch_position_info(kucoin, kc_trade_sym)
+            _last_known_positions.setdefault(sym, {})['kc'] = pos_kc.get('signed_qty', 0.0)
+            _last_known_positions.setdefault(sym, {})['kc_err_count'] = 0
+        except Exception:
+            _last_known_positions.setdefault(sym, {})['kc_err_count'] = _last_known_positions.setdefault(sym, {}).get('kc_err_count', 0) + 1
+            pos_kc = {'signed_qty': _last_known_positions.get(sym, {}).get('kc', 0.0), 'liquidationPrice': None, 'side': None}
+            logger.info("Using last-known KuCoin qty due to fetch error: %s (error_count=%d)", _last_known_positions[sym]['kc'], _last_known_positions[sym]['kc_err_count'])
+        try:
+            pos_bin = fetch_position_info(binance, sym)
+            _last_known_positions.setdefault(sym, {})['bin'] = pos_bin.get('signed_qty', 0.0)
+        except Exception:
+            pos_bin = {'signed_qty': _last_known_positions.get(sym, {}).get('bin', 0.0), 'liquidationPrice': None, 'side': None}
+            logger.info("Binance fetch error for pos; using last-known bin qty: %s", _last_known_positions.get(sym, {}).get('bin', 0.0))
+        logger.info("POST-ENTRY POS INFO | kc=%s | bin=%s", pos_kc, pos_bin)
+        qty_kc = abs(exec_qty_kc) if exec_qty_kc is not None else abs(pos_kc.get('signed_qty') or 0.0)
+        qty_bin = abs(exec_qty_bin) if exec_qty_bin is not None else abs(pos_bin.get('signed_qty') or 0.0)
+        liq_kc = pos_kc.get('liquidationPrice')
+        liq_bin = pos_bin.get('liquidationPrice')
+        side_kc = pos_kc.get('side')
+        side_bin = pos_bin.get('side')
+        logger.info("ATTEMPTING STOPS | kc_qty=%s kc_liq=%s kc_side=%s | bin_qty=%s bin_liq=%s bin_side=%s", qty_kc, liq_kc, side_kc, qty_bin, liq_bin, side_bin)
+        placed_kc = place_reduce_only_stop(kucoin, kc_trade_sym, side_kc, qty_kc, liq_kc, buffer_pct=STOP_BUFFER_PCT, exec_price_fallback=exec_price_kc)
+        placed_bin = place_reduce_only_stop(binance, sym, side_bin, qty_bin, liq_bin, buffer_pct=STOP_BUFFER_PCT, exec_price_fallback=exec_price_bin)
+        logger.info("STOP_PLACED_RESULT | kc=%s | bin=%s", placed_kc, placed_bin)
+        return placed_kc, placed_bin
+    except Exception:
+        logger.exception("Error placing stops after entry")
+        return False, False
+
+# -------------------- Averaging & maintenance --------------------
+def attempt_averaging_if_needed():
+    sym = active_trade.get('symbol')
+    if not sym:
+        return
+    if active_trade.get('averages_done', 0) >= MAX_AVERAGES:
+        return
+    case = active_trade.get('case')
+    avg_entry_spread = active_trade.get('avg_entry_spread') or 0.0
+    try:
+        bin_book = requests.get("https://fapi.binance.com/fapi/v1/ticker/bookTicker", timeout=5).json()
+        bin_price = None
+        for item in bin_book:
+            if item['symbol'] == sym:
+                bin_price = (float(item['bidPrice']), float(item['askPrice']))
+                break
+        kc_api = active_trade.get('ku_api') or (sym + "M")
+        kc_resp = requests.get(f"https://api-futures.kucoin.com/api/v1/ticker?symbol={kc_api}", timeout=5).json()
+        d = kc_resp.get('data', {}) if isinstance(kc_resp, dict) else {}
+        kc_price = (float(d.get('bestBidPrice') or 0), float(d.get('bestAskPrice') or 0))
+        if not bin_price or not kc_price:
+            return
+        bin_bid, bin_ask = bin_price
+        kc_bid, kc_ask = kc_price
+    except Exception:
+        return
+    if case == 'caseA':
+        current_spread = 100 * (kc_bid - bin_ask) / bin_ask
+    else:
+        current_spread = 100 * (bin_bid - kc_ask) / kc_ask
+    logger.info("Averaging check for %s | current_spread=%.4f%% avg_entry=%.4f%%", sym, current_spread, avg_entry_spread)
+    if current_spread >= AVERAGE_TRIGGER_MULTIPLIER * avg_entry_spread:
+        logger.info("Averaging triggered for %s", sym)
+        kc_ccxt = active_trade.get('ku_ccxt')
+        if not kc_ccxt:
+            kc_ccxt = resolve_kucoin_trade_symbol(kucoin, active_trade.get('ku_api') or sym + "M")
+            active_trade['ku_ccxt'] = kc_ccxt
+        if case == 'caseA':
+            notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL, bin_ask, kc_bid)
+            results = {}
+            def exec_kc(): results['kc'] = safe_create_order(kucoin, 'sell', notional_kc, kc_bid, kc_ccxt)
+            def exec_bin(): results['bin'] = safe_create_order(binance, 'buy', notional_bin, bin_ask, sym)
+        else:
+            notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL, bin_bid, kc_ask)
+            results = {}
+            def exec_kc(): results['kc'] = safe_create_order(kucoin, 'buy', notional_kc, kc_ask, kc_ccxt)
+            def exec_bin(): results['bin'] = safe_create_order(binance, 'sell', notional_bin, bin_bid, sym)
+        t1 = threading.Thread(target=exec_kc)
+        t2 = threading.Thread(target=exec_bin)
+        t1.start(); t2.start(); t1.join(); t2.join()
+        ok_kc, exec_price_kc, exec_time_kc, exec_qty_kc = results.get('kc', (False, None, None, None))
+        ok_bin, exec_price_bin, exec_time_bin, exec_qty_bin = results.get('bin', (False, None, None, None))
+        if ok_kc and ok_bin:
+            try:
+                market_bin = get_market(binance, sym)
+                bin_contract_size = float(market_bin.get('contractSize') or market_bin.get('info', {}).get('contractSize') or 1.0) if market_bin else 1.0
+                market_kc = get_market(kucoin, kc_ccxt)
+                kc_contract_size = float(market_kc.get('contractSize') or market_kc.get('info', {}).get('contractSize') or 1.0) if market_kc else 1.0
+                new_implied_bin = float(exec_qty_bin) * bin_contract_size * float(exec_price_bin) if exec_qty_bin is not None else 0.0
+                new_implied_kc = float(exec_qty_kc) * kc_contract_size * float(exec_price_kc) if exec_qty_kc is not None else 0.0
+                prev_bin = active_trade['final_implied_notional']['bin']
+                prev_kc = active_trade['final_implied_notional']['kc']
+                prev_avg = active_trade['avg_entry_spread'] or active_trade['entry_spread']
+                if active_trade['case'] == 'caseA':
+                    this_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin
+                else:
+                    this_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc
+                prev_total = prev_bin + prev_kc
+                new_total = new_implied_bin + new_implied_kc
+                if prev_total + new_total > 0:
+                    weighted_prev = prev_avg * prev_total
+                    weighted_new = this_spread * new_total
+                    new_avg = (weighted_prev + weighted_new) / (prev_total + new_total)
+                else:
+                    new_avg = this_spread
+                active_trade['averages_done'] += 1
+                active_trade['avg_entry_spread'] = new_avg
+                active_trade['final_implied_notional']['bin'] = prev_bin + new_implied_bin
+                active_trade['final_implied_notional']['kc'] = prev_kc + new_implied_kc
+                try_place_stops_after_entry(sym, kc_ccxt, exec_price_bin or None, exec_price_kc or None, None, None)
+                send_telegram(f"*AVERAGE ADDED* `{sym}` -> new avg spread `{new_avg:.4f}%` (averages_done={active_trade['averages_done']})\n{timestamp()}")
+            except Exception:
+                logger.exception("Error aggregating averaging results")
+        else:
+            logger.info("Averaging partial/failed execution; will not count as average")
+
+def check_take_profit_or_close_conditions():
+    sym = active_trade.get('symbol')
+    if not sym:
+        return
+    case = active_trade.get('case')
+    avg_entry = active_trade.get('avg_entry_spread') or active_trade.get('entry_spread') or 0.0
+    try:
+        bin_book = requests.get("https://fapi.binance.com/fapi/v1/ticker/bookTicker", timeout=5).json()
+        bin_price = None
+        for item in bin_book:
+            if item['symbol'] == sym:
+                bin_price = (float(item['bidPrice']), float(item['askPrice']))
+                break
+        kc_api = active_trade.get('ku_api') or sym + "M"
+        kc_resp = requests.get(f"https://api-futures.kucoin.com/api/v1/ticker?symbol={kc_api}", timeout=5).json()
+        d = kc_resp.get('data', {}) if isinstance(kc_resp, dict) else {}
+        kc_price = (float(d.get('bestBidPrice') or 0), float(d.get('bestAskPrice') or 0))
+        if not bin_price or not kc_price:
+            return
+        bin_bid, bin_ask = bin_price
+        kc_bid, kc_ask = kc_price
+    except Exception:
+        return
+    if case == 'caseA':
+        current_exit_spread = 100 * (kc_ask - bin_bid) / (entry_prices.get(sym, {}).get('binance') or 1.0)
+        captured = entry_spreads.get(sym, 0.0) - current_exit_spread
+        target = (active_trade.get('avg_entry_spread') or active_trade.get('entry_spread')) * TAKE_PROFIT_FACTOR
+        if captured >= target:
+            logger.info("Take profit met for %s captured=%.4f target=%.4f", sym, captured, target)
+            send_telegram(f"*TAKE PROFIT* `{sym}` captured {captured:.4f}% target {target:.4f}%\n{timestamp()}")
+            close_all_and_wait()
+            reset_active_trade()
+        else:
+            funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
+            current_spread_now = 100 * ((kc_bid - bin_ask) / bin_ask) if bin_ask and kc_bid else 0.0
+            if funding_acc > target and current_spread_now <= (1.5 * (active_trade.get('avg_entry_spread') or active_trade.get('entry_spread'))):
+                logger.info("Funding expense > target and spread reduced -> closing %s", sym)
+                send_telegram(f"*CLOSE ON FUNDING LOSS* `{sym}` funding_acc={funding_acc:.4f}% > take_profit={target:.4f}%\n{timestamp()}")
+                close_all_and_wait()
+                reset_active_trade()
+    elif case == 'caseB':
+        current_exit_spread = 100 * (bin_bid - kc_ask) / (entry_prices.get(sym, {}).get('kucoin') or 1.0)
+        captured = entry_spreads.get(sym, 0.0) - current_exit_spread
+        target = (active_trade.get('avg_entry_spread') or active_trade.get('entry_spread')) * TAKE_PROFIT_FACTOR
+        if captured >= target:
+            logger.info("Take profit met for %s captured=%.4f target=%.4f", sym, captured, target)
+            send_telegram(f"*TAKE PROFIT* `{sym}` captured {captured:.4f}% target {target:.4f}%\n{timestamp()}")
+            close_all_and_wait()
+            reset_active_trade()
+        else:
+            funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
+            current_spread_now = 100 * ((bin_bid - kc_ask) / kc_ask) if kc_ask and bin_bid else 0.0
+            if funding_acc > target and current_spread_now <= (1.5 * (active_trade.get('avg_entry_spread') or active_trade.get('entry_spread'))):
+                logger.info("Funding expense > target and spread reduced -> closing %s", sym)
+                send_telegram(f"*CLOSE ON FUNDING LOSS* `{sym}` funding_acc={funding_acc:.4f}% > take_profit={target:.4f}%\n{timestamp()}")
+                close_all_and_wait()
+                reset_active_trade()
+
+def reset_active_trade():
+    sym = active_trade.get('symbol')
+    if sym:
+        positions[sym] = None
+    active_trade.update({'symbol': None, 'ku_api': None, 'ku_ccxt': None, 'case': None, 'entry_spread': None, 'avg_entry_spread': None, 'entry_prices': None, 'notional': None, 'averages_done': 0, 'final_implied_notional': None, 'funding_accumulated_pct': 0.0, 'funding_rounds_seen': set(), 'suppress_full_scan': False})
+    logger.info("Active trade reset")
+
+# Funding accounting loop: when nextFundingTime <= now, fetch rates and add net expense if disadvantage
+def funding_round_accounting_loop():
+    while True:
+        try:
+            sym = active_trade.get('symbol')
+            if not sym:
+                time.sleep(5)
+                continue
+            bin_fr_info = fetch_binance_funding(sym)
+            kc_fr_info = fetch_kucoin_funding(active_trade.get('ku_api') or sym + "M")
+            if not bin_fr_info and not kc_fr_info:
+                time.sleep(10)
+                continue
+            now_ms = int(time.time()*1000)
+            next_bin = bin_fr_info.get('nextFundingTimeMs') if bin_fr_info else None
+            next_kc = kc_fr_info.get('nextFundingTimeMs') if kc_fr_info else None
+            for next_ft in (next_bin, next_kc):
+                try:
+                    if not next_ft:
+                        continue
+                    if next_ft <= now_ms and next_ft not in active_trade['funding_rounds_seen']:
+                        binfo = fetch_binance_funding(sym) or {}
+                        kinfo = fetch_kucoin_funding(active_trade.get('ku_api') or sym + "M") or {}
+                        b_pct = binfo.get('fundingRatePct') or 0.0
+                        k_pct = kinfo.get('fundingRatePct') or 0.0
+                        if active_trade['case'] == 'caseA':
+                            net = compute_net_funding_for_plan(b_pct, k_pct, 'binance','kucoin')
+                        else:
+                            net = compute_net_funding_for_plan(b_pct, k_pct, 'kucoin','binance')
+                        expense = abs(net) if net < 0 else 0.0
+                        active_trade['funding_accumulated_pct'] += expense
+                        active_trade['funding_rounds_seen'].add(next_ft)
+                        logger.info("Funding round applied at %s -> b_pct=%.6f k_pct=%.6f net=%.6f expense=%.6f acc=%.6f", datetime.utcfromtimestamp(next_ft/1000.0).isoformat(), b_pct, k_pct, net, expense, active_trade['funding_accumulated_pct'])
+                        send_telegram(f"*FUNDING ROUND APPLIED* `{sym}`\nBinance: `{b_pct}`% KuCoin: `{k_pct}`%\nNet: `{net}`% expense `{expense}`%\nAccumulated funding expense: `{active_trade['funding_accumulated_pct']:.4f}%`\n{timestamp()}")
+                except Exception:
+                    logger.exception("Error in funding_round_accounting loop")
+            time.sleep(10)
+        except Exception:
+            logger.exception("Funding accounting loop fatal error")
+            time.sleep(5)
+
+# Periodic maintenance loop: averaging, TP, takeover scans
+def periodic_trade_maintenance_loop():
+    last_full_scan = 0
+    while True:
+        try:
+            if not active_trade.get('symbol'):
+                time.sleep(1)
+                continue
+            attempt_averaging_if_needed()
+            check_take_profit_or_close_conditions()
+            now = time.time()
+            if not active_trade.get('suppress_full_scan') and (now - last_full_scan) >= SCANNER_FULL_INTERVAL:
+                last_full_scan = now
+                logger.info("Performing takeover scan while trade open")
+                common_symbols, ku_map = get_common_symbols()
+                if not common_symbols:
+                    continue
+                bin_book = get_binance_book()
+                ku_symbols = [ku_map.get(sym, sym + "M") for sym in common_symbols]
+                ku_prices = threaded_kucoin_prices(ku_symbols)
+                best_sym = None; best_spread = 0.0; best_info = None
+                for sym in common_symbols:
+                    if sym == active_trade.get('symbol'):
+                        continue
+                    bin_tick = bin_book.get(sym)
+                    ku_sym = ku_map.get(sym, sym + "M")
+                    ku_tick = ku_prices.get(ku_sym)
+                    if not bin_tick or not ku_tick:
+                        continue
+                    spread = calculate_spread(bin_tick["bid"], bin_tick["ask"], ku_tick["bid"], ku_tick["ask"])
+                    if spread is None:
+                        continue
+                    if abs(spread) > abs(best_spread):
+                        best_spread = spread
+                        best_sym = sym
+                        best_info = {"ku_sym": ku_sym, "bin_bid": bin_tick["bid"], "bin_ask": bin_tick["ask"], "ku_bid": ku_tick["bid"], "ku_ask": ku_tick["ask"]}
+                if best_sym and abs(best_spread) >= BIG_SPREAD_THRESHOLD and (active_trade.get('avg_entry_spread') or 0.0) < 4.0:
+                    logger.info("Takeover condition met: %s spread=%.4f >= %.2f", best_sym, best_spread, BIG_SPREAD_THRESHOLD)
+                    send_telegram(f"*TAKEOVER SIGNAL* `{best_sym}` spread `{best_spread:.4f}%` >= {BIG_SPREAD_THRESHOLD}%\nClosing current `{active_trade['symbol']}` and entering `{best_sym}` with 2x notional\n{timestamp()}")
+                    close_all_and_wait()
+                    reset_active_trade()
+                    execute_pair_trade(best_sym, best_info['ku_sym'], ('binance','kucoin') if best_info['ku_bid'] > best_info['bin_ask'] else ('kucoin','binance'), best_spread, best_info['bin_bid'], best_info['bin_ask'], best_info['ku_bid'], best_info['ku_ask'], 0.0, initial_multiplier=BIG_SPREAD_ENTRY_MULTIPLIER)
+            time.sleep(5)
+        except Exception:
+            logger.exception("trade maintenance loop error")
+            time.sleep(2)
+
+# Ctrl+E listener
 def start_ctrl_e_listener():
     def _listener():
-        global terminate_bot
         try:
             if os.name == 'nt':
                 import msvcrt
@@ -1269,15 +1999,16 @@ def start_ctrl_e_listener():
                         if msvcrt.kbhit():
                             ch = msvcrt.getch()
                             if ch == b'\x05':
-                                print(f"{datetime.now().isoformat()} Ctrl+E detected -> closing all positions now.")
+                                logger.info(f"{datetime.now().isoformat()} Ctrl+E detected -> closing all positions now.")
                                 try:
                                     close_all_and_wait()
                                 except Exception as e:
-                                    print(f"Error during Ctrl+E close_all_and_wait: {e}")
+                                    logger.exception("Error during Ctrl+E close_all_and_wait: %s", e)
+                                global terminate_bot
                                 terminate_bot = True
                                 break
                     except Exception as e:
-                        print(f"Ctrl+E listener error (windows): {e}")
+                        logger.exception("Ctrl+E listener error (windows): %s", e)
                     time.sleep(0.1)
             else:
                 import termios, tty, select
@@ -1291,15 +2022,16 @@ def start_ctrl_e_listener():
                             if r:
                                 ch = sys.stdin.read(1)
                                 if ch == '\x05':
-                                    print(f"{datetime.now().isoformat()} Ctrl+E detected -> closing all positions now.")
+                                    logger.info(f"{datetime.now().isoformat()} Ctrl+E detected -> closing all positions now.")
                                     try:
                                         close_all_and_wait()
                                     except Exception as e:
-                                        print(f"Error during Ctrl+E close_all_and_wait: {e}")
+                                        logger.exception("Error during Ctrl+E close_all_and_wait: %s", e)
+                                    global terminate_bot
                                     terminate_bot = True
                                     break
                         except Exception as e:
-                            print(f"Ctrl+E listener error (posix loop): {e}")
+                            logger.exception("Ctrl+E listener error (posix loop): %s", e)
                             time.sleep(0.1)
                 finally:
                     try:
@@ -1307,303 +2039,63 @@ def start_ctrl_e_listener():
                     except Exception:
                         pass
         except Exception as e:
-            print(f"Ctrl+E listener fatal error: {e}")
+            logger.exception("Ctrl+E listener fatal error: %s", e)
     t = threading.Thread(target=_listener, daemon=True)
     t.start()
 
 start_ctrl_e_listener()
 
-# Starting balances
-start_total_balance, start_bin_balance, start_kc_balance = get_total_futures_balance()
-print(f"Starting total balance approx: ${start_total_balance:.2f} (Binance: ${start_bin_balance:.2f} | KuCoin: ${start_kc_balance:.2f})\n")
-print(f"{datetime.now()} BOT STARTED – monitoring {SYMBOLS} / {KUCOIN_SYMBOLS}\n")
+# -------------------- Start background threads --------------------
+def start_background_threads():
+    t_scan = threading.Thread(target=spread_scanner_loop, daemon=True)
+    t_scan.start()
+    t_maint = threading.Thread(target=periodic_trade_maintenance_loop, daemon=True)
+    t_maint.start()
+    t_fund = threading.Thread(target=funding_round_accounting_loop, daemon=True)
+    t_fund.start()
+    logger.info("Background threads started: scanner, trade maintenance, funding accounting")
 
-# ----------------- MAIN LOOP -----------------
-while True:
-    try:
+start_background_threads()
+
+logger.info("Integrated Arb Bot started")
+send_telegram("Integrated Arb Bot started — spread alerts and trade updates will be posted to the configured Telegram group(s).")
+
+terminate_bot = False
+
+# -------------------- Main loop: evaluate top + and - candidates for entry --------------------
+try:
+    while True:
         if terminate_bot:
-            print("Termination requested (liquidation protection triggered) — stopping bot.")
+            logger.info("Termination requested — stopping bot.")
             try:
                 close_all_and_wait()
             except Exception:
                 pass
             break
-
-        bin_prices, kc_prices = get_prices()
-        for i, sym in enumerate(SYMBOLS):
-            bin_bid, bin_ask = bin_prices.get(sym, (None, None))
-            kc_bid, kc_ask = kc_prices.get(KUCOIN_SYMBOLS[i], (None, None))
-            kc_trade_sym = KUCOIN_TRADE_SYMBOLS[i]
-            if None in (bin_bid, bin_ask, kc_bid, kc_ask) or not kc_trade_sym:
-                continue
-
-            # Reset confirmations
-            if bin_ask < kc_bid:
-                trigger_spread = 100 * (kc_bid - bin_ask) / bin_ask
-                if trigger_spread < ENTRY_SPREAD:
-                    entry_confirm_count[sym] = 0
-            elif bin_bid > kc_ask:
-                trigger_spread = 100 * (bin_bid - kc_ask) / kc_ask
-                if trigger_spread < ENTRY_SPREAD:
-                    entry_confirm_count[sym] = 0
-
-            # CASE A: Buy Binance, Sell KuCoin
-            if bin_ask < kc_bid:
-                trigger_spread = 100 * (kc_bid - bin_ask) / bin_ask
-                print(f"{datetime.now().strftime('%H:%M:%S')} CASE A | Trigger Spread: {trigger_spread:.3f}% | Confirm: {entry_confirm_count[sym] + 1}/3")
-                if positions[sym] is None and trigger_spread >= ENTRY_SPREAD and not closing_in_progress and not has_open_positions():
-                    entry_confirm_count[sym] += 1
-                    if entry_confirm_count[sym] >= 3:
-                        total_bal, bin_bal, kc_bal = get_total_futures_balance()
-                        print(f"*** PRE-TRADE Total Balance: ${total_bal:.2f} (Binance: ${bin_bal:.2f} | KuCoin: ${kc_bal:.2f}) ***")
-                        trigger_time = datetime.utcnow()
-                        entry_actual[sym]['trigger_time'] = trigger_time
-                        entry_actual[sym]['trigger_price'] = {'binance': bin_ask, 'kucoin': kc_bid}
-                        print(f"{trigger_time.strftime('%H:%M:%S.%f')[:-3]} ENTRY CASE A CONFIRMED 3/3 -> EXECUTING PARALLEL ORDERS")
-
-                        notional_bin, notional_kc, bin_base_amt, kc_contracts = match_base_exposure_per_exchange(binance, kucoin, sym, kc_trade_sym, NOTIONAL, bin_ask, kc_bid)
-                        print(f"Placing orders with adjusted notionals to match base exposure -> Binance notional: ${notional_bin:.6f} | KuCoin notional: ${notional_kc:.6f}")
-
-                        results = {}
-                        def exec_kc(): results['kc'] = safe_create_order(kucoin, 'sell', notional_kc, kc_bid, kc_trade_sym, trigger_time=trigger_time, trigger_price=kc_bid)
-                        def exec_bin(): results['bin'] = safe_create_order(binance, 'buy', notional_bin, bin_ask, sym, trigger_time=trigger_time, trigger_price=bin_ask)
-                        t1 = threading.Thread(target=exec_kc)
-                        t2 = threading.Thread(target=exec_bin)
-                        t1.start(); t2.start(); t1.join(); t2.join()
-                        ok_kc, exec_price_kc, exec_time_kc, exec_qty_kc = results.get('kc', (False, None, None, None))
-                        ok_bin, exec_price_bin, exec_time_bin, exec_qty_bin = results.get('bin', (False, None, None, None))
-
-                        if ok_kc and ok_bin and exec_price_kc is not None and exec_price_bin is not None:
-                            try:
-                                market_bin = get_market(binance, sym)
-                                bin_contract_size = float(market_bin.get('contractSize') or market_bin.get('info', {}).get('contractSize') or 1.0) if market_bin else 1.0
-                                implied_bin = float(exec_qty_bin) * bin_contract_size * float(exec_price_bin) if exec_qty_bin is not None else compute_amount_for_notional(binance, sym, notional_bin, exec_price_bin)[1]
-                                market_kc = get_market(kucoin, kc_trade_sym)
-                                kc_contract_size = float(market_kc.get('contractSize') or market_kc.get('info', {}).get('contractSize') or 1.0) if market_kc else 1.0
-                                implied_kc = float(exec_qty_kc) * kc_contract_size * float(exec_price_kc) if exec_qty_kc is not None else compute_amount_for_notional(kucoin, kc_trade_sym, notional_kc, exec_price_kc)[1]
-                            except Exception:
-                                implied_bin = compute_amount_for_notional(binance, sym, notional_bin, exec_price_bin)[1] if exec_price_bin else 0.0
-                                implied_kc = compute_amount_for_notional(kucoin, kc_trade_sym, notional_kc, exec_price_kc)[1] if exec_price_kc else 0.0
-
-                            mismatch_pct = abs(implied_bin - implied_kc) / max(implied_bin, implied_kc) * 100 if max(implied_bin, implied_kc) > 0 else 100
-                            print(f"IMPLIED NOTIONALS | Binance: ${implied_bin:.6f} | KuCoin: ${implied_kc:.6f} | mismatch={mismatch_pct:.3f}%")
-
-                            # Accept or rebalance (Binance only) then attempt stops always
-                            if mismatch_pct <= MAX_NOTIONAL_MISMATCH_PCT:
-                                real_entry_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin
-                                final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
-                                entry_prices[sym]['kucoin'] = exec_price_kc
-                                entry_prices[sym]['binance'] = exec_price_bin
-                                entry_actual[sym]['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': exec_time_kc, 'exec_qty': exec_qty_kc, 'implied_notional': implied_kc}
-                                entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin, 'exec_qty': exec_qty_bin, 'implied_notional': implied_bin}
-                                entry_spreads[sym] = final_entry_spread
-                                positions[sym] = 'caseA'
-                                trade_start_balances[sym] = start_total_balance
-                                entry_confirm_count[sym] = 0
-                                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} ENTRY ACCEPTED (no rebalance required).")
-                                try:
-                                    _start_liquidation_watcher_for_symbol(sym, sym, kc_trade_sym)
-                                except Exception as e:
-                                    print(f"{datetime.now().isoformat()} Failed to start liquidation watcher: {e}")
-                                try_place_stops_after_entry(sym, kc_trade_sym, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc)
-
-                            else:
-                                diff_dollars = abs(implied_bin - implied_kc)
-                                print(f"NOTIONAL MISMATCH {mismatch_pct:.3f}% -> diff ${diff_dollars:.6f}")
-                                if diff_dollars >= REBALANCE_MIN_DOLLARS:
-                                    print("Attempting rebalance ON BINANCE ONLY to match KuCoin (do not touch KuCoin).")
-                                    reb_ok = False
-                                    reb_exec_price = None
-                                    reb_exec_qty = None
-                                    try:
-                                        if implied_bin < implied_kc:
-                                            reb_ok, reb_exec_price, _, reb_exec_qty = safe_create_order(binance, 'buy', diff_dollars, exec_price_bin, sym)
-                                        else:
-                                            reb_ok, reb_exec_price, _, reb_exec_qty = safe_create_order(binance, 'sell', diff_dollars, exec_price_bin, sym)
-                                    except Exception as e:
-                                        print(f"Rebalance attempt on Binance failed with exception: {e}")
-                                        reb_ok = False
-                                    # Accept final and place stops
-                                    real_entry_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin
-                                    final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
-                                    entry_prices[sym]['kucoin'] = exec_price_kc
-                                    entry_prices[sym]['binance'] = exec_price_bin
-                                    entry_actual[sym]['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': exec_time_kc, 'exec_qty': exec_qty_kc, 'implied_notional': implied_kc}
-                                    entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin, 'exec_qty': exec_qty_bin, 'implied_notional': implied_bin}
-                                    entry_spreads[sym] = final_entry_spread
-                                    positions[sym] = 'caseA'
-                                    trade_start_balances[sym] = start_total_balance
-                                    entry_confirm_count[sym] = 0
-                                    print("Finalized entry after attempted Binance rebalance. Attempting stops now.")
-                                    try_place_stops_after_entry(sym, kc_trade_sym, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc)
-                                else:
-                                    real_entry_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin
-                                    final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
-                                    entry_prices[sym]['kucoin'] = exec_price_kc
-                                    entry_prices[sym]['binance'] = exec_price_bin
-                                    entry_actual[sym]['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': exec_time_kc, 'exec_qty': exec_qty_kc, 'implied_notional': implied_kc}
-                                    entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin, 'exec_qty': exec_qty_bin, 'implied_notional': implied_bin}
-                                    entry_spreads[sym] = final_entry_spread
-                                    positions[sym] = 'caseA'
-                                    trade_start_balances[sym] = start_total_balance
-                                    entry_confirm_count[sym] = 0
-                                    try:
-                                        _start_liquidation_watcher_for_symbol(sym, sym, kc_trade_sym)
-                                    except Exception as e:
-                                        print(f"{datetime.now().isoformat()} Failed to start liquidation watcher: {e}")
-                                    try_place_stops_after_entry(sym, kc_trade_sym, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc)
-                        else:
-                            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} WARNING: Partial or failed execution in Case A. Closing positions if any.")
-                            close_all_and_wait()
-                            entry_confirm_count[sym] = 0
-
-            # CASE B: Sell Binance, Buy KuCoin
-            elif bin_bid > kc_ask:
-                trigger_spread = 100 * (bin_bid - kc_ask) / kc_ask
-                print(f"{datetime.now().strftime('%H:%M:%S')} CASE B | Trigger Spread: {trigger_spread:.3f}% | Confirm: {entry_confirm_count[sym] + 1}/3")
-                if positions[sym] is None and trigger_spread >= ENTRY_SPREAD and not closing_in_progress and not has_open_positions():
-                    entry_confirm_count[sym] += 1
-                    if entry_confirm_count[sym] >= 3:
-                        total_bal, bin_bal, kc_bal = get_total_futures_balance()
-                        print(f"*** PRE-TRADE Total Balance: ${total_bal:.2f} (Binance: ${bin_bal:.2f} | KuCoin: ${kc_bal:.2f}) ***")
-                        trigger_time = datetime.utcnow()
-                        entry_actual[sym]['trigger_time'] = trigger_time
-                        entry_actual[sym]['trigger_price'] = {'binance': bin_bid, 'kucoin': kc_ask}
-                        print(f"{trigger_time.strftime('%H:%M:%S.%f')[:-3]} ENTRY CASE B CONFIRMED 3/3 -> EXECUTING PARALLEL ORDERS")
-
-                        notional_bin, notional_kc, bin_base_amt, kc_contracts = match_base_exposure_per_exchange(binance, kucoin, sym, kc_trade_sym, NOTIONAL, bin_bid, kc_ask)
-                        print(f"Placing orders with adjusted notionals to match base exposure -> Binance notional: ${notional_bin:.6f} | KuCoin notional: ${notional_kc:.6f}")
-
-                        results = {}
-                        def exec_kc(): results['kc'] = safe_create_order(kucoin, 'buy', notional_kc, kc_ask, kc_trade_sym, trigger_time=trigger_time, trigger_price=kc_ask)
-                        def exec_bin(): results['bin'] = safe_create_order(binance, 'sell', notional_bin, bin_bid, sym, trigger_time=trigger_time, trigger_price=bin_bid)
-                        t1 = threading.Thread(target=exec_kc)
-                        t2 = threading.Thread(target=exec_bin)
-                        t1.start(); t2.start(); t1.join(); t2.join()
-                        ok_kc, exec_price_kc, exec_time_kc, exec_qty_kc = results.get('kc', (False, None, None, None))
-                        ok_bin, exec_price_bin, exec_time_bin, exec_qty_bin = results.get('bin', (False, None, None, None))
-
-                        if ok_kc and ok_bin and exec_price_kc is not None and exec_price_bin is not None:
-                            try:
-                                market_bin = get_market(binance, sym)
-                                bin_contract_size = float(market_bin.get('contractSize') or market_bin.get('info', {}).get('contractSize') or 1.0) if market_bin else 1.0
-                                implied_bin = float(exec_qty_bin) * bin_contract_size * float(exec_price_bin) if exec_qty_bin is not None else compute_amount_for_notional(binance, sym, notional_bin, exec_price_bin)[1]
-                                market_kc = get_market(kucoin, kc_trade_sym)
-                                kc_contract_size = float(market_kc.get('contractSize') or market_kc.get('info', {}).get('contractSize') or 1.0) if market_kc else 1.0
-                                implied_kc = float(exec_qty_kc) * kc_contract_size * float(exec_price_kc) if exec_qty_kc is not None else compute_amount_for_notional(kucoin, kc_trade_sym, notional_kc, exec_price_kc)[1]
-                            except Exception:
-                                implied_bin = compute_amount_for_notional(binance, sym, notional_bin, exec_price_bin)[1] if exec_price_bin else 0.0
-                                implied_kc = compute_amount_for_notional(kucoin, kc_trade_sym, notional_kc, exec_price_kc)[1] if exec_price_kc else 0.0
-
-                            mismatch_pct = abs(implied_bin - implied_kc) / max(implied_bin, implied_kc) * 100 if max(implied_bin, implied_kc) > 0 else 100
-                            print(f"IMPLIED NOTIONALS | Binance: ${implied_bin:.6f} | KuCoin: ${implied_kc:.6f} | mismatch={mismatch_pct:.3f}%")
-
-                            if mismatch_pct <= MAX_NOTIONAL_MISMATCH_PCT:
-                                real_entry_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc
-                                final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
-                                entry_prices[sym]['kucoin'] = exec_price_kc
-                                entry_prices[sym]['binance'] = exec_price_bin
-                                entry_actual[sym]['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': exec_time_kc, 'exec_qty': exec_qty_kc, 'implied_notional': implied_kc}
-                                entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin, 'exec_qty': exec_qty_bin, 'implied_notional': implied_bin}
-                                entry_spreads[sym] = final_entry_spread
-                                positions[sym] = 'caseB'
-                                trade_start_balances[sym] = start_total_balance
-                                entry_confirm_count[sym] = 0
-                                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} ENTRY ACCEPTED (no rebalance required).")
-                                try:
-                                    _start_liquidation_watcher_for_symbol(sym, sym, kc_trade_sym)
-                                except Exception as e:
-                                    print(f"{datetime.now().isoformat()} Failed to start liquidation watcher: {e}")
-                                try_place_stops_after_entry(sym, kc_trade_sym, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc)
-
-                            else:
-                                diff_dollars = abs(implied_bin - implied_kc)
-                                print(f"NOTIONAL MISMATCH {mismatch_pct:.3f}% -> diff ${diff_dollars:.6f}")
-                                if diff_dollars >= REBALANCE_MIN_DOLLARS:
-                                    print("Attempting rebalance ON BINANCE ONLY to match KuCoin (do not touch KuCoin).")
-                                    reb_ok = False
-                                    try:
-                                        if implied_bin < implied_kc:
-                                            reb_ok, _, _, _ = safe_create_order(binance, 'sell', diff_dollars, exec_price_bin, sym)
-                                        else:
-                                            reb_ok, _, _, _ = safe_create_order(binance, 'buy', diff_dollars, exec_price_bin, sym)
-                                    except Exception as e:
-                                        print(f"Rebalance attempt on Binance failed with exception: {e}")
-                                        reb_ok = False
-                                    real_entry_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc
-                                    final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
-                                    entry_prices[sym]['kucoin'] = exec_price_kc
-                                    entry_prices[sym]['binance'] = exec_price_bin
-                                    entry_actual[sym]['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': exec_time_kc, 'exec_qty': exec_qty_kc, 'implied_notional': implied_kc}
-                                    entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin, 'exec_qty': exec_qty_bin, 'implied_notional': implied_bin}
-                                    entry_spreads[sym] = final_entry_spread
-                                    positions[sym] = 'caseB'
-                                    trade_start_balances[sym] = start_total_balance
-                                    entry_confirm_count[sym] = 0
-                                    print("Finalized entry after attempted Binance rebalance. Attempting stops now.")
-                                    try_place_stops_after_entry(sym, kc_trade_sym, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc)
-                                else:
-                                    real_entry_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc
-                                    final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
-                                    entry_prices[sym]['kucoin'] = exec_price_kc
-                                    entry_prices[sym]['binance'] = exec_price_bin
-                                    entry_actual[sym]['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': exec_time_kc, 'exec_qty': exec_qty_kc, 'implied_notional': implied_kc}
-                                    entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin, 'exec_qty': exec_qty_bin, 'implied_notional': implied_bin}
-                                    entry_spreads[sym] = final_entry_spread
-                                    positions[sym] = 'caseB'
-                                    trade_start_balances[sym] = start_total_balance
-                                    entry_confirm_count[sym] = 0
-                                    print("Mismatch below REBALANCE_MIN_DOLLARS — accepting small residual exposure and proceeding. Attempting stops now.")
-                                    try:
-                                        _start_liquidation_watcher_for_symbol(sym, sym, kc_trade_sym)
-                                    except Exception as e:
-                                        print(f"{datetime.now().isoformat()} Failed to start liquidation watcher: {e}")
-                                    try_place_stops_after_entry(sym, kc_trade_sym, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc)
-                        else:
-                            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} WARNING: Partial or failed execution in Case B. Closing positions if any.")
-                            close_all_and_wait()
-                            entry_confirm_count[sym] = 0
-
-            # EXIT logic
-            if positions[sym] is not None:
-                if positions[sym] == 'caseA':
-                    current_exit_spread = 100 * (kc_ask - bin_bid) / entry_prices[sym]['binance']
-                    captured = entry_spreads[sym] - current_exit_spread
-                    current_entry_spread = 100 * (kc_bid - bin_ask) / bin_ask
-                elif positions[sym] == 'caseB':
-                    current_exit_spread = 100 * (bin_bid - kc_ask) / entry_prices[sym]['kucoin']
-                    captured = entry_spreads[sym] - current_exit_spread
-                    current_entry_spread = 100 * (bin_bid - kc_ask) / kc_ask
-                print(f"{datetime.now().strftime('%H:%M:%S')} POSITION OPEN | Entry Spread (Trigger): {current_entry_spread:.3f}% | Entry Basis: {entry_spreads[sym]:.3f}% | Exit Spread: {current_exit_spread:.3f}% | Captured: {captured:.3f}% | Exit Confirm: {exit_confirm_count[sym] + (1 if (captured >= PROFIT_TARGET or abs(current_exit_spread) < 0.02) else 0)}/3")
-                exit_condition = captured >= PROFIT_TARGET or abs(current_exit_spread) < 0.02
-                if exit_condition:
-                    exit_confirm_count[sym] += 1
-                    if exit_confirm_count[sym] >= 3:
-                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} EXIT TRIGGERED 3/3 | Captured: {captured:.3f}% | Current spread: {current_exit_spread:.3f}% | Case: {positions[sym].upper()}")
-                        try:
-                            et = entry_actual[sym].get('trigger_time')
-                            tp = entry_actual[sym].get('trigger_price')
-                            print(f" ENTRY TRIGGER TIME: {et.strftime('%H:%M:%S.%f')[:-3] if et else 'N/A'} | trigger_prices: {tp}")
-                            print(f" ENTRY EXECUTED DETAILS: binance={entry_actual[sym].get('binance')} kucoin={entry_actual[sym].get('kucoin')}")
-                        except Exception:
-                            pass
-                        close_all_and_wait()
-                        positions[sym] = None
-                        exit_confirm_count[sym] = 0
-                    else:
-                        print(f"{datetime.now().strftime('%H:%M:%S')} → Exit condition met, confirming {exit_confirm_count[sym]}/3...")
-                else:
-                    exit_confirm_count[sym] = 0
-
-        time.sleep(0.1)
-
-    except KeyboardInterrupt:
-        print("Stopping bot...")
-        try:
-            close_all_and_wait()
-        except Exception as e:
-            print("Error during graceful shutdown close:", e)
-        break
-    except Exception as e:
-        print("ERROR:", e)
-        time.sleep(0.5)
+        if not active_trade.get('symbol'):
+            best_pos, best_neg = get_best_positive_and_negative()
+            # Evaluate positive first then negative (order not critical)
+            tried = False
+            if best_pos:
+                sym, info = best_pos
+                try:
+                    if take_entry_for_candidate(sym, info):
+                        tried = True
+                except Exception:
+                    logger.exception("Error evaluating positive candidate %s", sym)
+            if not tried and best_neg:
+                sym, info = best_neg
+                try:
+                    if take_entry_for_candidate(sym, info):
+                        tried = True
+                except Exception:
+                    logger.exception("Error evaluating negative candidate %s", sym)
+        time.sleep(1)
+except KeyboardInterrupt:
+    logger.info("Interrupted by user - shutting down")
+    try:
+        close_all_and_wait()
+    except Exception:
+        pass
+except Exception:
+    logger.exception("Unhandled exception at top level, exiting")
