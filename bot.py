@@ -1594,6 +1594,7 @@ def get_total_futures_balance():
 def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
     ku_api = eval_info.get('ku_api_sym')
     plan = eval_info.get('plan')
+    entry_case = eval_info.get('case')
     bin_bid = eval_info.get('bin_bid'); bin_ask = eval_info.get('bin_ask'); kc_bid = eval_info.get('kc_bid'); kc_ask = eval_info.get('kc_ask')
     kc_ccxt = resolve_kucoin_trade_symbol(kucoin, ku_api)
     if not kc_ccxt:
@@ -1636,7 +1637,7 @@ def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
         confirm_counts[sym] = 0
         return False
     # Finalize entry (reuse finalize_entry logic but minimal side-effects already included)
-    success = finalize_entry_postexec(sym, ku_api, kc_ccxt, 'caseA' if plan==('binance','kucoin') else 'caseB', eval_info.get('trigger_spread'), exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc, notional_bin, notional_kc, eval_info.get('net_fr'))
+    success = finalize_entry_postexec(sym, ku_api, kc_ccxt, entry_case, eval_info.get('trigger_spread'), exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc, notional_bin, notional_kc, eval_info.get('net_fr'), eval_info)
     if success:
         # Post-entry balance snapshot
         total_post, bin_post, kc_post = get_total_futures_balance()
@@ -1648,7 +1649,7 @@ def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
         return False
 
 # We'll reuse finalize logic but as a separate function to avoid duplicate side-effects
-def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc, implied_bin, implied_kc, net_fr):
+def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc, implied_bin, implied_kc, net_fr, eval_info):
     try:
         market_bin = get_market(binance, sym)
         bin_contract_size = float(market_bin.get('contractSize') or market_bin.get('info', {}).get('contractSize') or 1.0) if market_bin else 1.0
@@ -1661,12 +1662,25 @@ def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, 
         implied_kc_amt = implied_kc
     mismatch_pct = abs(implied_bin_amt - implied_kc_amt) / max(implied_bin_amt, implied_kc_amt) * 100 if max(implied_bin_amt, implied_kc_amt) > 0 else 100
     logger.info("IMPLIED NOTIONALS | Binance: $%.6f | KuCoin: $%.6f | mismatch=%.3f%%", implied_bin_amt, implied_kc_amt, mismatch_pct)
+    
+    # NEW: Calculate practical entry spread (minimum of trigger_spread and executed spread)
+    if case == 'caseA':
+        exec_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin if exec_price_bin > 0 else trigger_spread
+    else:
+        exec_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc if exec_price_kc > 0 else trigger_spread
+    
+    # Use minimum of trigger_spread and executed spread as practical entry spread
+    practical_entry_spread = min(abs(trigger_spread), abs(exec_spread)) * (1 if trigger_spread >= 0 else -1)
+    
+    logger.info("ENTRY SPREAD CALCULATION | trigger=%.4f%% executed=%.4f%% practical=%.4f%%", 
+                trigger_spread, exec_spread, practical_entry_spread)
+    
     active_trade['symbol'] = sym
     active_trade['ku_api'] = ku_api_sym
     active_trade['ku_ccxt'] = kc_ccxt_sym
     active_trade['case'] = case
     active_trade['entry_spread'] = trigger_spread
-    active_trade['avg_entry_spread'] = trigger_spread
+    active_trade['avg_entry_spread'] = practical_entry_spread  # Use practical spread
     active_trade['entry_prices'] = {'binance': {'price': exec_price_bin, 'qty': exec_qty_bin, 'implied': implied_bin_amt}, 'kucoin': {'price': exec_price_kc, 'qty': exec_qty_kc, 'implied': implied_kc_amt}}
     active_trade['notional'] = NOTIONAL
     active_trade['averages_done'] = 0
@@ -1689,9 +1703,124 @@ def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, 
         _start_liquidation_watcher_for_symbols(sym, sym, kc_ccxt_sym)
     except Exception:
         logger.exception("Failed to start liquidation watcher")
-    msg = f"*ENTRY OPENED* `{sym}`\nCase: {case}\nEntry Spread: `{trigger_spread:.4f}%`\nBinance exec: `{exec_price_bin}`\nKuCoin exec: `{exec_price_kc}`\nNotionals ~ Bin: `${implied_bin_amt:.2f}` | Kc: `${implied_kc_amt:.2f}`\nAverages allowed: {MAX_AVERAGES}\n{timestamp()}"
+    
+    # NEW: Get entry condition details for messaging
+    entry_condition_msg = get_entry_condition_message(eval_info)
+    
+    msg = f"*ENTRY OPENED* `{sym}`\n{entry_condition_msg}\nCase: {case}\nTrigger Spread: `{trigger_spread:.4f}%`\nExecuted Spread: `{exec_spread:.4f}%`\nPractical Entry Spread: `{practical_entry_spread:.4f}%`\nBinance exec: `{exec_price_bin}`\nKuCoin exec: `{exec_price_kc}`\nNotionals ~ Bin: `${implied_bin_amt:.2f}` | Kc: `${implied_kc_amt:.2f}`\nAverages allowed: {MAX_AVERAGES}\n{timestamp()}"
+    logger.info("ENTRY_OPENED | %s | %s | trigger_spread=%.4f%% exec_spread=%.4f%% practical=%.4f%%", 
+                sym, entry_condition_msg.replace('\n', ' | '), trigger_spread, exec_spread, practical_entry_spread)
     send_telegram(msg)
     return True
+
+def get_entry_condition_message(eval_info):
+    """Generate a descriptive message about which entry condition was triggered"""
+    case = eval_info.get('case')
+    net_fr = eval_info.get('net_fr')
+    time_left_min = eval_info.get('time_left_min')
+    trigger_spread = eval_info.get('trigger_spread')
+    
+    if case == 'case1':
+        return f"✅ CASE 1 TRIGGERED\nSpread ≥ {CASE1_MIN_SPREAD}% AND FR Advantage ≥ {FR_ADVANTAGE_THRESHOLD}%\nNet FR: {net_fr:.4f}%"
+    elif case == 'case2':
+        net_dis = abs(net_fr) if net_fr else 0
+        return f"✅ CASE 2 TRIGGERED\nTime < 30min AND Spread ≥ {CASE2_MULT}x FR Disadvantage\nNet FR: {net_fr:.4f}% | Time left: {time_left_min:.1f}min"
+    elif case == 'case3':
+        net_dis = abs(net_fr) if net_fr else 0
+        return f"✅ CASE 3 TRIGGERED\nTime ≥ 30min AND Spread ≥ {CASE3_MULT}x FR Disadvantage\nNet FR: {net_fr:.4f}% | Time left: {time_left_min:.1f}min"
+    else:
+        return f"Entry triggered | Net FR: {net_fr:.4f}% | Time left: {time_left_min:.1f}min" if net_fr else "Entry triggered"
+
+# NEW: place_reduce_only_stop function
+def place_reduce_only_stop(exchange, symbol, side, qty, liq_price, buffer_pct=0.02, exec_price_fallback=None):
+    """
+    Place a reduce-only stop market order at liquidation price + buffer
+    side: 'long' or 'short' (position side)
+    qty: position quantity (absolute value)
+    liq_price: liquidation price
+    buffer_pct: percentage buffer from liquidation
+    exec_price_fallback: use this if liq_price is None
+    """
+    try:
+        if qty is None or qty == 0:
+            logger.info("No qty to place stop for %s %s", exchange.id, symbol)
+            return False
+        
+        # Determine stop price
+        stop_price = None
+        if liq_price is not None and liq_price > 0:
+            if side == 'long':
+                # For long, stop below liq
+                stop_price = liq_price * (1 - buffer_pct)
+            elif side == 'short':
+                # For short, stop above liq
+                stop_price = liq_price * (1 + buffer_pct)
+        elif exec_price_fallback is not None and exec_price_fallback > 0:
+            # Use exec price with larger buffer if no liq
+            if side == 'long':
+                stop_price = exec_price_fallback * (1 - buffer_pct * 3)
+            elif side == 'short':
+                stop_price = exec_price_fallback * (1 + buffer_pct * 3)
+        
+        if stop_price is None or stop_price <= 0:
+            logger.warning("Cannot determine valid stop price for %s %s (liq=%s, exec=%s, side=%s)", 
+                         exchange.id, symbol, liq_price, exec_price_fallback, side)
+            return False
+        
+        # Determine order side (opposite of position side)
+        order_side = 'sell' if side == 'long' else 'buy'
+        
+        # Round quantity
+        market = get_market(exchange, symbol)
+        prec = market.get('precision', {}).get('amount') if market else None
+        qty_rounded = round_down(abs(qty), prec) if prec is not None else abs(qty)
+        
+        if qty_rounded == 0:
+            logger.warning("Rounded qty is 0 for %s %s", exchange.id, symbol)
+            return False
+        
+        logger.info("Placing stop order: %s %s %s qty=%s stopPrice=%s (liq=%s)", 
+                   exchange.id, symbol, order_side, qty_rounded, stop_price, liq_price)
+        
+        if DRY_RUN:
+            logger.info("[DRY_RUN] Would place stop order")
+            return True
+        
+        # Place stop market order
+        try:
+            if exchange.id == 'binance':
+                order = exchange.create_order(
+                    symbol=symbol,
+                    type='STOP_MARKET',
+                    side=order_side,
+                    amount=qty_rounded,
+                    params={
+                        'stopPrice': stop_price,
+                        'reduceOnly': True
+                    }
+                )
+            else:  # kucoin
+                order = exchange.create_order(
+                    symbol=symbol,
+                    type='market',
+                    side=order_side,
+                    amount=qty_rounded,
+                    params={
+                        'stop': 'down' if order_side == 'sell' else 'up',
+                        'stopPrice': stop_price,
+                        'reduceOnly': True
+                    }
+                )
+            logger.info("Stop order placed successfully: %s %s order_id=%s", 
+                       exchange.id, symbol, order.get('id'))
+            return True
+        except Exception as e:
+            logger.exception("Failed to place stop order: %s %s: %s", exchange.id, symbol, e)
+            return False
+            
+    except Exception as e:
+        logger.exception("Error in place_reduce_only_stop: %s", e)
+        return False
 
 # Minimal re-used helpers (stop placing & initial qty)
 def _set_initial_entry_qtys(sym, exec_qty_bin, exec_qty_kc, exec_price_bin, exec_price_kc, notional_bin, notional_kc, kc_trade_sym):
