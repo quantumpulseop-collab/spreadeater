@@ -31,7 +31,7 @@ if missing:
     sys.exit(1)
 
 # Config (defaults)
-NOTIONAL = float(os.getenv('NOTIONAL', "45.0"))
+NOTIONAL = float(os.getenv('NOTIONAL', "10.0"))
 LEVERAGE = int(os.getenv('LEVERAGE', "5"))
 WATCHER_POLL_INTERVAL = float(os.getenv('WATCHER_POLL_INTERVAL', "0.5"))
 WATCHER_DETECT_CONFIRM = int(os.getenv('WATCHER_DETECT_CONFIRM', "2"))
