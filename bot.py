@@ -99,17 +99,43 @@ def fix_time_offset():
 
 fix_time_offset()
 
-# Logging - FIXED: Set console handler to DEBUG for Railway visibility
+# Logging - FORCED STDOUT FOR RAILWAY
+import sys
+sys.stdout = sys.stderr  # Force everything to stderr (Railway captures this)
+sys.stdout.reconfigure(line_buffering=True)  # Unbuffered
+sys.stderr.reconfigure(line_buffering=True)
+
 logger = logging.getLogger("arb_integrated")
 logger.setLevel(logging.DEBUG)
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)  # Changed from INFO to DEBUG
+logger.propagate = True
+
+# Console handler - FORCE to stdout/stderr
+ch = logging.StreamHandler(sys.stderr)
+ch.setLevel(logging.DEBUG)
 ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
 logger.addHandler(ch)
+
+# File handler
 fh = RotatingFileHandler("arb_integrated.log", maxBytes=8_000_000, backupCount=5)
 fh.setLevel(logging.DEBUG)
 fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
 logger.addHandler(fh)
+
+# CRITICAL: Force flush after every log
+class FlushHandler(logging.StreamHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+ch2 = FlushHandler(sys.stderr)
+ch2.setLevel(logging.INFO)
+ch2.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+logger.addHandler(ch2)
+
+# Print to verify logging works
+print("=" * 80, flush=True)
+print("LOGGING INITIALIZED - YOU SHOULD SEE THIS IN RAILWAY", flush=True)
+print("=" * 80, flush=True)
 
 def timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1342,13 +1368,26 @@ def spread_scanner_loop():
     last_alert = {}
     while True:
         try:
+            print(f"\n{'='*60}", flush=True)
+            print(f"🔍 SCANNER ITERATION - {timestamp()}", flush=True)
+            print(f"{'='*60}", flush=True)
+            
             common_symbols, ku_map = get_common_symbols()
             if not common_symbols:
+                print("⚠️  No common symbols found, sleeping...", flush=True)
                 time.sleep(5)
                 continue
+            
+            print(f"✓ Common symbols: {len(common_symbols)}", flush=True)
+            logger.info(f"Scanner: {len(common_symbols)} common symbols")
+            
             bin_book = get_binance_book()
+            print(f"✓ Binance book: {len(bin_book)} entries", flush=True)
+            
             ku_symbols = [ku_map.get(sym, sym + "M") for sym in common_symbols]
             ku_prices = threaded_kucoin_prices(ku_symbols)
+            print(f"✓ KuCoin prices: {len(ku_prices)}/{len(ku_symbols)}", flush=True)
+            
             new_candidates = {}
             for sym in common_symbols:
                 bin_tick = bin_book.get(sym)
@@ -1372,8 +1411,19 @@ def spread_scanner_loop():
             with candidates_shared_lock:
                 candidates_shared.clear()
                 candidates_shared.update(new_candidates)
+            
+            print(f"✅ CANDIDATES: {len(new_candidates)}", flush=True)
             logger.info("[%s] Scanner: shortlisted %d candidate(s)", timestamp(), len(new_candidates))
+            
+            # Show top 5 candidates
+            if new_candidates:
+                sorted_cands = sorted(new_candidates.items(), key=lambda x: abs(x[1]['start_spread']), reverse=True)[:5]
+                for sym, info in sorted_cands:
+                    print(f"   → {sym}: {info['start_spread']:+.4f}%", flush=True)
+                    logger.info(f"   Candidate: {sym} {info['start_spread']:+.4f}%")
+            
             if not new_candidates:
+                print(f"No candidates, sleeping {MONITOR_DURATION}s...", flush=True)
                 time.sleep(max(1, MONITOR_DURATION))
                 continue
             window_start = time.time()
@@ -1901,10 +1951,50 @@ def funding_round_accounting_loop():
             time.sleep(5)
 
 def periodic_summary_loop():
-    """Send status updates every 60 seconds"""
+    """Send detailed status updates every 60 seconds"""
     while True:
         try:
+            print("\n" + "="*80, flush=True)
+            print(f"PERIODIC SUMMARY LOOP RUNNING - {timestamp()}", flush=True)
+            print("="*80, flush=True)
             time.sleep(60)  # Every 1 minute
+            
+            # Get max positive and negative spreads
+            best_pos, best_neg = get_best_positive_and_negative()
+            
+            max_pos_spread = 0.0
+            max_pos_sym = "None"
+            max_pos_fr_bin = 0.0
+            max_pos_fr_kc = 0.0
+            
+            max_neg_spread = 0.0
+            max_neg_sym = "None"
+            max_neg_fr_bin = 0.0
+            max_neg_fr_kc = 0.0
+            
+            if best_pos:
+                max_pos_sym, pos_info = best_pos
+                max_pos_spread = pos_info.get('max_spread', pos_info.get('start_spread', 0.0))
+                # Fetch funding rates
+                try:
+                    b_info = fetch_binance_funding(max_pos_sym)
+                    k_info = fetch_kucoin_funding(pos_info.get('ku_sym', max_pos_sym + 'M'))
+                    max_pos_fr_bin = b_info.get('fundingRatePct', 0.0) if b_info else 0.0
+                    max_pos_fr_kc = k_info.get('fundingRatePct', 0.0) if k_info else 0.0
+                except Exception as e:
+                    logger.warning(f"Error fetching funding for {max_pos_sym}: {e}")
+            
+            if best_neg:
+                max_neg_sym, neg_info = best_neg
+                max_neg_spread = neg_info.get('min_spread', neg_info.get('start_spread', 0.0))
+                # Fetch funding rates
+                try:
+                    b_info = fetch_binance_funding(max_neg_sym)
+                    k_info = fetch_kucoin_funding(neg_info.get('ku_sym', max_neg_sym + 'M'))
+                    max_neg_fr_bin = b_info.get('fundingRatePct', 0.0) if b_info else 0.0
+                    max_neg_fr_kc = k_info.get('fundingRatePct', 0.0) if k_info else 0.0
+                except Exception as e:
+                    logger.warning(f"Error fetching funding for {max_neg_sym}: {e}")
             
             if active_trade.get('symbol'):
                 sym = active_trade['symbol']
@@ -1921,12 +2011,23 @@ def periodic_summary_loop():
                 
                 summary = (
                     f"📊 *BOT STATUS SUMMARY*\n"
-                    f"Active Trade: `{sym}` ({case})\n"
-                    f"Entry Spread: `{avg_spread:.4f}%` (avg of {avg_count} entries)\n"
-                    f"Current Spread: `{current_spread:.4f}%`\n"
-                    f"Total Notional: `${total_not:.2f}`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🟢 *ACTIVE TRADE*\n"
+                    f"Symbol: `{sym}` ({case})\n"
+                    f"Entry: `{avg_spread:.4f}%` (×{avg_count})\n"
+                    f"Current: `{current_spread:.4f}%`\n"
+                    f"Notional: `${total_not:.2f}`\n"
                     f"Funding Cost: `{funding_acc:.4f}%`\n"
-                    f"{timestamp()}"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📈 *MAX POSITIVE SPREAD*\n"
+                    f"`{max_pos_sym}`: `{max_pos_spread:.4f}%`\n"
+                    f"FR → Bin: `{max_pos_fr_bin:.4f}%` | KC: `{max_pos_fr_kc:.4f}%`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📉 *MAX NEGATIVE SPREAD*\n"
+                    f"`{max_neg_sym}`: `{max_neg_spread:.4f}%`\n"
+                    f"FR → Bin: `{max_neg_fr_bin:.4f}%` | KC: `{max_neg_fr_kc:.4f}%`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⏰ {timestamp()}"
                 )
             else:
                 # No active trade
@@ -1935,16 +2036,30 @@ def periodic_summary_loop():
                 
                 summary = (
                     f"📊 *BOT STATUS SUMMARY*\n"
-                    f"Status: `SCANNING`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔍 *SCANNING MODE*\n"
                     f"Active Trade: `None`\n"
-                    f"Candidates Found: `{num_candidates}`\n"
-                    f"{timestamp()}"
+                    f"Candidates: `{num_candidates}`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📈 *MAX POSITIVE SPREAD*\n"
+                    f"`{max_pos_sym}`: `{max_pos_spread:.4f}%`\n"
+                    f"FR → Bin: `{max_pos_fr_bin:.4f}%` | KC: `{max_pos_fr_kc:.4f}%`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📉 *MAX NEGATIVE SPREAD*\n"
+                    f"`{max_neg_sym}`: `{max_neg_spread:.4f}%`\n"
+                    f"FR → Bin: `{max_neg_fr_bin:.4f}%` | KC: `{max_neg_fr_kc:.4f}%`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⏰ {timestamp()}"
                 )
             
-            logger.info("Sending periodic summary")
+            print(f"SENDING SUMMARY TO TELEGRAM: {summary[:100]}...", flush=True)
+            logger.info("📊 PERIODIC SUMMARY - Sending to Telegram")
+            logger.info(f"Max Pos: {max_pos_sym} {max_pos_spread:.4f}% | Max Neg: {max_neg_sym} {max_neg_spread:.4f}%")
             send_telegram(summary)
+            print("SUMMARY SENT SUCCESSFULLY", flush=True)
             
-        except Exception:
+        except Exception as e:
+            print(f"ERROR IN SUMMARY LOOP: {e}", flush=True)
             logger.exception("Error in periodic_summary_loop")
             time.sleep(5)
 
@@ -2050,26 +2165,57 @@ start_ctrl_e_listener()
 
 # Start background threads
 def start_background_threads():
+    print("\n" + "="*80, flush=True)
+    print("🚀 STARTING BACKGROUND THREADS", flush=True)
+    print("="*80, flush=True)
+    
     t_scan = threading.Thread(target=spread_scanner_loop, daemon=True)
     t_scan.start()
+    print("✓ Scanner thread started", flush=True)
+    
     t_maint = threading.Thread(target=periodic_trade_maintenance_loop, daemon=True)
     t_maint.start()
+    print("✓ Maintenance thread started", flush=True)
+    
     t_fund = threading.Thread(target=funding_round_accounting_loop, daemon=True)
     t_fund.start()
-    t_summary = threading.Thread(target=periodic_summary_loop, daemon=True)  # NEW
+    print("✓ Funding thread started", flush=True)
+    
+    t_summary = threading.Thread(target=periodic_summary_loop, daemon=True)
     t_summary.start()
-    logger.info("Background threads started (including summary loop)")
+    print("✓ Summary thread started", flush=True)
+    
+    logger.info("✅ All background threads started (scanner, maintenance, funding, summary)")
+    print("="*80, flush=True)
+    print("✅ ALL THREADS RUNNING", flush=True)
+    print("="*80 + "\n", flush=True)
 
 start_background_threads()
 
 terminate_bot = False
+
+print("\n" + "="*80, flush=True)
+print("🎯 BOT FULLY INITIALIZED", flush=True)
+print("="*80, flush=True)
 logger.info("🚀 Bot initialization complete - sending startup message")
-send_telegram("🚀 Integrated Arb Bot started — spread alerts and trade updates will be posted to Telegram.")
+print("Sending Telegram startup message...", flush=True)
+send_telegram("🚀 Integrated Arb Bot V2 STARTED\n✅ All systems operational\n📊 Summary every 60s\n⏰ " + timestamp())
+print("✅ Telegram startup message sent", flush=True)
+print("="*80, flush=True)
+print("🔥 MAIN LOOP STARTING - BOT IS LIVE!", flush=True)
+print("="*80 + "\n", flush=True)
 
 # Main loop — with 3 confirmations for entry
 try:
+    loop_count = 0
     while True:
+        loop_count += 1
+        if loop_count % 30 == 0:  # Every 30 seconds
+            print(f"💓 Main loop heartbeat #{loop_count} - {timestamp()}", flush=True)
+            logger.debug(f"Main loop iteration {loop_count}")
+        
         if terminate_bot:
+            print("🛑 Terminate signal received, closing positions...", flush=True)
             try:
                 close_all_and_wait()
             except Exception:
@@ -2092,19 +2238,26 @@ try:
                     continue
                 # Increment confirm counter
                 confirm_counts[sym] = confirm_counts.get(sym, 0) + 1
+                print(f"⏳ Confirming {sym}: {confirm_counts[sym]}/{CONFIRM_COUNT} (spread={eval_info.get('trigger_spread'):.4f}%)", flush=True)
                 logger.info("Confirming %s: %d/%d (spread=%.4f%%)", sym, confirm_counts[sym], CONFIRM_COUNT, eval_info.get('trigger_spread'))
                 if confirm_counts[sym] >= CONFIRM_COUNT:
+                    print(f"✅ CONFIRMATION COMPLETE for {sym}! Re-evaluating before execution...", flush=True)
                     # re-evaluate immediately before executing
                     eval_info_refresh = evaluate_entry_conditions(sym, info)
                     if not eval_info_refresh:
+                        print(f"❌ Re-evaluation failed for {sym}, resetting confirms", flush=True)
                         confirm_counts[sym] = 0
                         continue
+                    print(f"🚀 EXECUTING TRADE: {sym}", flush=True)
                     # execute with pre/post snapshots
                     ok = execute_pair_trade_with_snapshots(sym, eval_info_refresh, initial_multiplier=1)
                     confirm_counts[sym] = 0
                     if ok:
+                        print(f"✅ Trade executed successfully for {sym}", flush=True)
                         entry_taken = True
                         break
+                    else:
+                        print(f"❌ Trade execution failed for {sym}", flush=True)
                 else:
                     # Wait for more confirms (loop continues)
                     pass
