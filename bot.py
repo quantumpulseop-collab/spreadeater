@@ -51,6 +51,7 @@ BIG_SPREAD_ENTRY_MULTIPLIER = 2
 MAX_AVERAGES = 2
 AVERAGE_TRIGGER_MULTIPLIER = 2.0
 TAKE_PROFIT_FACTOR = 0.5
+MIN_FR_DIFF_THRESHOLD = 0.12  # NEW: Minimum funding rate difference to consider (ignore below this)
 
 SCAN_THRESHOLD = 0.25
 ALERT_THRESHOLD = 5.0
@@ -1581,6 +1582,10 @@ def get_best_positive_and_negative():
     return best_pos, best_neg
 
 def evaluate_entry_conditions(sym, info):
+    """
+    FIXED: Now properly handles funding rate threshold and doesn't trigger
+    on small funding differences below MIN_FR_DIFF_THRESHOLD
+    """
     # returns dict with keys if candidate meets any case, else None
     bin_bid = info.get('bin_bid'); bin_ask = info.get('bin_ask'); kc_bid = info.get('ku_bid'); kc_ask = info.get('ku_ask'); ku_api_sym = info.get('ku_sym')
     if not all([bin_bid, bin_ask, kc_bid, kc_ask, ku_api_sym]):
@@ -1604,6 +1609,11 @@ def evaluate_entry_conditions(sym, info):
         net_fr = compute_net_funding_for_plan(bin_fr_pct, kc_fr_pct, 'binance','kucoin')
     else:
         net_fr = compute_net_funding_for_plan(bin_fr_pct, kc_fr_pct, 'kucoin','binance')
+    
+    # FIXED: Don't consider funding rate if difference is below threshold
+    if net_fr is not None and abs(net_fr) < MIN_FR_DIFF_THRESHOLD:
+        net_fr = 0.0  # Treat as neutral for small differences
+    
     now_ms = int(time.time()*1000)
     next_ft_ms = None
     if bin_next and kc_next:
@@ -1700,6 +1710,10 @@ def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
 
 # We'll reuse finalize logic but as a separate function to avoid duplicate side-effects
 def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc, implied_bin, implied_kc, net_fr, eval_info):
+    """
+    FIXED: Now properly stores the entry spread with correct sign (preserving negative for negative spreads)
+    so that exit logic can correctly compare spreads
+    """
     try:
         market_bin = get_market(binance, sym)
         bin_contract_size = float(market_bin.get('contractSize') or market_bin.get('info', {}).get('contractSize') or 1.0) if market_bin else 1.0
@@ -1713,14 +1727,17 @@ def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, 
     mismatch_pct = abs(implied_bin_amt - implied_kc_amt) / max(implied_bin_amt, implied_kc_amt) * 100 if max(implied_bin_amt, implied_kc_amt) > 0 else 100
     logger.info("IMPLIED NOTIONALS | Binance: $%.6f | KuCoin: $%.6f | mismatch=%.3f%%", implied_bin_amt, implied_kc_amt, mismatch_pct)
     
-    # NEW: Calculate practical entry spread (minimum of trigger_spread and executed spread)
+    # FIXED: Calculate practical entry spread and preserve the sign
     if case == 'caseA':
         exec_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin if exec_price_bin > 0 else trigger_spread
     else:
         exec_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc if exec_price_kc > 0 else trigger_spread
     
-    # Use minimum of trigger_spread and executed spread as practical entry spread
-    practical_entry_spread = min(abs(trigger_spread), abs(exec_spread)) * (1 if trigger_spread >= 0 else -1)
+    # Use minimum of absolute values but preserve the original sign
+    if abs(exec_spread) < abs(trigger_spread):
+        practical_entry_spread = exec_spread
+    else:
+        practical_entry_spread = trigger_spread
     
     logger.info("ENTRY SPREAD CALCULATION | trigger=%.4f%% executed=%.4f%% practical=%.4f%%", 
                 trigger_spread, exec_spread, practical_entry_spread)
@@ -1730,7 +1747,7 @@ def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, 
     active_trade['ku_ccxt'] = kc_ccxt_sym
     active_trade['case'] = case
     active_trade['entry_spread'] = trigger_spread
-    active_trade['avg_entry_spread'] = practical_entry_spread  # Use practical spread
+    active_trade['avg_entry_spread'] = practical_entry_spread  # FIXED: Now preserves sign
     active_trade['entry_prices'] = {'binance': {'price': exec_price_bin, 'qty': exec_qty_bin, 'implied': implied_bin_amt}, 'kucoin': {'price': exec_price_kc, 'qty': exec_qty_kc, 'implied': implied_kc_amt}}
     active_trade['notional'] = NOTIONAL
     active_trade['averages_done'] = 0
@@ -1738,7 +1755,7 @@ def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, 
     active_trade['funding_accumulated_pct'] = 0.0
     active_trade['funding_rounds_seen'] = set()
     active_trade['suppress_full_scan'] = abs(trigger_spread) >= BIG_SPREAD_THRESHOLD
-    entry_spreads[sym] = trigger_spread
+    entry_spreads[sym] = practical_entry_spread  # FIXED: Store with sign preserved
     entry_prices.setdefault(sym, {})['kucoin'] = exec_price_kc
     entry_prices.setdefault(sym, {})['binance'] = exec_price_bin
     entry_actual.setdefault(sym, {})['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': None, 'exec_qty': exec_qty_kc, 'implied_notional': implied_kc_amt}
@@ -2039,11 +2056,17 @@ def attempt_averaging_if_needed():
             logger.info("Averaging partial/failed execution; will not count as average")
 
 def check_take_profit_or_close_conditions():
+    """
+    FIXED: Now properly handles spread sign comparison and exits when:
+    1. 50% profit target is hit (spread converges by 50%)
+    2. Spread reverses direction (sign changes) - meaning at least 50% profit captured
+    """
     sym = active_trade.get('symbol')
     if not sym:
         return
     case = active_trade.get('case')
-    avg_entry = active_trade.get('avg_entry_spread') or active_trade.get('entry_spread') or 0.0
+    avg_entry_spread = active_trade.get('avg_entry_spread') or active_trade.get('entry_spread') or 0.0
+    
     try:
         bin_book = requests.get("https://fapi.binance.com/fapi/v1/ticker/bookTicker", timeout=5).json()
         bin_price = None
@@ -2064,36 +2087,65 @@ def check_take_profit_or_close_conditions():
             return
     except Exception:
         return
+    
+    # FIXED: Calculate current spread with proper sign preservation
     if case == 'caseA':
-        current_exit_spread = 100 * (kc_ask - bin_bid) / (entry_prices.get(sym, {}).get('binance') or 1.0)
-        captured = entry_spreads.get(sym, 0.0) - current_exit_spread
-        target = (active_trade.get('avg_entry_spread') or active_trade.get('entry_spread')) * TAKE_PROFIT_FACTOR
-        if captured >= target:
-            send_telegram(f"*TAKE PROFIT* `{sym}` captured {captured:.4f}% target {target:.4f}%\n{timestamp()}")
+        # Entry was long binance/short kucoin (positive spread at entry)
+        # Current spread in same direction
+        current_spread = 100 * (kc_bid - bin_ask) / bin_ask if bin_ask > 0 else 0.0
+    else:
+        # Entry was long kucoin/short binance (negative spread at entry)
+        # Current spread in same direction  
+        current_spread = 100 * (bin_bid - kc_ask) / kc_ask if kc_ask > 0 else 0.0
+    
+    logger.info("TP CHECK | sym=%s case=%s | entry_spread=%.4f%% current_spread=%.4f%%", 
+                sym, case, avg_entry_spread, current_spread)
+    
+    # FIXED: Check for sign reversal (spread flipped direction = big profit)
+    entry_was_positive = avg_entry_spread > 0
+    current_is_positive = current_spread > 0
+    
+    if entry_was_positive != current_is_positive:
+        # Sign changed! This means spread reversed = captured at least full spread
+        msg = f"*SPREAD SIGN REVERSAL EXIT* `{sym}`\nEntry: `{avg_entry_spread:.4f}%`\nCurrent: `{current_spread:.4f}%`\nSpread reversed direction - profit captured!\n{timestamp()}"
+        logger.info("SPREAD_SIGN_REVERSAL | %s | entry=%.4f%% current=%.4f%%", sym, avg_entry_spread, current_spread)
+        send_telegram(msg)
+        close_all_and_wait()
+        reset_active_trade()
+        return
+    
+    # FIXED: Calculate convergence properly with signed values
+    # For positive entry spread: profit when spread decreases (current < entry)
+    # For negative entry spread: profit when spread increases toward zero (current > entry, both negative)
+    if avg_entry_spread > 0:
+        # Positive spread case: profit = entry_spread - current_spread
+        spread_convergence = avg_entry_spread - current_spread
+    else:
+        # Negative spread case: profit = current_spread - entry_spread (both negative, so this is positive when converging)
+        spread_convergence = current_spread - avg_entry_spread
+    
+    target_convergence = abs(avg_entry_spread) * TAKE_PROFIT_FACTOR  # 50% of entry spread
+    
+    logger.info("TP CALC | convergence=%.4f%% target=%.4f%%", spread_convergence, target_convergence)
+    
+    if spread_convergence >= target_convergence:
+        msg = f"*TAKE PROFIT* `{sym}`\nEntry: `{avg_entry_spread:.4f}%`\nCurrent: `{current_spread:.4f}%`\nConvergence: `{spread_convergence:.4f}%` ≥ Target: `{target_convergence:.4f}%`\n{timestamp()}"
+        logger.info("TAKE_PROFIT | %s | convergence=%.4f%% >= target=%.4f%%", sym, spread_convergence, target_convergence)
+        send_telegram(msg)
+        close_all_and_wait()
+        reset_active_trade()
+        return
+    
+    # Check funding accumulation
+    funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
+    if funding_acc > target_convergence:
+        # Only close if spread hasn't widened too much
+        if abs(current_spread) <= (1.5 * abs(avg_entry_spread)):
+            msg = f"*CLOSE ON FUNDING LOSS* `{sym}`\nFunding acc: `{funding_acc:.4f}%` > Target: `{target_convergence:.4f}%`\nEntry: `{avg_entry_spread:.4f}%` Current: `{current_spread:.4f}%`\n{timestamp()}"
+            logger.info("FUNDING_LOSS_EXIT | %s | funding=%.4f%% > target=%.4f%%", sym, funding_acc, target_convergence)
+            send_telegram(msg)
             close_all_and_wait()
             reset_active_trade()
-        else:
-            funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
-            current_spread_now = 100 * ((kc_bid - bin_ask) / bin_ask) if bin_ask and kc_bid else 0.0
-            if funding_acc > target and current_spread_now <= (1.5 * (active_trade.get('avg_entry_spread') or active_trade.get('entry_spread'))):
-                send_telegram(f"*CLOSE ON FUNDING LOSS* `{sym}` funding_acc={funding_acc:.4f}% > take_profit={target:.4f}%\n{timestamp()}")
-                close_all_and_wait()
-                reset_active_trade()
-    elif case == 'caseB':
-        current_exit_spread = 100 * (bin_bid - kc_ask) / (entry_prices.get(sym, {}).get('kucoin') or 1.0)
-        captured = entry_spreads.get(sym, 0.0) - current_exit_spread
-        target = (active_trade.get('avg_entry_spread') or active_trade.get('entry_spread')) * TAKE_PROFIT_FACTOR
-        if captured >= target:
-            send_telegram(f"*TAKE PROFIT* `{sym}` captured {captured:.4f}% target {target:.4f}%\n{timestamp()}")
-            close_all_and_wait()
-            reset_active_trade()
-        else:
-            funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
-            current_spread_now = 100 * ((bin_bid - kc_ask) / kc_ask) if kc_ask and bin_bid else 0.0
-            if funding_acc > target and current_spread_now <= (1.5 * (active_trade.get('avg_entry_spread') or active_trade.get('entry_spread'))):
-                send_telegram(f"*CLOSE ON FUNDING LOSS* `{sym}` funding_acc={funding_acc:.4f}% > take_profit={target:.4f}%\n{timestamp()}")
-                close_all_and_wait()
-                reset_active_trade()
 
 def reset_active_trade():
     sym = active_trade.get('symbol')
@@ -2413,7 +2465,60 @@ try:
                 pass
             break
         if not active_trade.get('symbol'):
+            # FIXED: Check for 7.5%+ big spread entry even when no trade is active
             best_pos, best_neg = get_best_positive_and_negative()
+            
+            # Check if any symbol has >= 7.5% spread for immediate entry
+            big_spread_candidate = None
+            big_spread_info = None
+            
+            with candidates_shared_lock:
+                for sym, info in candidates_shared.items():
+                    max_spread = info.get('max_spread', info.get('start_spread', 0.0))
+                    if abs(max_spread) >= BIG_SPREAD_THRESHOLD:
+                        big_spread_candidate = sym
+                        big_spread_info = info
+                        logger.info("BIG SPREAD DETECTED (no active trade): %s spread=%.4f%%", sym, max_spread)
+                        break
+            
+            # If big spread found, enter immediately
+            if big_spread_candidate and big_spread_info:
+                logger.info("Entering on BIG SPREAD (>=%.1f%%) with no active trade: %s", BIG_SPREAD_THRESHOLD, big_spread_candidate)
+                send_telegram(f"*BIG SPREAD ENTRY* `{big_spread_candidate}` spread `{big_spread_info.get('max_spread', 0.0):.4f}%` >= {BIG_SPREAD_THRESHOLD}%\nEntering with 2x notional\n{timestamp()}")
+                
+                # Create eval_info for execution
+                sym = big_spread_candidate
+                ku_api_sym = big_spread_info.get('ku_sym')
+                bin_bid = big_spread_info.get('bin_bid')
+                bin_ask = big_spread_info.get('bin_ask')
+                kc_bid = big_spread_info.get('ku_bid')
+                kc_ask = big_spread_info.get('ku_ask')
+                
+                if kc_bid > bin_ask:
+                    trigger_spread = 100 * (kc_bid - bin_ask) / bin_ask
+                    plan = ('binance', 'kucoin')
+                else:
+                    trigger_spread = 100 * (bin_bid - kc_ask) / kc_ask
+                    plan = ('kucoin', 'binance')
+                
+                eval_info = {
+                    'case': 'big_spread',
+                    'plan': plan,
+                    'trigger_spread': trigger_spread,
+                    'net_fr': 0.0,
+                    'time_left_min': None,
+                    'bin_bid': bin_bid,
+                    'bin_ask': bin_ask,
+                    'kc_bid': kc_bid,
+                    'kc_ask': kc_ask,
+                    'ku_api_sym': ku_api_sym
+                }
+                
+                execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=BIG_SPREAD_ENTRY_MULTIPLIER)
+                time.sleep(1)
+                continue
+            
+            # Otherwise proceed with normal candidate evaluation
             candidate_list = []
             if best_pos:
                 candidate_list.append(best_pos)
