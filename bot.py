@@ -1727,10 +1727,13 @@ def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, 
     mismatch_pct = abs(implied_bin_amt - implied_kc_amt) / max(implied_bin_amt, implied_kc_amt) * 100 if max(implied_bin_amt, implied_kc_amt) > 0 else 100
     logger.info("IMPLIED NOTIONALS | Binance: $%.6f | KuCoin: $%.6f | mismatch=%.3f%%", implied_bin_amt, implied_kc_amt, mismatch_pct)
     
-    # FIXED: Calculate practical entry spread and preserve the sign
-    if case == 'caseA':
+    # FIXED: Calculate executed spread using the SAME direction as trigger spread
+    # Determine direction from trigger spread sign
+    if trigger_spread > 0:
+        # Positive trigger means kc_bid > bin_ask (long binance, short kucoin)
         exec_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin if exec_price_bin > 0 else trigger_spread
     else:
+        # Negative trigger means bin_bid > kc_ask (long kucoin, short binance)
         exec_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc if exec_price_kc > 0 else trigger_spread
     
     # Use minimum of absolute values but preserve the original sign
@@ -1991,14 +1994,19 @@ def attempt_averaging_if_needed():
         kc_bid, kc_ask = kc_price
     except Exception:
         return
-    if case == 'caseA':
+    
+    # FIXED: Calculate current spread using entry spread direction (not case)
+    if avg_entry_spread > 0:
+        # Entry was positive spread
         if bin_ask <= 0:
             return
         current_spread = 100 * (kc_bid - bin_ask) / bin_ask
     else:
+        # Entry was negative spread
         if kc_ask <= 0:
             return
         current_spread = 100 * (bin_bid - kc_ask) / kc_ask
+    
     logger.info("Averaging check for %s | current_spread=%.4f%% avg_entry=%.4f%%", sym, current_spread, avg_entry_spread)
     if current_spread >= AVERAGE_TRIGGER_MULTIPLIER * avg_entry_spread:
         logger.info("Averaging triggered for %s", sym)
@@ -2006,12 +2014,16 @@ def attempt_averaging_if_needed():
         if not kc_ccxt:
             kc_ccxt = resolve_kucoin_trade_symbol(kucoin, active_trade.get('ku_api') or sym + "M")
             active_trade['ku_ccxt'] = kc_ccxt
-        if case == 'caseA':
+        
+        # Use entry spread direction for order placement
+        if avg_entry_spread > 0:
+            # Positive entry: long binance, short kucoin
             notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL, bin_ask, kc_bid)
             results = {}
             def exec_kc(): results['kc'] = safe_create_order(kucoin, 'sell', notional_kc, kc_bid, kc_ccxt)
             def exec_bin(): results['bin'] = safe_create_order(binance, 'buy', notional_bin, bin_ask, sym)
         else:
+            # Negative entry: long kucoin, short binance
             notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL, bin_bid, kc_ask)
             results = {}
             def exec_kc(): results['kc'] = safe_create_order(kucoin, 'buy', notional_kc, kc_ask, kc_ccxt)
@@ -2032,9 +2044,13 @@ def attempt_averaging_if_needed():
                 prev_bin = active_trade['final_implied_notional']['bin']
                 prev_kc = active_trade['final_implied_notional']['kc']
                 prev_avg = active_trade['avg_entry_spread'] or active_trade['entry_spread']
-                if active_trade['case'] == 'caseA':
+                
+                # Calculate this averaging spread using entry direction
+                if prev_avg > 0:
+                    # Positive entry
                     this_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin
                 else:
+                    # Negative entry
                     this_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc
                 prev_total = prev_bin + prev_kc
                 new_total = new_implied_bin + new_implied_kc
@@ -2088,18 +2104,17 @@ def check_take_profit_or_close_conditions():
     except Exception:
         return
     
-    # FIXED: Calculate current spread with proper sign preservation
-    if case == 'caseA':
-        # Entry was long binance/short kucoin (positive spread at entry)
-        # Current spread in same direction
+    # FIXED: Calculate current spread using the SAME direction as entry spread
+    # Use entry spread sign to determine direction (not case, which can be wrong)
+    if avg_entry_spread > 0:
+        # Entry was positive spread (kc_bid > bin_ask)
         current_spread = 100 * (kc_bid - bin_ask) / bin_ask if bin_ask > 0 else 0.0
     else:
-        # Entry was long kucoin/short binance (negative spread at entry)
-        # Current spread in same direction  
+        # Entry was negative spread (bin_bid > kc_ask)
         current_spread = 100 * (bin_bid - kc_ask) / kc_ask if kc_ask > 0 else 0.0
     
-    logger.info("TP CHECK | sym=%s case=%s | entry_spread=%.4f%% current_spread=%.4f%%", 
-                sym, case, avg_entry_spread, current_spread)
+    logger.info("TP CHECK | sym=%s | entry_spread=%.4f%% current_spread=%.4f%%", 
+                sym, avg_entry_spread, current_spread)
     
     # FIXED: Check for sign reversal (spread flipped direction = big profit)
     entry_was_positive = avg_entry_spread > 0
