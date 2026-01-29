@@ -51,7 +51,8 @@ BIG_SPREAD_ENTRY_MULTIPLIER = 2
 MAX_AVERAGES = 2
 AVERAGE_TRIGGER_MULTIPLIER = 2.0
 TAKE_PROFIT_FACTOR = 0.5
-MIN_FR_DIFF_THRESHOLD = 0.12  # NEW: Minimum funding rate difference to consider (ignore below this)
+MIN_FR_DIFF_THRESHOLD = 0.01  # CHANGED: Minimum funding rate difference (was 0.12%, now 0.01%)
+MIN_SPREAD_THRESHOLD = 1.5     # NEW: Minimum spread required for ANY entry
 
 SCAN_THRESHOLD = 0.25
 ALERT_THRESHOLD = 5.0
@@ -805,6 +806,116 @@ def close_all_and_wait(timeout_s=20, poll_interval=0.5):
     logger.info("Timeout waiting for positions to close.")
     return False
 
+def close_all_and_wait_with_tracking(target_sym, timeout_s=20, poll_interval=0.5):
+    """
+    NEW: Close positions and track executed prices for exit spread calculation
+    Returns dict with bin_exec_price and kc_exec_price
+    """
+    global closing_in_progress
+    closing_in_progress = True
+    logger.info("Closing all positions with tracking for %s...", target_sym)
+    
+    result = {'bin_exec_price': None, 'kc_exec_price': None}
+    
+    # Close on Binance and track execution
+    try:
+        all_bin_pos = binance.fetch_positions()
+    except Exception:
+        all_bin_pos = []
+    for pos in all_bin_pos:
+        try:
+            sym = pos.get('symbol') or (pos.get('info') or {}).get('symbol')
+            if not sym or sym != target_sym:
+                continue
+            signed = _get_signed_from_binance_pos(pos)
+            if abs(float(signed or 0)) == 0:
+                continue
+            side = 'sell' if signed > 0 else 'buy'
+            market = get_market(binance, sym)
+            prec = market.get('precision', {}).get('amount') if market else None
+            qty = round_down(abs(signed), prec) if prec is not None else abs(signed)
+            if qty > 0:
+                try:
+                    logger.info(f"Closing Binance {sym} {side} {qty} (with tracking)")
+                    try:
+                        order = binance.create_market_order(sym, side, qty, params={'reduceOnly': True})
+                    except TypeError:
+                        order = binance.create_order(symbol=sym, type='market', side=side, amount=qty, params={'reduceOnly': True})
+                    # Extract executed price
+                    if order:
+                        exec_price = float(order.get('price') or order.get('average') or order.get('info', {}).get('avgPrice') or 0)
+                        if exec_price > 0:
+                            result['bin_exec_price'] = exec_price
+                            logger.info(f"Binance exit executed @ {exec_price}")
+                except Exception:
+                    logger.exception("Error closing binance position %s", sym)
+        except Exception:
+            continue
+    
+    # Close on KuCoin and track execution
+    try:
+        all_kc_pos = kucoin.fetch_positions()
+    except Exception:
+        all_kc_pos = []
+    for pos in all_kc_pos:
+        try:
+            sym = pos.get('symbol') or (pos.get('info') or {}).get('symbol')
+            # Match against ku_ccxt symbol
+            if not sym or (active_trade.get('ku_ccxt') and sym != active_trade.get('ku_ccxt')):
+                continue
+            signed = _get_signed_from_kucoin_pos(pos)
+            if abs(float(signed or 0)) == 0:
+                continue
+            side = 'sell' if signed > 0 else 'buy'
+            market = get_market(kucoin, sym)
+            prec = market.get('precision', {}).get('amount') if market else None
+            qty = round_down(abs(signed), prec) if prec is not None else abs(signed)
+            if qty > 0:
+                try:
+                    logger.info(f"Closing KuCoin {sym} {side} {qty} (with tracking)")
+                    order = kucoin.create_market_order(sym, side, qty, params={'reduceOnly': True, 'marginMode': 'cross'})
+                    # Extract executed price
+                    if order:
+                        exec_price = float(order.get('price') or order.get('average') or order.get('info', {}).get('avgPrice') or 0)
+                        if exec_price > 0:
+                            result['kc_exec_price'] = exec_price
+                            logger.info(f"KuCoin exit executed @ {exec_price}")
+                except Exception:
+                    logger.exception("Error closing kucoin position %s", sym)
+        except Exception:
+            continue
+    
+    # Wait for positions to close
+    start = time.time()
+    while time.time() - start < timeout_s:
+        try:
+            bin_check = binance.fetch_positions()
+            kc_check = kucoin.fetch_positions()
+            any_open = False
+            for p in (bin_check or []):
+                if abs(float(_get_signed_from_binance_pos(p) or 0)) > 0:
+                    any_open = True
+                    break
+            if not any_open:
+                for p in (kc_check or []):
+                    if abs(float(_get_signed_from_kucoin_pos(p) or 0)) > 0:
+                        any_open = True
+                        break
+            logger.info("Checking open positions... any_open=%s", any_open)
+            if not any_open:
+                closing_in_progress = False
+                total_bal, bin_bal, kc_bal = get_total_futures_balance()
+                logger.info("*** POST-EXIT Total Balance approx: ${:.2f} (Binance: ${:.2f} | KuCoin: ${:.2f}) ***".format(total_bal, bin_bal, kc_bal))
+                logger.info("EXIT TRACKING | bin_exec=%.6f kc_exec=%.6f", result.get('bin_exec_price') or 0, result.get('kc_exec_price') or 0)
+                return result
+        except Exception:
+            logger.exception("Error checking positions in close_all_and_wait_with_tracking")
+        time.sleep(poll_interval)
+    
+    closing_in_progress = False
+    logger.warning("Timeout waiting for positions to close in tracking mode")
+    return result
+
 # Exec price/time/qty extractor and KuCoin poller (preserved)
 def extract_executed_price_time_qty(exchange, symbol, order_obj):
     try:
@@ -1265,6 +1376,13 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
         logger.info(f"{datetime.now().isoformat()} Watcher initial prev_bin={prev_bin} prev_kc={prev_kc} entry_bin_initial={entry_bin_initial} entry_kc_initial={entry_kc_initial}")
         while not stop_flag.is_set():
             try:
+                # FIXED: Skip monitoring when TP closing is in progress (not a liquidation!)
+                if tp_closing_in_progress:
+                    zero_cnt_bin = zero_cnt_kc = 0
+                    logger.info(f"{datetime.now().isoformat()} Liquidation watcher skipping (TP closing in progress)")
+                    time.sleep(WATCHER_POLL_INTERVAL)
+                    continue
+                
                 if closing_in_progress or positions.get(sym) is None:
                     zero_cnt_bin = zero_cnt_kc = 0
                     if positions.get(sym) is None:
@@ -1309,6 +1427,12 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                 prev_kc_abs = abs(prev_kc)
                 bin_initial_nonzero = abs(entry_initial_qtys.get(sym, {}).get('bin', 0.0)) > ZERO_ABS_THRESHOLD
                 kc_initial_nonzero = abs(entry_initial_qtys.get(sym, {}).get('kc', 0.0)) > ZERO_ABS_THRESHOLD
+                
+                # FIXED: Don't trigger liquidation actions if TP closing just finished
+                if tp_closing_in_progress:
+                    time.sleep(WATCHER_POLL_INTERVAL)
+                    continue
+                
                 if (prev_bin_abs > ZERO_ABS_THRESHOLD or bin_initial_nonzero) and cur_bin_abs <= ZERO_ABS_THRESHOLD:
                     logger.info(f"{datetime.now().isoformat()} Detected immediate ZERO on Binance (prev non-zero -> now zero). Triggering immediate targeted close of KuCoin.")
                     try:
@@ -1381,6 +1505,7 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
 
 # State
 closing_in_progress = False
+tp_closing_in_progress = False  # NEW: Track if closing for TP (not liquidation)
 positions = {}
 entry_spreads = {}
 entry_prices = {}
@@ -1408,6 +1533,10 @@ active_trade = {
 # Confirm counters per symbol (consecutive confirms)
 confirm_counts = {}
 CONFIRM_COUNT = 3
+
+# NEW: TP confirmation counter (need 3 consecutive confirmations to exit)
+tp_confirm_count = 0
+TP_CONFIRM_COUNT = 3
 
 # Scanner shared candidates
 candidates_shared_lock = threading.Lock()
@@ -1585,6 +1714,7 @@ def evaluate_entry_conditions(sym, info):
     """
     FIXED: Now properly handles funding rate threshold and doesn't trigger
     on small funding differences below MIN_FR_DIFF_THRESHOLD
+    ADDED: Minimum 1.5% spread requirement for ALL entries
     """
     # returns dict with keys if candidate meets any case, else None
     bin_bid = info.get('bin_bid'); bin_ask = info.get('bin_ask'); kc_bid = info.get('ku_bid'); kc_ask = info.get('ku_ask'); ku_api_sym = info.get('ku_sym')
@@ -1598,6 +1728,11 @@ def evaluate_entry_conditions(sym, info):
         plan = ('kucoin', 'binance')
     else:
         return None
+    
+    # NEW: Check minimum spread threshold FIRST
+    if abs(trigger_spread) < MIN_SPREAD_THRESHOLD:
+        return None  # Spread too small, reject entry
+    
     # funding fetch
     bin_fr_info = fetch_binance_funding(sym)
     kc_fr_info = fetch_kucoin_funding(ku_api_sym)
@@ -2090,14 +2225,16 @@ def attempt_averaging_if_needed():
 
 def check_take_profit_or_close_conditions():
     """
-    FIXED: Now properly handles spread sign comparison and exits when:
-    1. 50% profit target is hit (spread converges by 50%)
-    2. Spread reverses direction (sign changes) - meaning at least 50% profit captured
+    FIXED: Now requires 3 consecutive confirmations before exiting (like entry)
+    ADDED: Tracks exit trigger spread and real executed spread with slippage
     """
+    global tp_confirm_count, tp_closing_in_progress
+    
     sym = active_trade.get('symbol')
     if not sym:
+        tp_confirm_count = 0
         return
-    case = active_trade.get('case')
+    
     avg_entry_spread = active_trade.get('avg_entry_spread') or active_trade.get('entry_spread') or 0.0
     
     try:
@@ -2112,13 +2249,16 @@ def check_take_profit_or_close_conditions():
         d = kc_resp.get('data', {}) if isinstance(kc_resp, dict) else {}
         kc_price = (float(d.get('bestBidPrice') or 0), float(d.get('bestAskPrice') or 0))
         if not bin_price or not kc_price:
+            tp_confirm_count = 0
             return
         bin_bid, bin_ask = bin_price
         kc_bid, kc_ask = kc_price
         # Validate prices to prevent division by zero
         if bin_bid <= 0 or bin_ask <= 0 or kc_bid <= 0 or kc_ask <= 0:
+            tp_confirm_count = 0
             return
     except Exception:
+        tp_confirm_count = 0
         return
     
     # FIXED: Calculate current spread using the SAME direction as entry spread
@@ -2138,53 +2278,106 @@ def check_take_profit_or_close_conditions():
     entry_was_positive = avg_entry_spread > 0
     current_is_positive = current_spread > 0
     
+    should_exit = False
+    exit_reason = None
+    
     if entry_was_positive != current_is_positive:
         # Sign changed! This means spread reversed = captured at least full spread
-        msg = f"*SPREAD SIGN REVERSAL EXIT* `{sym}`\nEntry: `{avg_entry_spread:.4f}%`\nCurrent: `{current_spread:.4f}%`\nSpread reversed direction - profit captured!\n{timestamp()}"
+        should_exit = True
+        exit_reason = f"SPREAD SIGN REVERSAL"
         logger.info("SPREAD_SIGN_REVERSAL | %s | entry=%.4f%% current=%.4f%%", sym, avg_entry_spread, current_spread)
-        send_telegram(msg)
-        close_all_and_wait()
-        reset_active_trade()
-        return
-    
-    # FIXED: Calculate convergence properly with signed values
-    # For positive entry spread: profit when spread decreases (current < entry)
-    # For negative entry spread: profit when spread increases toward zero (current > entry, both negative)
-    if avg_entry_spread > 0:
-        # Positive spread case: profit = entry_spread - current_spread
-        spread_convergence = avg_entry_spread - current_spread
     else:
-        # Negative spread case: profit = current_spread - entry_spread (both negative, so this is positive when converging)
-        spread_convergence = current_spread - avg_entry_spread
+        # FIXED: Calculate convergence properly with signed values
+        # For positive entry spread: profit when spread decreases (current < entry)
+        # For negative entry spread: profit when spread increases toward zero (current > entry, both negative)
+        if avg_entry_spread > 0:
+            # Positive spread case: profit = entry_spread - current_spread
+            spread_convergence = avg_entry_spread - current_spread
+        else:
+            # Negative spread case: profit = current_spread - entry_spread (both negative, so this is positive when converging)
+            spread_convergence = current_spread - avg_entry_spread
+        
+        target_convergence = abs(avg_entry_spread) * TAKE_PROFIT_FACTOR  # 50% of entry spread
+        
+        logger.info("TP CALC | convergence=%.4f%% target=%.4f%%", spread_convergence, target_convergence)
+        
+        if spread_convergence >= target_convergence:
+            should_exit = True
+            exit_reason = f"TAKE PROFIT (convergence={spread_convergence:.4f}% >= target={target_convergence:.4f}%)"
+        else:
+            # Check funding accumulation
+            funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
+            if funding_acc > target_convergence:
+                # Only close if spread hasn't widened too much
+                if abs(current_spread) <= (1.5 * abs(avg_entry_spread)):
+                    should_exit = True
+                    exit_reason = f"FUNDING LOSS (acc={funding_acc:.4f}% > target={target_convergence:.4f}%)"
     
-    target_convergence = abs(avg_entry_spread) * TAKE_PROFIT_FACTOR  # 50% of entry spread
-    
-    logger.info("TP CALC | convergence=%.4f%% target=%.4f%%", spread_convergence, target_convergence)
-    
-    if spread_convergence >= target_convergence:
-        msg = f"*TAKE PROFIT* `{sym}`\nEntry: `{avg_entry_spread:.4f}%`\nCurrent: `{current_spread:.4f}%`\nConvergence: `{spread_convergence:.4f}%` ≥ Target: `{target_convergence:.4f}%`\n{timestamp()}"
-        logger.info("TAKE_PROFIT | %s | convergence=%.4f%% >= target=%.4f%%", sym, spread_convergence, target_convergence)
-        send_telegram(msg)
-        close_all_and_wait()
-        reset_active_trade()
-        return
-    
-    # Check funding accumulation
-    funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
-    if funding_acc > target_convergence:
-        # Only close if spread hasn't widened too much
-        if abs(current_spread) <= (1.5 * abs(avg_entry_spread)):
-            msg = f"*CLOSE ON FUNDING LOSS* `{sym}`\nFunding acc: `{funding_acc:.4f}%` > Target: `{target_convergence:.4f}%`\nEntry: `{avg_entry_spread:.4f}%` Current: `{current_spread:.4f}%`\n{timestamp()}"
-            logger.info("FUNDING_LOSS_EXIT | %s | funding=%.4f%% > target=%.4f%%", sym, funding_acc, target_convergence)
+    # NEW: 3-confirmation logic for exit
+    if should_exit:
+        tp_confirm_count += 1
+        logger.info("TP CONFIRMATION %d/%d | %s | %s", tp_confirm_count, TP_CONFIRM_COUNT, sym, exit_reason)
+        print(f"⏳ TP Confirmation {tp_confirm_count}/{TP_CONFIRM_COUNT} for {sym}: {exit_reason}", flush=True)
+        
+        if tp_confirm_count >= TP_CONFIRM_COUNT:
+            logger.info("TP CONFIRMED %d times - EXECUTING EXIT for %s", TP_CONFIRM_COUNT, sym)
+            print(f"✅ TP CONFIRMED {TP_CONFIRM_COUNT} times - EXITING {sym}", flush=True)
+            
+            # Store trigger spread before closing
+            exit_trigger_spread = current_spread
+            exit_trigger_time = timestamp()
+            
+            # Set TP closing flag BEFORE closing positions
+            tp_closing_in_progress = True
+            
+            # Close positions and capture executed prices
+            close_result = close_all_and_wait_with_tracking(sym)
+            
+            # Reset TP closing flag
+            tp_closing_in_progress = False
+            
+            if close_result:
+                exit_exec_bin_price = close_result.get('bin_exec_price')
+                exit_exec_kc_price = close_result.get('kc_exec_price')
+                
+                # Calculate actual exit spread from executed prices
+                if exit_exec_bin_price and exit_exec_kc_price:
+                    if avg_entry_spread > 0:
+                        # Positive entry: use (bin - kc) / kc
+                        exit_exec_spread = 100 * (exit_exec_bin_price - exit_exec_kc_price) / exit_exec_kc_price
+                    else:
+                        # Negative entry: use (kc - bin) / bin
+                        exit_exec_spread = 100 * (exit_exec_kc_price - exit_exec_bin_price) / exit_exec_bin_price
+                    
+                    # Calculate slippage
+                    exit_slippage = exit_trigger_spread - exit_exec_spread
+                    
+                    logger.info("EXIT SPREADS | trigger=%.4f%% executed=%.4f%% slippage=%.4f%%", 
+                                exit_trigger_spread, exit_exec_spread, exit_slippage)
+                    
+                    msg = f"*{exit_reason}* `{sym}`\nEntry: `{avg_entry_spread:.4f}%`\nExit Trigger: `{exit_trigger_spread:.4f}%`\nExit Executed: `{exit_exec_spread:.4f}%`\nSlippage: `{exit_slippage:.4f}%`\n{exit_trigger_time}"
+                else:
+                    msg = f"*{exit_reason}* `{sym}`\nEntry: `{avg_entry_spread:.4f}%`\nExit Trigger: `{exit_trigger_spread:.4f}%`\n{exit_trigger_time}"
+            else:
+                close_all_and_wait()
+                msg = f"*{exit_reason}* `{sym}`\nEntry: `{avg_entry_spread:.4f}%`\n{exit_trigger_time}"
+            
             send_telegram(msg)
-            close_all_and_wait()
             reset_active_trade()
+            tp_confirm_count = 0
+    else:
+        # Reset confirmation counter if condition not met
+        if tp_confirm_count > 0:
+            logger.info("TP condition no longer met, resetting counter (was %d)", tp_confirm_count)
+        tp_confirm_count = 0
 
 def reset_active_trade():
+    global tp_confirm_count
     sym = active_trade.get('symbol')
     if sym:
         positions[sym] = None
     active_trade.update({'symbol': None, 'ku_api': None, 'ku_ccxt': None, 'case': None, 'entry_spread': None, 'avg_entry_spread': None, 'entry_prices': None, 'notional': None, 'averages_done': 0, 'final_implied_notional': None, 'funding_accumulated_pct': 0.0, 'funding_rounds_seen': set(), 'suppress_full_scan': False})
+    tp_confirm_count = 0  # NEW: Reset TP confirmation counter
     logger.info("Active trade reset")
 
 def funding_round_accounting_loop():
