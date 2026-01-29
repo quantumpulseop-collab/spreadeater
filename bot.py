@@ -1527,7 +1527,8 @@ active_trade = {
     'final_implied_notional': None,
     'funding_accumulated_pct': 0.0,
     'funding_rounds_seen': set(),
-    'suppress_full_scan': False
+    'suppress_full_scan': False,
+    'plan': None  # FIXED: Store plan ('binance', 'kucoin') or ('kucoin', 'binance')
 }
 
 # Confirm counters per symbol (consecutive confirms)
@@ -1862,15 +1863,23 @@ def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, 
     mismatch_pct = abs(implied_bin_amt - implied_kc_amt) / max(implied_bin_amt, implied_kc_amt) * 100 if max(implied_bin_amt, implied_kc_amt) > 0 else 100
     logger.info("IMPLIED NOTIONALS | Binance: $%.6f | KuCoin: $%.6f | mismatch=%.3f%%", implied_bin_amt, implied_kc_amt, mismatch_pct)
     
-    # FIXED: Calculate executed spread - formula depends on which direction we're trading
-    # For positive trigger: BIN bid > KC ask (short BIN, long KC) → use (bin - kc) / kc
-    # For negative trigger: KC bid > BIN ask (long BIN, short KC) → use (kc - bin) / bin
-    if trigger_spread > 0:
-        # Positive trigger spread
-        exec_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc if exec_price_kc > 0 else trigger_spread
-    else:
-        # Negative trigger spread
+    # FIXED: Calculate executed spread - formula depends on the PLAN (which exchange is long/short)
+    # Plan is stored in eval_info
+    plan = eval_info.get('plan')  # ('binance', 'kucoin') or ('kucoin', 'binance')
+    
+    # For plan ('binance', 'kucoin'): long binance, short kucoin → NEGATIVE spread
+    # Formula: (kc_price - bin_price) / bin_price → will be NEGATIVE when kc > bin
+    # For plan ('kucoin', 'binance'): short binance, long kucoin → POSITIVE spread  
+    # Formula: (bin_price - kc_price) / kc_price → will be POSITIVE when bin > kc
+    
+    if plan == ('binance', 'kucoin'):
+        # Long binance, short kucoin → negative spread
+        # Use (kc - bin) / bin
         exec_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin if exec_price_bin > 0 else trigger_spread
+    else:  # plan == ('kucoin', 'binance')
+        # Short binance, long kucoin → positive spread
+        # Use (bin - kc) / kc
+        exec_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc if exec_price_kc > 0 else trigger_spread
     
     # Use minimum of absolute values but preserve the original sign
     if abs(exec_spread) < abs(trigger_spread):
@@ -1894,6 +1903,7 @@ def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, 
     active_trade['funding_accumulated_pct'] = 0.0
     active_trade['funding_rounds_seen'] = set()
     active_trade['suppress_full_scan'] = abs(trigger_spread) >= BIG_SPREAD_THRESHOLD
+    active_trade['plan'] = plan  # FIXED: Store plan for later reference in averaging/TP
     entry_spreads[sym] = practical_entry_spread  # FIXED: Store with sign preserved
     entry_prices.setdefault(sym, {})['kucoin'] = exec_price_kc
     entry_prices.setdefault(sym, {})['binance'] = exec_price_bin
@@ -2131,19 +2141,20 @@ def attempt_averaging_if_needed():
     except Exception:
         return
     
-    # FIXED: Calculate current spread using entry spread direction
-    # For positive entry: use (bin_bid - kc_ask) / kc_ask
-    # For negative entry: use (kc_bid - bin_ask) / bin_ask
-    if avg_entry_spread > 0:
-        # Entry was positive spread
-        if kc_ask <= 0:
-            return
-        current_spread = 100 * (bin_bid - kc_ask) / kc_ask
-    else:
-        # Entry was negative spread
+    # FIXED: Calculate current spread using the PLAN direction (not entry spread sign)
+    # For plan ('binance', 'kucoin'): long bin, short kc → use (kc_bid - bin_ask) / bin_ask
+    # For plan ('kucoin', 'binance'): short bin, long kc → use (bin_bid - kc_ask) / kc_ask
+    plan = active_trade.get('plan')
+    if plan == ('binance', 'kucoin'):
+        # Long binance, short kucoin
         if bin_ask <= 0:
             return
         current_spread = 100 * (kc_bid - bin_ask) / bin_ask
+    else:
+        # Short binance, long kucoin
+        if kc_ask <= 0:
+            return
+        current_spread = 100 * (bin_bid - kc_ask) / kc_ask
     
     logger.info("Averaging check for %s | current_spread=%.4f%% avg_entry=%.4f%%", sym, current_spread, avg_entry_spread)
     
@@ -2165,19 +2176,19 @@ def attempt_averaging_if_needed():
             kc_ccxt = resolve_kucoin_trade_symbol(kucoin, active_trade.get('ku_api') or sym + "M")
             active_trade['ku_ccxt'] = kc_ccxt
         
-        # Use entry spread direction for order placement
-        if avg_entry_spread > 0:
-            # Positive entry: short binance, long kucoin
-            notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL, bin_bid, kc_ask)
-            results = {}
-            def exec_kc(): results['kc'] = safe_create_order(kucoin, 'buy', notional_kc, kc_ask, kc_ccxt)
-            def exec_bin(): results['bin'] = safe_create_order(binance, 'sell', notional_bin, bin_bid, sym)
-        else:
-            # Negative entry: long binance, short kucoin
+        # FIXED: Use plan direction for order placement (not entry spread sign)
+        if plan == ('binance', 'kucoin'):
+            # Long binance, short kucoin
             notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL, bin_ask, kc_bid)
             results = {}
             def exec_kc(): results['kc'] = safe_create_order(kucoin, 'sell', notional_kc, kc_bid, kc_ccxt)
             def exec_bin(): results['bin'] = safe_create_order(binance, 'buy', notional_bin, bin_ask, sym)
+        else:
+            # Short binance, long kucoin
+            notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL, bin_bid, kc_ask)
+            results = {}
+            def exec_kc(): results['kc'] = safe_create_order(kucoin, 'buy', notional_kc, kc_ask, kc_ccxt)
+            def exec_bin(): results['bin'] = safe_create_order(binance, 'sell', notional_bin, bin_bid, sym)
         t1 = threading.Thread(target=exec_kc)
         t2 = threading.Thread(target=exec_bin)
         t1.start(); t2.start(); t1.join(); t2.join()
@@ -2195,15 +2206,15 @@ def attempt_averaging_if_needed():
                 prev_kc = active_trade['final_implied_notional']['kc']
                 prev_avg = active_trade['avg_entry_spread'] or active_trade['entry_spread']
                 
-                # Calculate this averaging spread using entry direction
-                # For positive entry: use (bin - kc) / kc
-                # For negative entry: use (kc - bin) / bin
-                if prev_avg > 0:
-                    # Positive entry
-                    this_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc
-                else:
-                    # Negative entry
+                # FIXED: Calculate this averaging spread using PLAN direction (not entry spread sign)
+                # For plan ('binance', 'kucoin'): long bin, short kc → use (kc - bin) / bin
+                # For plan ('kucoin', 'binance'): short bin, long kc → use (bin - kc) / kc
+                if plan == ('binance', 'kucoin'):
+                    # Long binance, short kucoin
                     this_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin
+                else:
+                    # Short binance, long kucoin
+                    this_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc
                 prev_total = prev_bin + prev_kc
                 new_total = new_implied_bin + new_implied_kc
                 if prev_total + new_total > 0:
@@ -2261,15 +2272,16 @@ def check_take_profit_or_close_conditions():
         tp_confirm_count = 0
         return
     
-    # FIXED: Calculate current spread using the SAME direction as entry spread
-    # For positive entry: use (bin_bid - kc_ask) / kc_ask
-    # For negative entry: use (kc_bid - bin_ask) / bin_ask
-    if avg_entry_spread > 0:
-        # Entry was positive spread (bin > kc)
-        current_spread = 100 * (bin_bid - kc_ask) / kc_ask if kc_ask > 0 else 0.0
-    else:
-        # Entry was negative spread (kc > bin)
+    # FIXED: Calculate current spread using the PLAN direction (not entry spread sign)
+    # For plan ('binance', 'kucoin'): long bin, short kc → use (kc_bid - bin_ask) / bin_ask
+    # For plan ('kucoin', 'binance'): short bin, long kc → use (bin_bid - kc_ask) / kc_ask
+    plan = active_trade.get('plan')
+    if plan == ('binance', 'kucoin'):
+        # Long binance, short kucoin (negative spread)
         current_spread = 100 * (kc_bid - bin_ask) / bin_ask if bin_ask > 0 else 0.0
+    else:
+        # Short binance, long kucoin (positive spread)
+        current_spread = 100 * (bin_bid - kc_ask) / kc_ask if kc_ask > 0 else 0.0
     
     logger.info("TP CHECK | sym=%s | entry_spread=%.4f%% current_spread=%.4f%%", 
                 sym, avg_entry_spread, current_spread)
@@ -2342,12 +2354,13 @@ def check_take_profit_or_close_conditions():
                 
                 # Calculate actual exit spread from executed prices
                 if exit_exec_bin_price and exit_exec_kc_price:
-                    if avg_entry_spread > 0:
-                        # Positive entry: use (bin - kc) / kc
-                        exit_exec_spread = 100 * (exit_exec_bin_price - exit_exec_kc_price) / exit_exec_kc_price
-                    else:
-                        # Negative entry: use (kc - bin) / bin
+                    # FIXED: Use plan direction for exit spread calculation
+                    if plan == ('binance', 'kucoin'):
+                        # Long binance, short kucoin: use (kc - bin) / bin
                         exit_exec_spread = 100 * (exit_exec_kc_price - exit_exec_bin_price) / exit_exec_bin_price
+                    else:
+                        # Short binance, long kucoin: use (bin - kc) / kc
+                        exit_exec_spread = 100 * (exit_exec_bin_price - exit_exec_kc_price) / exit_exec_kc_price
                     
                     # Calculate slippage
                     exit_slippage = exit_trigger_spread - exit_exec_spread
@@ -2376,7 +2389,7 @@ def reset_active_trade():
     sym = active_trade.get('symbol')
     if sym:
         positions[sym] = None
-    active_trade.update({'symbol': None, 'ku_api': None, 'ku_ccxt': None, 'case': None, 'entry_spread': None, 'avg_entry_spread': None, 'entry_prices': None, 'notional': None, 'averages_done': 0, 'final_implied_notional': None, 'funding_accumulated_pct': 0.0, 'funding_rounds_seen': set(), 'suppress_full_scan': False})
+    active_trade.update({'symbol': None, 'ku_api': None, 'ku_ccxt': None, 'case': None, 'entry_spread': None, 'avg_entry_spread': None, 'entry_prices': None, 'notional': None, 'averages_done': 0, 'final_implied_notional': None, 'funding_accumulated_pct': 0.0, 'funding_rounds_seen': set(), 'suppress_full_scan': False, 'plan': None})
     tp_confirm_count = 0  # NEW: Reset TP confirmation counter
     logger.info("Active trade reset")
 
