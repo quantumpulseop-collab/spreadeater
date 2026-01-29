@@ -559,6 +559,9 @@ def _get_signed_position_amount(pos):
     return 0.0
 
 def fetch_position_info(exchange, symbol):
+    """
+    FIXED: Enhanced liquidation price extraction for Binance
+    """
     try:
         pos_list = exchange.fetch_positions([symbol])
     except Exception:
@@ -577,28 +580,75 @@ def fetch_position_info(exchange, symbol):
             signed = _get_signed_from_kucoin_pos(pos)
     except Exception:
         signed = _get_signed_position_amount(pos)
+    
+    # FIXED: Enhanced liquidation price extraction
     liq = None
     info = pos.get('info') or {}
-    for fld in ('liquidationPrice', 'liquidation_price', 'liquidationPriceUsd', 'liquidation'):
-        if fld in pos and pos.get(fld):
-            try:
-                liq = float(pos.get(fld))
-                break
-            except Exception:
-                pass
-        if fld in info and info.get(fld):
-            try:
-                liq = float(info.get(fld))
-                break
-            except Exception:
-                pass
+    
+    # For Binance, try multiple possible fields in the correct order
+    if exchange.id == 'binance':
+        # First try the direct liquidationPrice field from info
+        for fld in ('liquidationPrice', 'liquidation_price', 'liquidationPriceUsd', 'liquidation'):
+            if fld in info and info.get(fld):
+                try:
+                    val = info.get(fld)
+                    # Convert string "0" or 0 to None (means no liquidation price set yet)
+                    if val and str(val) not in ('0', '0.0', '0.00'):
+                        liq = float(val)
+                        logger.info("BINANCE LIQUIDATION EXTRACTED from info.%s: %s", fld, liq)
+                        break
+                except Exception as e:
+                    logger.debug("Failed to parse liquidation from info.%s: %s", fld, e)
+                    pass
+        
+        # If still None, try from the top-level pos object
+        if liq is None:
+            for fld in ('liquidationPrice', 'liquidation_price', 'liquidationPriceUsd', 'liquidation'):
+                if fld in pos and pos.get(fld):
+                    try:
+                        val = pos.get(fld)
+                        if val and str(val) not in ('0', '0.0', '0.00'):
+                            liq = float(val)
+                            logger.info("BINANCE LIQUIDATION EXTRACTED from pos.%s: %s", fld, liq)
+                            break
+                    except Exception as e:
+                        logger.debug("Failed to parse liquidation from pos.%s: %s", fld, e)
+                        pass
+    else:
+        # For KuCoin and other exchanges
+        for fld in ('liquidationPrice', 'liquidation_price', 'liquidationPriceUsd', 'liquidation'):
+            if fld in pos and pos.get(fld):
+                try:
+                    val = pos.get(fld)
+                    if val and str(val) not in ('0', '0.0', '0.00'):
+                        liq = float(val)
+                        break
+                except Exception:
+                    pass
+            if fld in info and info.get(fld):
+                try:
+                    val = info.get(fld)
+                    if val and str(val) not in ('0', '0.0', '0.00'):
+                        liq = float(val)
+                        break
+                except Exception:
+                    pass
+    
+    # Final fallback: check if position dict exists
     if liq is None:
         try:
             if isinstance(info.get('position'), dict) and info.get('position').get('liquidationPrice'):
-                liq = float(info.get('position').get('liquidationPrice'))
+                val = info.get('position').get('liquidationPrice')
+                if val and str(val) not in ('0', '0.0', '0.00'):
+                    liq = float(val)
         except Exception:
             pass
+    
     side = 'long' if signed > 0 else ('short' if signed < 0 else None)
+    
+    logger.info("POSITION INFO for %s %s: signed_qty=%s, liquidationPrice=%s, side=%s", 
+                exchange.id, symbol, signed, liq, side)
+    
     return {'signed_qty': float(signed or 0.0), 'liquidationPrice': liq, 'side': side}
 
 def close_single_exchange_position(exchange, symbol):
@@ -1755,12 +1805,16 @@ def place_reduce_only_stop(exchange, symbol, side, qty, liq_price, buffer_pct=0.
             elif side == 'short':
                 # For short, stop above liq
                 stop_price = liq_price * (1 + buffer_pct)
+            logger.info("✅ STOP PRICE CALCULATED FROM LIQUIDATION PRICE: %s side=%s liq_price=%s stop_price=%s", 
+                       exchange.id, side, liq_price, stop_price)
         elif exec_price_fallback is not None and exec_price_fallback > 0:
             # Use exec price with larger buffer if no liq
             if side == 'long':
                 stop_price = exec_price_fallback * (1 - buffer_pct * 3)
             elif side == 'short':
                 stop_price = exec_price_fallback * (1 + buffer_pct * 3)
+            logger.warning("⚠️  FALLBACK: Using exec price for stop (no liquidation price available): %s side=%s exec_price=%s stop_price=%s", 
+                         exchange.id, side, exec_price_fallback, stop_price)
         
         if stop_price is None or stop_price <= 0:
             logger.warning("Cannot determine valid stop price for %s %s (liq=%s, exec=%s, side=%s)", 
@@ -1808,7 +1862,8 @@ def place_reduce_only_stop(exchange, symbol, side, qty, liq_price, buffer_pct=0.
                     params={
                         'stop': 'down' if order_side == 'sell' else 'up',
                         'stopPrice': stop_price,
-                        'reduceOnly': True
+                        'reduceOnly': True,
+                        'marginMode': 'cross'
                     }
                 )
             logger.info("Stop order placed successfully: %s %s order_id=%s", 
@@ -1920,8 +1975,12 @@ def attempt_averaging_if_needed():
     except Exception:
         return
     if case == 'caseA':
+        if bin_ask <= 0:
+            return
         current_spread = 100 * (kc_bid - bin_ask) / bin_ask
     else:
+        if kc_ask <= 0:
+            return
         current_spread = 100 * (bin_bid - kc_ask) / kc_ask
     logger.info("Averaging check for %s | current_spread=%.4f%% avg_entry=%.4f%%", sym, current_spread, avg_entry_spread)
     if current_spread >= AVERAGE_TRIGGER_MULTIPLIER * avg_entry_spread:
@@ -2000,6 +2059,9 @@ def check_take_profit_or_close_conditions():
             return
         bin_bid, bin_ask = bin_price
         kc_bid, kc_ask = kc_price
+        # Validate prices to prevent division by zero
+        if bin_bid <= 0 or bin_ask <= 0 or kc_bid <= 0 or kc_ask <= 0:
+            return
     except Exception:
         return
     if case == 'caseA':
