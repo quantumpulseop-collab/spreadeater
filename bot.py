@@ -808,7 +808,7 @@ def close_all_and_wait(timeout_s=20, poll_interval=0.5):
 
 def close_all_and_wait_with_tracking(target_sym, timeout_s=20, poll_interval=0.5):
     """
-    NEW: Close positions and track executed prices for exit spread calculation
+    FIXED: Close positions on BOTH exchanges in PARALLEL to minimize timing gap
     Returns dict with bin_exec_price and kc_exec_price
     """
     global closing_in_progress
@@ -817,81 +817,106 @@ def close_all_and_wait_with_tracking(target_sym, timeout_s=20, poll_interval=0.5
     
     result = {'bin_exec_price': None, 'kc_exec_price': None}
     
-    # Close on Binance and track execution
-    try:
-        all_bin_pos = binance.fetch_positions()
-    except Exception:
-        all_bin_pos = []
-    for pos in all_bin_pos:
+    # FIXED: Use threading to close BOTH exchanges simultaneously
+    def close_binance_positions():
+        """Close Binance positions and track execution"""
         try:
-            sym = pos.get('symbol') or (pos.get('info') or {}).get('symbol')
-            if not sym or sym != target_sym:
-                continue
-            signed = _get_signed_from_binance_pos(pos)
-            if abs(float(signed or 0)) == 0:
-                continue
-            side = 'sell' if signed > 0 else 'buy'
-            market = get_market(binance, sym)
-            prec = market.get('precision', {}).get('amount') if market else None
-            qty = round_down(abs(signed), prec) if prec is not None else abs(signed)
-            if qty > 0:
-                try:
-                    logger.info(f"Closing Binance {sym} {side} {qty} (with tracking)")
+            all_bin_pos = binance.fetch_positions()
+        except Exception as e:
+            logger.error(f"Error fetching Binance positions: {e}")
+            all_bin_pos = []
+        
+        for pos in all_bin_pos:
+            try:
+                sym = pos.get('symbol') or (pos.get('info') or {}).get('symbol')
+                if not sym or sym != target_sym:
+                    continue
+                signed = _get_signed_from_binance_pos(pos)
+                if abs(float(signed or 0)) == 0:
+                    continue
+                side = 'sell' if signed > 0 else 'buy'
+                market = get_market(binance, sym)
+                prec = market.get('precision', {}).get('amount') if market else None
+                qty = round_down(abs(signed), prec) if prec is not None else abs(signed)
+                if qty > 0:
                     try:
-                        order = binance.create_market_order(sym, side, qty, params={'reduceOnly': True})
-                    except TypeError:
-                        order = binance.create_order(symbol=sym, type='market', side=side, amount=qty, params={'reduceOnly': True})
-                    # Extract executed price
-                    if order:
-                        exec_price = float(order.get('price') or order.get('average') or order.get('info', {}).get('avgPrice') or 0)
-                        if exec_price > 0:
-                            result['bin_exec_price'] = exec_price
-                            logger.info(f"Binance exit executed @ {exec_price}")
-                except Exception:
-                    logger.exception("Error closing binance position %s", sym)
-        except Exception:
-            continue
+                        logger.info(f"Closing Binance {sym} {side} {qty} (parallel)")
+                        try:
+                            order = binance.create_market_order(sym, side, qty, params={'reduceOnly': True})
+                        except TypeError:
+                            order = binance.create_order(symbol=sym, type='market', side=side, amount=qty, params={'reduceOnly': True})
+                        # Extract executed price
+                        if order:
+                            exec_price = float(order.get('price') or order.get('average') or order.get('info', {}).get('avgPrice') or 0)
+                            if exec_price > 0:
+                                result['bin_exec_price'] = exec_price
+                                logger.info(f"✅ Binance exit executed @ {exec_price}")
+                    except Exception as e:
+                        logger.exception("Error closing binance position %s: %s", sym, e)
+            except Exception:
+                continue
     
-    # Close on KuCoin and track execution
-    try:
-        all_kc_pos = kucoin.fetch_positions()
-    except Exception:
-        all_kc_pos = []
-    for pos in all_kc_pos:
+    def close_kucoin_positions():
+        """Close KuCoin positions and track execution"""
         try:
-            sym = pos.get('symbol') or (pos.get('info') or {}).get('symbol')
-            # Match against ku_ccxt symbol
-            if not sym or (active_trade.get('ku_ccxt') and sym != active_trade.get('ku_ccxt')):
+            all_kc_pos = kucoin.fetch_positions()
+        except Exception as e:
+            logger.error(f"Error fetching KuCoin positions: {e}")
+            all_kc_pos = []
+        
+        for pos in all_kc_pos:
+            try:
+                sym = pos.get('symbol') or (pos.get('info') or {}).get('symbol')
+                # Match against ku_ccxt symbol
+                if not sym or (active_trade.get('ku_ccxt') and sym != active_trade.get('ku_ccxt')):
+                    continue
+                signed = _get_signed_from_kucoin_pos(pos)
+                if abs(float(signed or 0)) == 0:
+                    continue
+                side = 'sell' if signed > 0 else 'buy'
+                market = get_market(kucoin, sym)
+                prec = market.get('precision', {}).get('amount') if market else None
+                qty = round_down(abs(signed), prec) if prec is not None else abs(signed)
+                if qty > 0:
+                    try:
+                        logger.info(f"Closing KuCoin {sym} {side} {qty} (parallel)")
+                        order = kucoin.create_market_order(sym, side, qty, params={'reduceOnly': True, 'marginMode': 'cross'})
+                        # Extract executed price
+                        if order:
+                            exec_price = float(order.get('price') or order.get('average') or order.get('info', {}).get('avgPrice') or 0)
+                            if exec_price > 0:
+                                result['kc_exec_price'] = exec_price
+                                logger.info(f"✅ KuCoin exit executed @ {exec_price}")
+                    except Exception as e:
+                        logger.exception("Error closing kucoin position %s: %s", sym, e)
+            except Exception:
                 continue
-            signed = _get_signed_from_kucoin_pos(pos)
-            if abs(float(signed or 0)) == 0:
-                continue
-            side = 'sell' if signed > 0 else 'buy'
-            market = get_market(kucoin, sym)
-            prec = market.get('precision', {}).get('amount') if market else None
-            qty = round_down(abs(signed), prec) if prec is not None else abs(signed)
-            if qty > 0:
-                try:
-                    logger.info(f"Closing KuCoin {sym} {side} {qty} (with tracking)")
-                    order = kucoin.create_market_order(sym, side, qty, params={'reduceOnly': True, 'marginMode': 'cross'})
-                    # Extract executed price
-                    if order:
-                        exec_price = float(order.get('price') or order.get('average') or order.get('info', {}).get('avgPrice') or 0)
-                        if exec_price > 0:
-                            result['kc_exec_price'] = exec_price
-                            logger.info(f"KuCoin exit executed @ {exec_price}")
-                except Exception:
-                    logger.exception("Error closing kucoin position %s", sym)
-        except Exception:
-            continue
     
-    # Wait for positions to close
+    # CRITICAL FIX: Execute BOTH closings in PARALLEL using threads
+    thread_bin = threading.Thread(target=close_binance_positions, name="BinanceCloser")
+    thread_kc = threading.Thread(target=close_kucoin_positions, name="KuCoinCloser")
+    
+    logger.info("⚡ Starting PARALLEL position closing on both exchanges...")
+    start_close = time.time()
+    thread_bin.start()
+    thread_kc.start()
+    
+    # Wait for both to complete
+    thread_bin.join()
+    thread_kc.join()
+    close_duration = time.time() - start_close
+    logger.info("✅ Both exchange closings completed in %.2f seconds", close_duration)
+    
+    # Wait for positions to close (with improved error handling)
     start = time.time()
+    check_count = 0
     while time.time() - start < timeout_s:
+        check_count += 1
         try:
             bin_check = binance.fetch_positions()
             kc_check = kucoin.fetch_positions()
             any_open = False
+            
             for p in (bin_check or []):
                 if abs(float(_get_signed_from_binance_pos(p) or 0)) > 0:
                     any_open = True
@@ -901,19 +926,19 @@ def close_all_and_wait_with_tracking(target_sym, timeout_s=20, poll_interval=0.5
                     if abs(float(_get_signed_from_kucoin_pos(p) or 0)) > 0:
                         any_open = True
                         break
-            logger.info("Checking open positions... any_open=%s", any_open)
+            logger.info(f"Position check #{check_count}: any_open={any_open}, elapsed={time.time()-start:.1f}s")
             if not any_open:
                 closing_in_progress = False
                 total_bal, bin_bal, kc_bal = get_total_futures_balance()
                 logger.info("*** POST-EXIT Total Balance approx: ${:.2f} (Binance: ${:.2f} | KuCoin: ${:.2f}) ***".format(total_bal, bin_bal, kc_bal))
                 logger.info("EXIT TRACKING | bin_exec=%.6f kc_exec=%.6f", result.get('bin_exec_price') or 0, result.get('kc_exec_price') or 0)
                 return result
-        except Exception:
-            logger.exception("Error checking positions in close_all_and_wait_with_tracking")
+        except Exception as e:
+            logger.exception(f"Error checking positions (attempt #{check_count}): {e}")
         time.sleep(poll_interval)
     
     closing_in_progress = False
-    logger.warning("Timeout waiting for positions to close in tracking mode")
+    logger.warning("⚠️  Timeout waiting for positions to close in tracking mode after %d checks", check_count)
     return result
 
 # Exec price/time/qty extractor and KuCoin poller (preserved)
@@ -2319,11 +2344,13 @@ def check_take_profit_or_close_conditions():
         else:
             # Check funding accumulation
             funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
-            if funding_acc > target_convergence:
+            # CHANGED: Now funding_acc can be negative (net received) or positive (net paid)
+            # Only close if NET PAID funding exceeds target (positive funding_acc > target)
+            if funding_acc > 0 and funding_acc > target_convergence:
                 # Only close if spread hasn't widened too much
                 if abs(current_spread) <= (1.5 * abs(avg_entry_spread)):
                     should_exit = True
-                    exit_reason = f"FUNDING LOSS (acc={funding_acc:.4f}% > target={target_convergence:.4f}%)"
+                    exit_reason = f"FUNDING LOSS (net paid={funding_acc:.4f}% > target={target_convergence:.4f}%)"
     
     # NEW: 3-confirmation logic for exit
     if should_exit:
@@ -2339,6 +2366,10 @@ def check_take_profit_or_close_conditions():
             exit_trigger_spread = current_spread
             exit_trigger_time = timestamp()
             
+            # ADDED: Capture pre-trade balance
+            pre_total, pre_bin, pre_kc = get_total_futures_balance()
+            net_funding_total = active_trade.get('funding_accumulated_pct', 0.0)
+            
             # Set TP closing flag BEFORE closing positions
             tp_closing_in_progress = True
             
@@ -2347,6 +2378,9 @@ def check_take_profit_or_close_conditions():
             
             # Reset TP closing flag
             tp_closing_in_progress = False
+            
+            # ADDED: Capture post-trade balance
+            post_total, post_bin, post_kc = get_total_futures_balance()
             
             if close_result:
                 exit_exec_bin_price = close_result.get('bin_exec_price')
@@ -2368,12 +2402,54 @@ def check_take_profit_or_close_conditions():
                     logger.info("EXIT SPREADS | trigger=%.4f%% executed=%.4f%% slippage=%.4f%%", 
                                 exit_trigger_spread, exit_exec_spread, exit_slippage)
                     
-                    msg = f"*{exit_reason}* `{sym}`\nEntry: `{avg_entry_spread:.4f}%`\nExit Trigger: `{exit_trigger_spread:.4f}%`\nExit Executed: `{exit_exec_spread:.4f}%`\nSlippage: `{exit_slippage:.4f}%`\n{exit_trigger_time}"
+                    # CHANGED: Enhanced telegram message with pre/post balance and net funding
+                    funding_status = "received" if net_funding_total < 0 else "paid"
+                    msg = (
+                        f"*{exit_reason}* `{sym}`\n"
+                        f"Entry: `{avg_entry_spread:.4f}%`\n"
+                        f"Exit Trigger: `{exit_trigger_spread:.4f}%`\n"
+                        f"Exit Executed: `{exit_exec_spread:.4f}%`\n"
+                        f"Slippage: `{exit_slippage:.4f}%`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Net Funding: `{abs(net_funding_total):.4f}%` ({funding_status})\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Pre-Balance: `${pre_total:.2f}`\n"
+                        f"  Binance: `${pre_bin:.2f}`\n"
+                        f"  KuCoin: `${pre_kc:.2f}`\n"
+                        f"Post-Balance: `${post_total:.2f}`\n"
+                        f"  Binance: `${post_bin:.2f}`\n"
+                        f"  KuCoin: `${post_kc:.2f}`\n"
+                        f"P&L: `${post_total - pre_total:.2f}`\n"
+                        f"{exit_trigger_time}"
+                    )
                 else:
-                    msg = f"*{exit_reason}* `{sym}`\nEntry: `{avg_entry_spread:.4f}%`\nExit Trigger: `{exit_trigger_spread:.4f}%`\n{exit_trigger_time}"
+                    funding_status = "received" if net_funding_total < 0 else "paid"
+                    msg = (
+                        f"*{exit_reason}* `{sym}`\n"
+                        f"Entry: `{avg_entry_spread:.4f}%`\n"
+                        f"Exit Trigger: `{exit_trigger_spread:.4f}%`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Net Funding: `{abs(net_funding_total):.4f}%` ({funding_status})\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Pre-Balance: `${pre_total:.2f}`\n"
+                        f"Post-Balance: `${post_total:.2f}`\n"
+                        f"P&L: `${post_total - pre_total:.2f}`\n"
+                        f"{exit_trigger_time}"
+                    )
             else:
                 close_all_and_wait()
-                msg = f"*{exit_reason}* `{sym}`\nEntry: `{avg_entry_spread:.4f}%`\n{exit_trigger_time}"
+                funding_status = "received" if net_funding_total < 0 else "paid"
+                msg = (
+                    f"*{exit_reason}* `{sym}`\n"
+                    f"Entry: `{avg_entry_spread:.4f}%`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Net Funding: `{abs(net_funding_total):.4f}%` ({funding_status})\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Pre-Balance: `${pre_total:.2f}`\n"
+                    f"Post-Balance: `${post_total:.2f}`\n"
+                    f"P&L: `${post_total - pre_total:.2f}`\n"
+                    f"{exit_trigger_time}"
+                )
             
             send_telegram(msg)
             reset_active_trade()
@@ -2421,10 +2497,12 @@ def funding_round_accounting_loop():
                             net = compute_net_funding_for_plan(b_pct, k_pct, 'binance','kucoin')
                         else:
                             net = compute_net_funding_for_plan(b_pct, k_pct, 'kucoin','binance')
-                        expense = abs(net) if net < 0 else 0.0
-                        active_trade['funding_accumulated_pct'] += expense
+                        # CHANGED: Now tracks NET funding (positive = received, negative = paid)
+                        # This allows received funding to offset paid funding
+                        active_trade['funding_accumulated_pct'] += net  # Direct addition (negative reduces, positive increases)
                         active_trade['funding_rounds_seen'].add(next_ft)
-                        send_telegram(f"*FUNDING ROUND APPLIED* `{sym}`\nBinance: `{b_pct}`% KuCoin: `{k_pct}`%\nNet: `{net}`% expense `{expense}`%\nAccumulated funding expense: `{active_trade['funding_accumulated_pct']:.4f}%`\n{timestamp()}")
+                        funding_status = "received" if net > 0 else "paid"
+                        send_telegram(f"*FUNDING ROUND APPLIED* `{sym}`\nBinance: `{b_pct:.4f}`% KuCoin: `{k_pct:.4f}`%\nNet: `{net:.4f}%` ({funding_status})\nNet accumulated funding: `{active_trade['funding_accumulated_pct']:.4f}%`\n{timestamp()}")
                 except Exception:
                     logger.exception("Error in funding_round_accounting loop")
             time.sleep(10)
@@ -2580,12 +2658,14 @@ def periodic_trade_maintenance_loop():
                         best_sym = sym
                         best_info = {"ku_sym": ku_sym, "bin_bid": bin_tick["bid"], "bin_ask": bin_tick["ask"], "ku_bid": ku_tick["bid"], "ku_ask": ku_tick["ask"]}
                 if best_sym and abs(best_spread) >= BIG_SPREAD_THRESHOLD and (active_trade.get('avg_entry_spread') or 0.0) < 4.0:
-                    send_telegram(f"*TAKEOVER SIGNAL* `{best_sym}` spread `{best_spread:.4f}%` >= {BIG_SPREAD_THRESHOLD}%\nClosing current `{active_trade['symbol']}` and entering `{best_sym}` with 2x notional\n{timestamp()}")
+                    # CHANGED: Now works for ANY direction (positive or negative spread >= 7.5%)
+                    # Keeps the original 4.0% entry restriction as requested
+                    send_telegram(f"*TAKEOVER SIGNAL* `{best_sym}` spread `{best_spread:.4f}%` (any direction)\nCurrent trade: `{active_trade['symbol']}` entry `{active_trade.get('avg_entry_spread', 0.0):.4f}%`\nClosing current and entering new with 2x notional\n{timestamp()}")
                     close_all_and_wait()
                     reset_active_trade()
                     eval_info = {'plan': ('binance','kucoin') if best_info['ku_bid'] > best_info['bin_ask'] else ('kucoin','binance'),'ku_api_sym': best_info['ku_sym'],'bin_bid':best_info['bin_bid'],'bin_ask':best_info['bin_ask'],'kc_bid':best_info['ku_bid'],'kc_ask':best_info['ku_ask'],'trigger_spread':best_spread,'net_fr':0.0}
                     execute_pair_trade_with_snapshots(best_sym, eval_info, initial_multiplier=BIG_SPREAD_ENTRY_MULTIPLIER)
-            time.sleep(5)
+            time.sleep(2)  # FIXED: Reduced from 5s to 2s for faster TP confirmations
         except Exception:
             logger.exception("trade maintenance loop error")
             time.sleep(2)
