@@ -43,7 +43,7 @@ KC_TRANSIENT_BACKOFF_SECONDS = float(os.getenv('KC_TRANSIENT_BACKOFF_SECONDS', "
 
 # Strategy-specific params (as agreed)
 FR_ADVANTAGE_THRESHOLD = 0.01
-CASE1_MIN_SPREAD = 1.5
+CASE1_MIN_SPREAD = 1.8  # CHANGED: Was 1.5%, now 1.8%
 CASE2_MULT = 13.0
 CASE3_MULT = 15.0
 BIG_SPREAD_THRESHOLD = 7.5
@@ -52,7 +52,7 @@ MAX_AVERAGES = 2
 AVERAGE_TRIGGER_MULTIPLIER = 2.0
 TAKE_PROFIT_FACTOR = 0.5
 MIN_FR_DIFF_THRESHOLD = 0.01  # CHANGED: Minimum funding rate difference (was 0.12%, now 0.01%)
-MIN_SPREAD_THRESHOLD = 1.5     # NEW: Minimum spread required for ANY entry
+MIN_SPREAD_THRESHOLD = 1.8     # CHANGED: Minimum spread required for ANY entry (was 1.5%)
 
 SCAN_THRESHOLD = 0.25
 ALERT_THRESHOLD = 5.0
@@ -381,6 +381,50 @@ def compute_net_funding_for_plan(bin_fr_pct, kc_fr_pct, plan_long='binance', pla
         return 0.0
     except Exception:
         return 0.0
+
+# FIXED: Add dynamic funding interval detection
+def detect_funding_interval_hours(bin_next_ms, kc_next_ms):
+    """
+    Dynamically detect funding interval by checking time until next funding.
+    Returns estimated interval in hours (1, 2, 4, or 8).
+    """
+    try:
+        now_ms = int(time.time() * 1000)
+        intervals = []
+        
+        if bin_next_ms and bin_next_ms > now_ms:
+            time_left_ms = bin_next_ms - now_ms
+            time_left_hours = time_left_ms / (1000 * 60 * 60)
+            # Round to nearest standard interval
+            if time_left_hours <= 1.5:
+                intervals.append(1)
+            elif time_left_hours <= 3:
+                intervals.append(2)
+            elif time_left_hours <= 6:
+                intervals.append(4)
+            else:
+                intervals.append(8)
+        
+        if kc_next_ms and kc_next_ms > now_ms:
+            time_left_ms = kc_next_ms - now_ms
+            time_left_hours = time_left_ms / (1000 * 60 * 60)
+            # Round to nearest standard interval
+            if time_left_hours <= 1.5:
+                intervals.append(1)
+            elif time_left_hours <= 3:
+                intervals.append(2)
+            elif time_left_hours <= 6:
+                intervals.append(4)
+            else:
+                intervals.append(8)
+        
+        if intervals:
+            # Use minimum interval (most frequent funding)
+            return min(intervals)
+        return 4  # Default to 4h if can't detect
+    except Exception:
+        logger.exception("Error detecting funding interval")
+        return 4  # Default fallback
 
 # Spreadeater helpers (preserved)
 def ensure_markets_loaded():
@@ -806,6 +850,50 @@ def close_all_and_wait(timeout_s=20, poll_interval=0.5):
     logger.info("Timeout waiting for positions to close.")
     return False
 
+def cancel_all_open_orders(target_sym):
+    """
+    Cancel all open orders (especially stop orders) on both exchanges for the target symbol.
+    This is CRITICAL for Binance because conditional STOP_MARKET orders prevent
+    reduce-only market orders from executing.
+    """
+    logger.info("🔄 Cancelling all open orders for %s on both exchanges...", target_sym)
+    
+    # Cancel Binance orders
+    try:
+        binance_orders = binance.fetch_open_orders(target_sym)
+        if binance_orders:
+            logger.info(f"Found {len(binance_orders)} open Binance orders to cancel for {target_sym}")
+            for order in binance_orders:
+                try:
+                    binance.cancel_order(order['id'], target_sym)
+                    logger.info(f"✅ Cancelled Binance order {order['id']} (type={order.get('type')})")
+                except Exception as e:
+                    logger.warning(f"Failed to cancel Binance order {order.get('id')}: {e}")
+        else:
+            logger.info("No open Binance orders to cancel")
+    except Exception as e:
+        logger.warning(f"Error fetching/cancelling Binance orders for {target_sym}: {e}")
+    
+    # Cancel KuCoin orders (for the ku_ccxt symbol)
+    try:
+        ku_ccxt_sym = active_trade.get('ku_ccxt')
+        if ku_ccxt_sym:
+            kucoin_orders = kucoin.fetch_open_orders(ku_ccxt_sym)
+            if kucoin_orders:
+                logger.info(f"Found {len(kucoin_orders)} open KuCoin orders to cancel for {ku_ccxt_sym}")
+                for order in kucoin_orders:
+                    try:
+                        kucoin.cancel_order(order['id'], ku_ccxt_sym)
+                        logger.info(f"✅ Cancelled KuCoin order {order['id']} (type={order.get('type')})")
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel KuCoin order {order.get('id')}: {e}")
+            else:
+                logger.info("No open KuCoin orders to cancel")
+    except Exception as e:
+        logger.warning(f"Error fetching/cancelling KuCoin orders: {e}")
+    
+    logger.info("✅ Order cancellation complete")
+
 def close_all_and_wait_with_tracking(target_sym, timeout_s=20, poll_interval=0.5):
     """
     FIXED: Close positions on BOTH exchanges in PARALLEL to minimize timing gap
@@ -814,6 +902,11 @@ def close_all_and_wait_with_tracking(target_sym, timeout_s=20, poll_interval=0.5
     global closing_in_progress
     closing_in_progress = True
     logger.info("Closing all positions with tracking for %s...", target_sym)
+    
+    # CRITICAL FIX: Cancel all open orders (especially stop orders) BEFORE closing positions
+    # This is essential for Binance because conditional STOP_MARKET orders prevent
+    # reduce-only market orders from executing
+    cancel_all_open_orders(target_sym)
     
     result = {'bin_exec_price': None, 'kc_exec_price': None}
     
@@ -852,9 +945,23 @@ def close_all_and_wait_with_tracking(target_sym, timeout_s=20, poll_interval=0.5
                                 result['bin_exec_price'] = exec_price
                                 logger.info(f"✅ Binance exit executed @ {exec_price}")
                     except Exception as e:
-                        logger.exception("Error closing binance position %s: %s", sym, e)
-            except Exception:
-                continue
+                        logger.warning(f"reduceOnly close failed for Binance {sym}, trying closePosition fallback: {e}")
+                        # CRITICAL FALLBACK: Use closePosition to bypass stop orders
+                        try:
+                            logger.info(f"Attempting closePosition fallback for Binance {sym}")
+                            try:
+                                order = binance.create_order(symbol=sym, type='market', side=side, amount=None, params={'closePosition': True})
+                            except TypeError:
+                                order = binance.create_order(sym, 'market', side, params={'closePosition': True})
+                            logger.info(f"✅ Binance closePosition fallback succeeded for {sym}")
+                            if order:
+                                exec_price = float(order.get('price') or order.get('average') or order.get('info', {}).get('avgPrice') or 0)
+                                if exec_price > 0:
+                                    result['bin_exec_price'] = exec_price
+                        except Exception as e2:
+                            logger.exception(f"closePosition fallback also failed for Binance {sym}: {e2}")
+            except Exception as ex:
+                logger.exception(f"Unexpected error in close_binance_positions loop: {ex}")
     
     def close_kucoin_positions():
         """Close KuCoin positions and track execution"""
@@ -1350,13 +1457,41 @@ def get_prices_for_symbol(sym, ku_api_sym):
 # Liquidation watcher adapted
 _liquidation_watchers = {}
 
+# FIXED: Cache Binance positions to avoid excessive API calls
+_binance_position_cache = {}
+_binance_position_cache_lock = threading.Lock()
+_binance_position_cache_time = {}
+BINANCE_POSITION_CACHE_TTL = 2.0  # Cache for 2 seconds
+
 def _fetch_signed_binance(sym):
+    """
+    FIXED: Use cached positions to avoid hitting rate limits.
+    This function is called very frequently by the liquidation watcher.
+    """
     try:
+        now = time.time()
+        with _binance_position_cache_lock:
+            # Check if we have a recent cached value
+            if sym in _binance_position_cache and sym in _binance_position_cache_time:
+                if now - _binance_position_cache_time[sym] < BINANCE_POSITION_CACHE_TTL:
+                    return _binance_position_cache[sym]
+        
+        # Need to fetch fresh data
         p = binance.fetch_positions([sym])
         if not p:
+            with _binance_position_cache_lock:
+                _binance_position_cache[sym] = 0.0
+                _binance_position_cache_time[sym] = now
             return 0.0
         pos = p[0]
-        return _get_signed_from_binance_pos(pos)
+        signed_qty = _get_signed_from_binance_pos(pos)
+        
+        # Update cache
+        with _binance_position_cache_lock:
+            _binance_position_cache[sym] = signed_qty
+            _binance_position_cache_time[sym] = now
+        
+        return signed_qty
     except Exception as e:
         logger.info(f"{datetime.utcnow().isoformat()} BINANCE fetch error for {sym}: {e}")
         return None
@@ -1553,7 +1688,10 @@ active_trade = {
     'funding_accumulated_pct': 0.0,
     'funding_rounds_seen': set(),
     'suppress_full_scan': False,
-    'plan': None  # FIXED: Store plan ('binance', 'kucoin') or ('kucoin', 'binance')
+    'plan': None,  # FIXED: Store plan ('binance', 'kucoin') or ('kucoin', 'binance')
+    'avg_count': 0,  # NEW: Track averaging count
+    'final_averaged_price_bin': None,  # NEW: Track final averaged entry price on Binance
+    'final_averaged_price_kc': None   # NEW: Track final averaged entry price on KuCoin
 }
 
 # Confirm counters per symbol (consecutive confirms)
@@ -2249,11 +2387,15 @@ def attempt_averaging_if_needed():
                 else:
                     new_avg = this_spread
                 active_trade['averages_done'] += 1
+                active_trade['avg_count'] = active_trade['averages_done']  # NEW: Track averaging count
                 active_trade['avg_entry_spread'] = new_avg
                 active_trade['final_implied_notional']['bin'] = prev_bin + new_implied_bin
                 active_trade['final_implied_notional']['kc'] = prev_kc + new_implied_kc
+                # NEW: Track final averaged entry prices
+                active_trade['final_averaged_price_bin'] = exec_price_bin
+                active_trade['final_averaged_price_kc'] = exec_price_kc
                 try_place_stops_after_entry(sym, kc_ccxt, exec_price_bin or None, exec_price_kc or None, None, None)
-                send_telegram(f"*AVERAGE ADDED* `{sym}` -> new avg spread `{new_avg:.4f}%` (averages_done={active_trade['averages_done']})\n{timestamp()}")
+                send_telegram(f"*AVERAGE ADDED* `{sym}` -> new avg spread `{new_avg:.4f}%` (averages_done={active_trade['averages_done']})\nBin: `{exec_price_bin:.6f}` | KC: `{exec_price_kc:.6f}`\n{timestamp()}")
             except Exception:
                 logger.exception("Error aggregating averaging results")
         else:
@@ -2403,9 +2545,22 @@ def check_take_profit_or_close_conditions():
                                 exit_trigger_spread, exit_exec_spread, exit_slippage)
                     
                     # CHANGED: Enhanced telegram message with pre/post balance and net funding
+                    # NEW: Add averaging information if averaging occurred
                     funding_status = "received" if net_funding_total < 0 else "paid"
+                    avg_count = active_trade.get('avg_count', 0)
+                    averaging_info = ""
+                    if avg_count > 0:
+                        final_bin_price = active_trade.get('final_averaged_price_bin')
+                        final_kc_price = active_trade.get('final_averaged_price_kc')
+                        averaging_info = f"Averaging: `{avg_count}x`\n"
+                        if final_bin_price:
+                            averaging_info += f"Avg Entry Bin: `{final_bin_price:.6f}`\n"
+                        if final_kc_price:
+                            averaging_info += f"Avg Entry KC: `{final_kc_price:.6f}`\n"
+                    
                     msg = (
                         f"*{exit_reason}* `{sym}`\n"
+                        f"{averaging_info}"
                         f"Entry: `{avg_entry_spread:.4f}%`\n"
                         f"Exit Trigger: `{exit_trigger_spread:.4f}%`\n"
                         f"Exit Executed: `{exit_exec_spread:.4f}%`\n"
@@ -2423,9 +2578,22 @@ def check_take_profit_or_close_conditions():
                         f"{exit_trigger_time}"
                     )
                 else:
+                    # NEW: Add averaging information
+                    avg_count = active_trade.get('avg_count', 0)
+                    averaging_info = ""
+                    if avg_count > 0:
+                        final_bin_price = active_trade.get('final_averaged_price_bin')
+                        final_kc_price = active_trade.get('final_averaged_price_kc')
+                        averaging_info = f"Averaging: `{avg_count}x`\n"
+                        if final_bin_price:
+                            averaging_info += f"Avg Entry Bin: `{final_bin_price:.6f}`\n"
+                        if final_kc_price:
+                            averaging_info += f"Avg Entry KC: `{final_kc_price:.6f}`\n"
+                    
                     funding_status = "received" if net_funding_total < 0 else "paid"
                     msg = (
                         f"*{exit_reason}* `{sym}`\n"
+                        f"{averaging_info}"
                         f"Entry: `{avg_entry_spread:.4f}%`\n"
                         f"Exit Trigger: `{exit_trigger_spread:.4f}%`\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -2438,9 +2606,22 @@ def check_take_profit_or_close_conditions():
                     )
             else:
                 close_all_and_wait()
+                # NEW: Add averaging information
+                avg_count = active_trade.get('avg_count', 0)
+                averaging_info = ""
+                if avg_count > 0:
+                    final_bin_price = active_trade.get('final_averaged_price_bin')
+                    final_kc_price = active_trade.get('final_averaged_price_kc')
+                    averaging_info = f"Averaging: `{avg_count}x`\n"
+                    if final_bin_price:
+                        averaging_info += f"Avg Entry Bin: `{final_bin_price:.6f}`\n"
+                    if final_kc_price:
+                        averaging_info += f"Avg Entry KC: `{final_kc_price:.6f}`\n"
+                
                 funding_status = "received" if net_funding_total < 0 else "paid"
                 msg = (
                     f"*{exit_reason}* `{sym}`\n"
+                    f"{averaging_info}"
                     f"Entry: `{avg_entry_spread:.4f}%`\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"Net Funding: `{abs(net_funding_total):.4f}%` ({funding_status})\n"
@@ -2465,7 +2646,7 @@ def reset_active_trade():
     sym = active_trade.get('symbol')
     if sym:
         positions[sym] = None
-    active_trade.update({'symbol': None, 'ku_api': None, 'ku_ccxt': None, 'case': None, 'entry_spread': None, 'avg_entry_spread': None, 'entry_prices': None, 'notional': None, 'averages_done': 0, 'final_implied_notional': None, 'funding_accumulated_pct': 0.0, 'funding_rounds_seen': set(), 'suppress_full_scan': False, 'plan': None})
+    active_trade.update({'symbol': None, 'ku_api': None, 'ku_ccxt': None, 'case': None, 'entry_spread': None, 'avg_entry_spread': None, 'entry_prices': None, 'notional': None, 'averages_done': 0, 'final_implied_notional': None, 'funding_accumulated_pct': 0.0, 'funding_rounds_seen': set(), 'suppress_full_scan': False, 'plan': None, 'avg_count': 0, 'final_averaged_price_bin': None, 'final_averaged_price_kc': None})
     tp_confirm_count = 0  # NEW: Reset TP confirmation counter
     logger.info("Active trade reset")
 
@@ -2883,7 +3064,73 @@ try:
                 if s not in current_syms:
                     confirm_counts[s] = 0
         else:
-            # Active trade present; maintenance threads handle averaging/TP; main loop sleeps
+            # Active trade present
+            # NEW: Check for 7.5%+ big spread override - close current trade and enter new one
+            # Only if current practical entry spread < 4%
+            current_practical_entry = active_trade.get('avg_entry_spread', 0.0)
+            
+            if abs(current_practical_entry) < 4.0:
+                # Check for big spread candidate
+                big_spread_candidate = None
+                big_spread_info = None
+                
+                with candidates_shared_lock:
+                    for sym, info in candidates_shared.items():
+                        # Skip current symbol
+                        if sym == active_trade.get('symbol'):
+                            continue
+                        max_spread = info.get('max_spread', info.get('start_spread', 0.0))
+                        if abs(max_spread) >= BIG_SPREAD_THRESHOLD:
+                            big_spread_candidate = sym
+                            big_spread_info = info
+                            logger.info("BIG SPREAD OVERRIDE DETECTED: %s spread=%.4f%% (current trade entry=%.4f%%)", 
+                                      sym, max_spread, current_practical_entry)
+                            break
+                
+                if big_spread_candidate and big_spread_info:
+                    logger.info("CLOSING current trade to enter BIG SPREAD: %s (%.4f%%)", big_spread_candidate, big_spread_info.get('max_spread'))
+                    send_telegram(f"*BIG SPREAD OVERRIDE*\nClosing `{active_trade.get('symbol')}` (entry={current_practical_entry:.4f}%)\nEntering `{big_spread_candidate}` ({big_spread_info.get('max_spread', 0.0):.4f}%)\n{timestamp()}")
+                    
+                    # Close current trade
+                    try:
+                        close_all_and_wait()
+                        reset_active_trade()
+                    except Exception:
+                        logger.exception("Error closing current trade for big spread override")
+                    
+                    # Enter new big spread trade
+                    sym = big_spread_candidate
+                    ku_api_sym = big_spread_info.get('ku_sym')
+                    bin_bid = big_spread_info.get('bin_bid')
+                    bin_ask = big_spread_info.get('bin_ask')
+                    kc_bid = big_spread_info.get('ku_bid')
+                    kc_ask = big_spread_info.get('ku_ask')
+                    
+                    if kc_bid > bin_ask:
+                        trigger_spread = 100 * (kc_bid - bin_ask) / bin_ask
+                        plan = ('binance', 'kucoin')
+                    else:
+                        trigger_spread = 100 * (bin_bid - kc_ask) / kc_ask
+                        plan = ('kucoin', 'binance')
+                    
+                    eval_info = {
+                        'case': 'big_spread_override',
+                        'plan': plan,
+                        'trigger_spread': trigger_spread,
+                        'net_fr': 0.0,
+                        'time_left_min': None,
+                        'bin_bid': bin_bid,
+                        'bin_ask': bin_ask,
+                        'kc_bid': kc_bid,
+                        'kc_ask': kc_ask,
+                        'ku_api_sym': ku_api_sym
+                    }
+                    
+                    execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=BIG_SPREAD_ENTRY_MULTIPLIER)
+                    time.sleep(1)
+                    continue
+            
+            # Otherwise: maintenance threads handle averaging/TP; main loop sleeps
             pass
         time.sleep(1)
 except KeyboardInterrupt:
