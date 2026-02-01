@@ -232,10 +232,26 @@ def get_common_symbols():
     logger.info("Common symbols: %d", len(common))
     return common, ku_map
 
-def get_binance_book(retries=1):
+def get_binance_book(retries=2):
+    """
+    FIXED: Handle 418 (rate limit) errors gracefully with retry and backoff
+    """
     for attempt in range(1, retries+1):
         try:
             r = requests.get(BINANCE_BOOK_URL, timeout=10)
+            
+            # CRITICAL FIX: Handle 418 (I'm a teapot) rate limit error
+            if r.status_code == 418:
+                logger.warning(f"⚠️  Binance book ticker returned 418 (rate limit), attempt {attempt}/{retries}")
+                if attempt < retries:
+                    backoff = 2.0 * attempt  # Increasing backoff: 2s, 4s, etc.
+                    logger.info(f"Waiting {backoff}s before retry...")
+                    time.sleep(backoff)
+                    continue
+                else:
+                    logger.error("❌ Binance book ticker failed after retries (418 rate limit)")
+                    return {}
+            
             r.raise_for_status()
             data = r.json()
             out = {}
@@ -244,12 +260,14 @@ def get_binance_book(retries=1):
                     out[d["symbol"]] = {"bid": float(d["bidPrice"]), "ask": float(d["askPrice"])}
                 except Exception:
                     continue
+            logger.debug(f"✓ Fetched {len(out)} Binance book entries")
             return out
-        except Exception:
-            logger.exception("[BINANCE_BOOK] fetch error")
+        except Exception as e:
+            logger.warning(f"[BINANCE_BOOK] fetch error (attempt {attempt}/{retries}): {e}")
             if attempt == retries:
+                logger.error("❌ Binance book ticker failed after all retries")
                 return {}
-            time.sleep(0.5)
+            time.sleep(1.0)
 
 def get_binance_price(symbol, session, retries=1):
     for attempt in range(1, retries+1):
@@ -324,60 +342,143 @@ def calculate_spread(bin_bid, bin_ask, ku_bid, ku_ask):
         return None
 
 # Funding rate helpers
-def fetch_binance_funding(symbol):
-    try:
-        r = requests.get(BINANCE_FUND_URL.format(symbol=symbol), timeout=6)
-        if r.status_code != 200:
-            return None
-        d = r.json()
-        fr_raw = d.get('fundingRate') or d.get('lastFundingRate')
-        nft = d.get('nextFundingTime') or d.get('nextFundingRateTime')
-        fr = None
-        if fr_raw is not None:
-            fr = float(fr_raw) * 100.0 if abs(float(fr_raw)) < 1.0 else float(fr_raw)
-        next_ft = int(nft) if nft else None
-        return {'fundingRatePct': fr, 'nextFundingTimeMs': next_ft}
-    except Exception:
-        logger.exception("fetch_binance_funding error for %s", symbol)
-        return None
-
-def fetch_kucoin_funding(symbol):
-    try:
+def fetch_binance_funding(symbol, max_retries=2):
+    """
+    FIXED: Add retry logic and better error handling for 418 (rate limit) errors
+    """
+    for attempt in range(max_retries):
         try:
-            fr_info = kucoin.fetchFundingRate(symbol)
-            if fr_info:
-                fr = fr_info.get('fundingRate') or fr_info.get('info', {}).get('fundingRate')
-                next_ft = fr_info.get('nextFundingTime') or fr_info.get('info', {}).get('nextFundingTime')
-                fr_pct = None
-                if fr is not None:
-                    fr_pct = float(fr) * 100.0 if abs(float(fr)) < 1.0 else float(fr)
-                return {'fundingRatePct': fr_pct, 'nextFundingTimeMs': int(next_ft) if next_ft else None}
-        except Exception:
-            pass
-        r = requests.get(KUCOIN_FUND_URL.format(symbol=symbol), timeout=6)
-        if r.status_code != 200:
-            return None
-        d = r.json()
-        data = d.get('data') or {}
-        fr_raw = data.get('fundingRate') or data.get('fundingRate24h')
-        nft = data.get('nextFundingTime')
-        fr = None
-        if fr_raw is not None:
-            fr = float(fr_raw) * 100.0 if abs(float(fr_raw)) < 1.0 else float(fr_raw)
-        next_ft = int(nft) if nft else None
-        return {'fundingRatePct': fr, 'nextFundingTimeMs': next_ft}
-    except Exception:
-        logger.exception("fetch_kucoin_funding error for %s", symbol)
-        return None
+            r = requests.get(BINANCE_FUND_URL.format(symbol=symbol), timeout=6)
+            if r.status_code == 418:
+                # Binance rate limit (I'm a teapot)
+                logger.warning(f"Binance funding rate 418 (rate limit) for {symbol}, attempt {attempt+1}/{max_retries}")
+                if attempt < max_retries - 1:
+                    time.sleep(1.0)  # Wait before retry
+                    continue
+                return None
+            if r.status_code != 200:
+                logger.warning(f"Binance funding rate non-200: {r.status_code} for {symbol}")
+                return None
+            d = r.json()
+            fr_raw = d.get('fundingRate') or d.get('lastFundingRate')
+            nft = d.get('nextFundingTime') or d.get('nextFundingRateTime')
+            fr = None
+            if fr_raw is not None:
+                fr = float(fr_raw) * 100.0 if abs(float(fr_raw)) < 1.0 else float(fr_raw)
+                
+                # CRITICAL FIX: Check if funding rate is exactly 0.0000 (all zeros)
+                # This is likely a data glitch - reject it
+                if fr == 0.0 or abs(fr) < 1e-8:
+                    logger.warning(f"⚠️  Binance funding rate is 0.0000 for {symbol} - likely data glitch, rejecting")
+                    return None  # Treat as fetch failure
+                    
+            next_ft = int(nft) if nft else None
+            logger.debug(f"✓ Binance FR for {symbol}: {fr:.6f}% (next: {next_ft})")
+            return {'fundingRatePct': fr, 'nextFundingTimeMs': next_ft}
+        except Exception as e:
+            logger.warning(f"fetch_binance_funding error for {symbol} (attempt {attempt+1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+    
+    logger.error(f"❌ Failed to fetch Binance funding rate for {symbol} after {max_retries} attempts")
+    return None
+
+def fetch_kucoin_funding(symbol, max_retries=2):
+    """
+    FIXED: Add retry logic and validation to reject 0.0000 funding rates as glitches
+    """
+    for attempt in range(max_retries):
+        try:
+            # Try CCXT first
+            try:
+                fr_info = kucoin.fetchFundingRate(symbol)
+                if fr_info:
+                    fr = fr_info.get('fundingRate') or fr_info.get('info', {}).get('fundingRate')
+                    next_ft = fr_info.get('nextFundingTime') or fr_info.get('info', {}).get('nextFundingTime')
+                    fr_pct = None
+                    if fr is not None:
+                        fr_pct = float(fr) * 100.0 if abs(float(fr)) < 1.0 else float(fr)
+                        
+                        # CRITICAL FIX: Check if funding rate is exactly 0.0000 (all zeros)
+                        # This is likely a data glitch - reject it
+                        if fr_pct == 0.0 or abs(fr_pct) < 1e-8:
+                            logger.warning(f"⚠️  KuCoin (CCXT) funding rate is 0.0000 for {symbol} - likely data glitch, rejecting")
+                            # Don't return yet, try REST API fallback
+                        else:
+                            logger.debug(f"✓ KuCoin (CCXT) FR for {symbol}: {fr_pct:.6f}% (next: {next_ft})")
+                            return {'fundingRatePct': fr_pct, 'nextFundingTimeMs': int(next_ft) if next_ft else None}
+            except Exception as e:
+                logger.debug(f"KuCoin CCXT fetch failed for {symbol}: {e}, trying REST API")
+            
+            # REST API fallback
+            r = requests.get(KUCOIN_FUND_URL.format(symbol=symbol), timeout=6)
+            if r.status_code != 200:
+                logger.warning(f"KuCoin funding rate non-200: {r.status_code} for {symbol}")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+                    continue
+                return None
+            d = r.json()
+            data = d.get('data') or {}
+            fr_raw = data.get('fundingRate') or data.get('fundingRate24h')
+            nft = data.get('nextFundingTime')
+            fr = None
+            if fr_raw is not None:
+                fr = float(fr_raw) * 100.0 if abs(float(fr_raw)) < 1.0 else float(fr_raw)
+                
+                # CRITICAL FIX: Check if funding rate is exactly 0.0000 (all zeros)
+                # This is likely a data glitch - reject it
+                if fr == 0.0 or abs(fr) < 1e-8:
+                    logger.warning(f"⚠️  KuCoin (REST) funding rate is 0.0000 for {symbol} - likely data glitch, rejecting")
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5)
+                        continue
+                    return None  # Treat as fetch failure after retries
+                    
+            next_ft = int(nft) if nft else None
+            logger.debug(f"✓ KuCoin (REST) FR for {symbol}: {fr:.6f}% (next: {next_ft})")
+            return {'fundingRatePct': fr, 'nextFundingTimeMs': next_ft}
+        except Exception as e:
+            logger.warning(f"fetch_kucoin_funding error for {symbol} (attempt {attempt+1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+    
+    logger.error(f"❌ Failed to fetch KuCoin funding rate for {symbol} after {max_retries} attempts")
+    return None
 
 def compute_net_funding_for_plan(bin_fr_pct, kc_fr_pct, plan_long='binance', plan_short='kucoin'):
+    """
+    FIXED: Don't treat None as 0.0 - if either funding rate is None, return None
+    This prevents bad entries when funding rate fetch fails
+    """
     try:
-        fb = bin_fr_pct or 0.0
-        fk = kc_fr_pct or 0.0
+        # CRITICAL FIX: If either funding rate is None, return None (don't assume 0)
+        if bin_fr_pct is None or kc_fr_pct is None:
+            logger.warning(f"⚠️  Cannot compute net funding: bin_fr={bin_fr_pct} kc_fr={kc_fr_pct} - returning None")
+            return None
+        
+        fb = float(bin_fr_pct)
+        fk = float(kc_fr_pct)
+        
+        # CRITICAL FIX: Additional check - if either is exactly 0.0, log warning
+        # (this shouldn't happen now due to fetch validation, but double-check)
+        if abs(fb) < 1e-8 or abs(fk) < 1e-8:
+            logger.warning(f"⚠️  Suspicious funding rate (near zero): bin_fr={fb:.6f}% kc_fr={fk:.6f}% - returning None")
+            return None
+        
         if plan_long == 'binance' and plan_short == 'kucoin':
-            return fk - fb
+            net = fk - fb
         elif plan_long == 'kucoin' and plan_short == 'binance':
-            return fb - fk
+            net = fb - fk
+        else:
+            logger.error(f"Invalid plan: long={plan_long} short={plan_short}")
+            return None
+        
+        logger.debug(f"✓ Net funding: bin={fb:.6f}% kc={fk:.6f}% → net={net:.6f}% (long={plan_long}, short={plan_short})")
+        return net
+    except Exception as e:
+        logger.exception(f"Error computing net funding: {e}")
+        return None
         return 0.0
     except Exception:
         return 0.0
@@ -909,10 +1010,8 @@ def cancel_all_open_orders_aggressive(target_sym):
 
 def close_all_and_wait_with_tracking(target_sym, timeout_s=10, poll_interval=0.3):
     """
-    FIXED: Close positions on BOTH exchanges in PARALLEL to minimize timing gap
-    FIXED: Reduced timeout to 10s (was 20s) with faster polling (0.3s vs 0.5s)
-    FIXED: Aggressive order cancellation with verification
-    FIXED: Immediate fallback to closePosition if reduceOnly fails
+    FIXED: Use the SAME reliable closing method as liquidation watcher (close_single_exchange_position)
+    This ensures positions actually close instead of silently failing
     Returns dict with bin_exec_price and kc_exec_price
     """
     global closing_in_progress
@@ -924,117 +1023,32 @@ def close_all_and_wait_with_tracking(target_sym, timeout_s=10, poll_interval=0.3
     
     result = {'bin_exec_price': None, 'kc_exec_price': None}
     
-    # FIXED: Use threading to close BOTH exchanges simultaneously
-    def close_binance_positions():
-        """
-        FIXED: Close Binance positions with IMMEDIATE fallback to closePosition
-        if reduceOnly is blocked by stop orders
-        """
-        try:
-            all_bin_pos = binance.fetch_positions()
-        except Exception as e:
-            logger.error(f"Error fetching Binance positions: {e}")
-            return
-        
-        for pos in all_bin_pos:
-            try:
-                sym = pos.get('symbol') or (pos.get('info') or {}).get('symbol')
-                if not sym or sym != target_sym:
-                    continue
-                signed = _get_signed_from_binance_pos(pos)
-                if abs(float(signed or 0)) == 0:
-                    continue
-                side = 'sell' if signed > 0 else 'buy'
-                market = get_market(binance, sym)
-                prec = market.get('precision', {}).get('amount') if market else None
-                qty = round_down(abs(signed), prec) if prec is not None else abs(signed)
-                
-                if qty > 0:
-                    # CRITICAL FIX: Try reduceOnly first, but IMMEDIATELY fallback to closePosition
-                    success = False
-                    
-                    # Attempt 1: reduceOnly market order
-                    try:
-                        logger.info(f"Attempt 1: Closing Binance {sym} {side} {qty} with reduceOnly")
-                        try:
-                            order = binance.create_market_order(sym, side, qty, params={'reduceOnly': True})
-                        except TypeError:
-                            order = binance.create_order(symbol=sym, type='market', side=side, amount=qty, params={'reduceOnly': True})
-                        
-                        if order:
-                            exec_price = float(order.get('price') or order.get('average') or 
-                                             order.get('info', {}).get('avgPrice') or 0)
-                            if exec_price > 0:
-                                result['bin_exec_price'] = exec_price
-                                logger.info(f"✅ Binance reduceOnly succeeded @ {exec_price}")
-                                success = True
-                    except Exception as e:
-                        logger.warning(f"❌ reduceOnly failed (likely blocked by stop orders): {e}")
-                    
-                    # Attempt 2: IMMEDIATE closePosition fallback (don't wait!)
-                    if not success:
-                        try:
-                            logger.info(f"Attempt 2: IMMEDIATE closePosition fallback for {sym}")
-                            try:
-                                order = binance.create_order(symbol=sym, type='market', side=side, amount=None, params={'closePosition': True})
-                            except TypeError:
-                                order = binance.create_order(sym, 'market', side, params={'closePosition': True})
-                            
-                            logger.info(f"✅ Binance closePosition succeeded for {sym}")
-                            if order:
-                                exec_price = float(order.get('price') or order.get('average') or 
-                                                 order.get('info', {}).get('avgPrice') or 0)
-                                if exec_price > 0:
-                                    result['bin_exec_price'] = exec_price
-                                    success = True
-                        except Exception as e2:
-                            logger.exception(f"❌ closePosition ALSO failed for {sym}: {e2}")
-                    
-                    if not success:
-                        logger.error(f"🚨 CRITICAL: Failed to close Binance position {sym} with both methods!")
-                        
-            except Exception as ex:
-                logger.exception(f"Unexpected error in close_binance_positions loop: {ex}")
+    # CRITICAL FIX: Use the SAME method as liquidation watcher - it WORKS!
+    # Get the KuCoin CCXT symbol
+    ku_ccxt_sym = active_trade.get('ku_ccxt')
     
-    def close_kucoin_positions():
-        """Close KuCoin positions and track execution"""
-        try:
-            all_kc_pos = kucoin.fetch_positions()
-        except Exception as e:
-            logger.error(f"Error fetching KuCoin positions: {e}")
-            return
-        
-        for pos in all_kc_pos:
-            try:
-                sym = pos.get('symbol') or (pos.get('info') or {}).get('symbol')
-                # Match against ku_ccxt symbol
-                if not sym or (active_trade.get('ku_ccxt') and sym != active_trade.get('ku_ccxt')):
-                    continue
-                signed = _get_signed_from_kucoin_pos(pos)
-                if abs(float(signed or 0)) == 0:
-                    continue
-                side = 'sell' if signed > 0 else 'buy'
-                market = get_market(kucoin, sym)
-                prec = market.get('precision', {}).get('amount') if market else None
-                qty = round_down(abs(signed), prec) if prec is not None else abs(signed)
-                if qty > 0:
-                    try:
-                        logger.info(f"Closing KuCoin {sym} {side} {qty} (parallel)")
-                        order = kucoin.create_market_order(sym, side, qty, params={'reduceOnly': True, 'marginMode': 'cross'})
-                        # Extract executed price
-                        if order:
-                            exec_price = float(order.get('price') or order.get('average') or order.get('info', {}).get('avgPrice') or 0)
-                            if exec_price > 0:
-                                result['kc_exec_price'] = exec_price
-                                logger.info(f"✅ KuCoin exit executed @ {exec_price}")
-                    except Exception as e:
-                        logger.exception("Error closing kucoin position %s: %s", sym, e)
-            except Exception:
-                continue
+    # PARALLEL closing using the liquidation watcher's reliable method
+    def close_binance_reliable():
+        """Use the liquidation watcher's method that ACTUALLY WORKS"""
+        logger.info(f"🔄 Closing Binance {target_sym} using liquidation watcher method...")
+        success = close_single_exchange_position(binance, target_sym)
+        logger.info(f"{'✅' if success else '❌'} Binance close result: {success}")
+        return success
     
-    # CRITICAL FIX: Execute BOTH closings in PARALLEL using threads
-    thread_bin = threading.Thread(target=close_binance_positions, name="BinanceCloser")
-    thread_kc = threading.Thread(target=close_kucoin_positions, name="KuCoinCloser")
+    def close_kucoin_reliable():
+        """Use the liquidation watcher's method that ACTUALLY WORKS"""
+        if ku_ccxt_sym:
+            logger.info(f"🔄 Closing KuCoin {ku_ccxt_sym} using liquidation watcher method...")
+            success = close_single_exchange_position(kucoin, ku_ccxt_sym)
+            logger.info(f"{'✅' if success else '❌'} KuCoin close result: {success}")
+            return success
+        else:
+            logger.warning("⚠️  No KuCoin CCXT symbol, skipping KuCoin close")
+            return False
+    
+    # Execute BOTH closings in PARALLEL using threads
+    thread_bin = threading.Thread(target=close_binance_reliable, name="BinanceCloser")
+    thread_kc = threading.Thread(target=close_kucoin_reliable, name="KuCoinCloser")
     
     logger.info("⚡ Starting PARALLEL position closing on both exchanges...")
     start_close = time.time()
@@ -1047,7 +1061,7 @@ def close_all_and_wait_with_tracking(target_sym, timeout_s=10, poll_interval=0.3
     close_duration = time.time() - start_close
     logger.info("✅ Both exchange closings completed in %.2f seconds", close_duration)
     
-    # FIXED: Faster polling (0.3s instead of 0.5s) and shorter timeout (10s instead of 20s)
+    # Wait for positions to close (with faster polling)
     start = time.time()
     check_count = 0
     while time.time() - start < timeout_s:
@@ -1083,7 +1097,7 @@ def close_all_and_wait_with_tracking(target_sym, timeout_s=10, poll_interval=0.3
                 total_bal, bin_bal, kc_bal = get_total_futures_balance()
                 logger.info("✅ All positions closed in %.2f seconds", elapsed)
                 logger.info("*** POST-EXIT Total Balance approx: ${:.2f} (Binance: ${:.2f} | KuCoin: ${:.2f}) ***".format(total_bal, bin_bal, kc_bal))
-                logger.info("EXIT TRACKING | bin_exec=%.6f kc_exec=%.6f", result.get('bin_exec_price') or 0, result.get('kc_exec_price') or 0)
+                logger.info("EXIT TRACKING | Positions closed successfully")
                 return result
         except Exception as e:
             logger.exception(f"Error checking positions (attempt #{check_count}): {e}")
@@ -1945,7 +1959,8 @@ def evaluate_entry_conditions(sym, info):
     """
     FIXED: Now properly handles funding rate threshold and doesn't trigger
     on small funding differences below MIN_FR_DIFF_THRESHOLD
-    ADDED: Minimum 1.5% spread requirement for ALL entries
+    ADDED: Minimum 1.8% spread requirement for ALL entries
+    CRITICAL FIX: Reject entry if funding rates are None (fetch failed or 0.0000 glitch)
     """
     # returns dict with keys if candidate meets any case, else None
     bin_bid = info.get('bin_bid'); bin_ask = info.get('bin_ask'); kc_bid = info.get('ku_bid'); kc_ask = info.get('ku_ask'); ku_api_sym = info.get('ku_sym')
@@ -1964,11 +1979,30 @@ def evaluate_entry_conditions(sym, info):
     if abs(trigger_spread) < MIN_SPREAD_THRESHOLD:
         return None  # Spread too small, reject entry
     
-    # funding fetch
+    # CRITICAL: Fetch funding rates with retry and validation
     bin_fr_info = fetch_binance_funding(sym)
     kc_fr_info = fetch_kucoin_funding(ku_api_sym)
-    bin_fr_pct = bin_fr_info.get('fundingRatePct') if bin_fr_info else None
-    kc_fr_pct = kc_fr_info.get('fundingRatePct') if kc_fr_info else None
+    
+    # CRITICAL FIX: If either funding rate fetch failed, reject entry
+    # (This includes cases where funding rate was 0.0000 - treated as glitch)
+    if bin_fr_info is None:
+        logger.warning(f"❌ Cannot evaluate {sym}: Binance funding rate fetch failed (None or 0.0000 glitch)")
+        return None
+    if kc_fr_info is None:
+        logger.warning(f"❌ Cannot evaluate {sym}: KuCoin funding rate fetch failed (None or 0.0000 glitch)")
+        return None
+    
+    bin_fr_pct = bin_fr_info.get('fundingRatePct')
+    kc_fr_pct = kc_fr_info.get('fundingRatePct')
+    
+    # CRITICAL FIX: Double-check that funding rates are not None
+    if bin_fr_pct is None or kc_fr_pct is None:
+        logger.warning(f"❌ Cannot evaluate {sym}: Funding rates are None (bin={bin_fr_pct}, kc={kc_fr_pct})")
+        return None
+    
+    # Log funding rates for visibility
+    logger.info(f"📊 {sym} Funding Rates: Binance={bin_fr_pct:.6f}% KuCoin={kc_fr_pct:.6f}%")
+    
     bin_next = bin_fr_info.get('nextFundingTimeMs') if bin_fr_info else None
     kc_next = kc_fr_info.get('nextFundingTimeMs') if kc_fr_info else None
     if plan == ('binance','kucoin'):
@@ -1976,8 +2010,13 @@ def evaluate_entry_conditions(sym, info):
     else:
         net_fr = compute_net_funding_for_plan(bin_fr_pct, kc_fr_pct, 'kucoin','binance')
     
+    # CRITICAL FIX: If net_fr is None (compute failed), reject entry
+    if net_fr is None:
+        logger.warning(f"❌ Cannot evaluate {sym}: Net funding calculation failed")
+        return None
+    
     # FIXED: Don't consider funding rate if difference is below threshold
-    if net_fr is not None and abs(net_fr) < MIN_FR_DIFF_THRESHOLD:
+    if abs(net_fr) < MIN_FR_DIFF_THRESHOLD:
         net_fr = 0.0  # Treat as neutral for small differences
     
     now_ms = int(time.time()*1000)
@@ -1989,20 +2028,29 @@ def evaluate_entry_conditions(sym, info):
     elif kc_next:
         next_ft_ms = kc_next
     time_left_min = (next_ft_ms - now_ms)/60000.0 if next_ft_ms else None
+    
+    # Log entry evaluation for debugging
+    logger.info(f"📊 {sym} Entry Eval: spread={trigger_spread:.4f}% net_fr={net_fr:.6f}% time_left={time_left_min}min plan={plan}")
+    
     # Evaluate cases in order
     # Case1
     if abs(trigger_spread) >= CASE1_MIN_SPREAD and net_fr is not None and net_fr >= FR_ADVANTAGE_THRESHOLD:
+        logger.info(f"✅ {sym} CASE1 triggered: spread={trigger_spread:.4f}% >= {CASE1_MIN_SPREAD}%, net_fr={net_fr:.6f}% >= {FR_ADVANTAGE_THRESHOLD}%")
         return {'case':'case1','plan':plan,'trigger_spread':trigger_spread,'net_fr':net_fr,'time_left_min':time_left_min,'bin_bid':bin_bid,'bin_ask':bin_ask,'kc_bid':kc_bid,'kc_ask':kc_ask,'ku_api_sym':ku_api_sym}
     # Case2
     if net_fr is not None and net_fr < 0 and time_left_min is not None and time_left_min < 30:
         net_dis = abs(net_fr)
         if abs(trigger_spread) >= CASE2_MULT * net_dis:
+            logger.info(f"✅ {sym} CASE2 triggered: spread={trigger_spread:.4f}% >= {CASE2_MULT}*{net_dis:.6f}%, time_left={time_left_min:.1f}min < 30")
             return {'case':'case2','plan':plan,'trigger_spread':trigger_spread,'net_fr':net_fr,'time_left_min':time_left_min,'bin_bid':bin_bid,'bin_ask':bin_ask,'kc_bid':kc_bid,'kc_ask':kc_ask,'ku_api_sym':ku_api_sym}
     # Case3
     if net_fr is not None and net_fr < 0 and time_left_min is not None and time_left_min >= 30:
         net_dis = abs(net_fr)
         if abs(trigger_spread) >= CASE3_MULT * net_dis:
+            logger.info(f"✅ {sym} CASE3 triggered: spread={trigger_spread:.4f}% >= {CASE3_MULT}*{net_dis:.6f}%, time_left={time_left_min:.1f}min >= 30")
             return {'case':'case3','plan':plan,'trigger_spread':trigger_spread,'net_fr':net_fr,'time_left_min':time_left_min,'bin_bid':bin_bid,'bin_ask':bin_ask,'kc_bid':kc_bid,'kc_ask':kc_ask,'ku_api_sym':ku_api_sym}
+    
+    logger.debug(f"⏸️  {sym} No case triggered (spread={trigger_spread:.4f}%, net_fr={net_fr:.6f}%)")
     return None
 
 def get_total_futures_balance():
