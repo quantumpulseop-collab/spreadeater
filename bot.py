@@ -850,29 +850,44 @@ def close_all_and_wait(timeout_s=20, poll_interval=0.5):
     logger.info("Timeout waiting for positions to close.")
     return False
 
-def cancel_all_open_orders(target_sym):
+def cancel_all_open_orders_aggressive(target_sym):
     """
-    Cancel all open orders (especially stop orders) on both exchanges for the target symbol.
+    FIXED: Aggressively cancel ALL orders and VERIFY they're gone before proceeding.
     This is CRITICAL for Binance because conditional STOP_MARKET orders prevent
     reduce-only market orders from executing.
     """
-    logger.info("🔄 Cancelling all open orders for %s on both exchanges...", target_sym)
+    logger.info("🔄 Aggressively cancelling ALL orders for %s...", target_sym)
     
-    # Cancel Binance orders
-    try:
-        binance_orders = binance.fetch_open_orders(target_sym)
-        if binance_orders:
-            logger.info(f"Found {len(binance_orders)} open Binance orders to cancel for {target_sym}")
-            for order in binance_orders:
-                try:
-                    binance.cancel_order(order['id'], target_sym)
-                    logger.info(f"✅ Cancelled Binance order {order['id']} (type={order.get('type')})")
-                except Exception as e:
-                    logger.warning(f"Failed to cancel Binance order {order.get('id')}: {e}")
-        else:
-            logger.info("No open Binance orders to cancel")
-    except Exception as e:
-        logger.warning(f"Error fetching/cancelling Binance orders for {target_sym}: {e}")
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        # Cancel Binance orders
+        try:
+            binance_orders = binance.fetch_open_orders(target_sym)
+            if binance_orders:
+                logger.info(f"Attempt {attempt+1}: Found {len(binance_orders)} Binance orders to cancel")
+                for order in binance_orders:
+                    try:
+                        binance.cancel_order(order['id'], target_sym)
+                        logger.info(f"✅ Cancelled Binance order {order['id']} (type={order.get('type')})")
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel Binance order {order.get('id')}: {e}")
+                
+                # CRITICAL: Verify cancellation
+                time.sleep(0.5)  # Give exchange time to process
+                verify_orders = binance.fetch_open_orders(target_sym)
+                if not verify_orders:
+                    logger.info("✅ All Binance orders cancelled successfully")
+                    break
+                else:
+                    logger.warning(f"⚠️  Still {len(verify_orders)} Binance orders remaining, retrying...")
+            else:
+                logger.info("No Binance orders to cancel")
+                break
+        except Exception as e:
+            logger.warning(f"Error in Binance order cancellation attempt {attempt+1}: {e}")
+        
+        if attempt < max_attempts - 1:
+            time.sleep(0.3)
     
     # Cancel KuCoin orders (for the ku_ccxt symbol)
     try:
@@ -880,44 +895,46 @@ def cancel_all_open_orders(target_sym):
         if ku_ccxt_sym:
             kucoin_orders = kucoin.fetch_open_orders(ku_ccxt_sym)
             if kucoin_orders:
-                logger.info(f"Found {len(kucoin_orders)} open KuCoin orders to cancel for {ku_ccxt_sym}")
+                logger.info(f"Found {len(kucoin_orders)} KuCoin orders to cancel")
                 for order in kucoin_orders:
                     try:
                         kucoin.cancel_order(order['id'], ku_ccxt_sym)
-                        logger.info(f"✅ Cancelled KuCoin order {order['id']} (type={order.get('type')})")
+                        logger.info(f"✅ Cancelled KuCoin order {order['id']}")
                     except Exception as e:
                         logger.warning(f"Failed to cancel KuCoin order {order.get('id')}: {e}")
-            else:
-                logger.info("No open KuCoin orders to cancel")
     except Exception as e:
-        logger.warning(f"Error fetching/cancelling KuCoin orders: {e}")
+        logger.warning(f"Error cancelling KuCoin orders: {e}")
     
-    logger.info("✅ Order cancellation complete")
+    logger.info("✅ Aggressive order cancellation complete")
 
-def close_all_and_wait_with_tracking(target_sym, timeout_s=20, poll_interval=0.5):
+def close_all_and_wait_with_tracking(target_sym, timeout_s=10, poll_interval=0.3):
     """
     FIXED: Close positions on BOTH exchanges in PARALLEL to minimize timing gap
+    FIXED: Reduced timeout to 10s (was 20s) with faster polling (0.3s vs 0.5s)
+    FIXED: Aggressive order cancellation with verification
+    FIXED: Immediate fallback to closePosition if reduceOnly fails
     Returns dict with bin_exec_price and kc_exec_price
     """
     global closing_in_progress
     closing_in_progress = True
-    logger.info("Closing all positions with tracking for %s...", target_sym)
+    logger.info("🔄 Closing all positions with tracking for %s...", target_sym)
     
-    # CRITICAL FIX: Cancel all open orders (especially stop orders) BEFORE closing positions
-    # This is essential for Binance because conditional STOP_MARKET orders prevent
-    # reduce-only market orders from executing
-    cancel_all_open_orders(target_sym)
+    # CRITICAL FIX: Use AGGRESSIVE order cancellation with verification
+    cancel_all_open_orders_aggressive(target_sym)
     
     result = {'bin_exec_price': None, 'kc_exec_price': None}
     
     # FIXED: Use threading to close BOTH exchanges simultaneously
     def close_binance_positions():
-        """Close Binance positions and track execution"""
+        """
+        FIXED: Close Binance positions with IMMEDIATE fallback to closePosition
+        if reduceOnly is blocked by stop orders
+        """
         try:
             all_bin_pos = binance.fetch_positions()
         except Exception as e:
             logger.error(f"Error fetching Binance positions: {e}")
-            all_bin_pos = []
+            return
         
         for pos in all_bin_pos:
             try:
@@ -931,35 +948,51 @@ def close_all_and_wait_with_tracking(target_sym, timeout_s=20, poll_interval=0.5
                 market = get_market(binance, sym)
                 prec = market.get('precision', {}).get('amount') if market else None
                 qty = round_down(abs(signed), prec) if prec is not None else abs(signed)
+                
                 if qty > 0:
+                    # CRITICAL FIX: Try reduceOnly first, but IMMEDIATELY fallback to closePosition
+                    success = False
+                    
+                    # Attempt 1: reduceOnly market order
                     try:
-                        logger.info(f"Closing Binance {sym} {side} {qty} (parallel)")
+                        logger.info(f"Attempt 1: Closing Binance {sym} {side} {qty} with reduceOnly")
                         try:
                             order = binance.create_market_order(sym, side, qty, params={'reduceOnly': True})
                         except TypeError:
                             order = binance.create_order(symbol=sym, type='market', side=side, amount=qty, params={'reduceOnly': True})
-                        # Extract executed price
+                        
                         if order:
-                            exec_price = float(order.get('price') or order.get('average') or order.get('info', {}).get('avgPrice') or 0)
+                            exec_price = float(order.get('price') or order.get('average') or 
+                                             order.get('info', {}).get('avgPrice') or 0)
                             if exec_price > 0:
                                 result['bin_exec_price'] = exec_price
-                                logger.info(f"✅ Binance exit executed @ {exec_price}")
+                                logger.info(f"✅ Binance reduceOnly succeeded @ {exec_price}")
+                                success = True
                     except Exception as e:
-                        logger.warning(f"reduceOnly close failed for Binance {sym}, trying closePosition fallback: {e}")
-                        # CRITICAL FALLBACK: Use closePosition to bypass stop orders
+                        logger.warning(f"❌ reduceOnly failed (likely blocked by stop orders): {e}")
+                    
+                    # Attempt 2: IMMEDIATE closePosition fallback (don't wait!)
+                    if not success:
                         try:
-                            logger.info(f"Attempting closePosition fallback for Binance {sym}")
+                            logger.info(f"Attempt 2: IMMEDIATE closePosition fallback for {sym}")
                             try:
                                 order = binance.create_order(symbol=sym, type='market', side=side, amount=None, params={'closePosition': True})
                             except TypeError:
                                 order = binance.create_order(sym, 'market', side, params={'closePosition': True})
-                            logger.info(f"✅ Binance closePosition fallback succeeded for {sym}")
+                            
+                            logger.info(f"✅ Binance closePosition succeeded for {sym}")
                             if order:
-                                exec_price = float(order.get('price') or order.get('average') or order.get('info', {}).get('avgPrice') or 0)
+                                exec_price = float(order.get('price') or order.get('average') or 
+                                                 order.get('info', {}).get('avgPrice') or 0)
                                 if exec_price > 0:
                                     result['bin_exec_price'] = exec_price
+                                    success = True
                         except Exception as e2:
-                            logger.exception(f"closePosition fallback also failed for Binance {sym}: {e2}")
+                            logger.exception(f"❌ closePosition ALSO failed for {sym}: {e2}")
+                    
+                    if not success:
+                        logger.error(f"🚨 CRITICAL: Failed to close Binance position {sym} with both methods!")
+                        
             except Exception as ex:
                 logger.exception(f"Unexpected error in close_binance_positions loop: {ex}")
     
@@ -969,7 +1002,7 @@ def close_all_and_wait_with_tracking(target_sym, timeout_s=20, poll_interval=0.5
             all_kc_pos = kucoin.fetch_positions()
         except Exception as e:
             logger.error(f"Error fetching KuCoin positions: {e}")
-            all_kc_pos = []
+            return
         
         for pos in all_kc_pos:
             try:
@@ -1014,7 +1047,7 @@ def close_all_and_wait_with_tracking(target_sym, timeout_s=20, poll_interval=0.5
     close_duration = time.time() - start_close
     logger.info("✅ Both exchange closings completed in %.2f seconds", close_duration)
     
-    # Wait for positions to close (with improved error handling)
+    # FIXED: Faster polling (0.3s instead of 0.5s) and shorter timeout (10s instead of 20s)
     start = time.time()
     check_count = 0
     while time.time() - start < timeout_s:
@@ -1024,28 +1057,62 @@ def close_all_and_wait_with_tracking(target_sym, timeout_s=20, poll_interval=0.5
             kc_check = kucoin.fetch_positions()
             any_open = False
             
+            # Check if positions are still open with detailed logging
             for p in (bin_check or []):
-                if abs(float(_get_signed_from_binance_pos(p) or 0)) > 0:
+                qty = abs(float(_get_signed_from_binance_pos(p) or 0))
+                if qty > 0:
+                    sym = p.get('symbol')
+                    logger.info(f"⚠️  Binance {sym} still has {qty} contracts open")
                     any_open = True
                     break
+            
             if not any_open:
                 for p in (kc_check or []):
-                    if abs(float(_get_signed_from_kucoin_pos(p) or 0)) > 0:
+                    qty = abs(float(_get_signed_from_kucoin_pos(p) or 0))
+                    if qty > 0:
+                        sym = p.get('symbol')
+                        logger.info(f"⚠️  KuCoin {sym} still has {qty} contracts open")
                         any_open = True
                         break
-            logger.info(f"Position check #{check_count}: any_open={any_open}, elapsed={time.time()-start:.1f}s")
+            
+            elapsed = time.time() - start
+            logger.info(f"Position check #{check_count}: any_open={any_open}, elapsed={elapsed:.2f}s")
+            
             if not any_open:
                 closing_in_progress = False
                 total_bal, bin_bal, kc_bal = get_total_futures_balance()
+                logger.info("✅ All positions closed in %.2f seconds", elapsed)
                 logger.info("*** POST-EXIT Total Balance approx: ${:.2f} (Binance: ${:.2f} | KuCoin: ${:.2f}) ***".format(total_bal, bin_bal, kc_bal))
                 logger.info("EXIT TRACKING | bin_exec=%.6f kc_exec=%.6f", result.get('bin_exec_price') or 0, result.get('kc_exec_price') or 0)
                 return result
         except Exception as e:
             logger.exception(f"Error checking positions (attempt #{check_count}): {e}")
+        
         time.sleep(poll_interval)
     
+    # Timeout reached
     closing_in_progress = False
-    logger.warning("⚠️  Timeout waiting for positions to close in tracking mode after %d checks", check_count)
+    logger.error("🚨 TIMEOUT: Positions did not close within %ds after %d checks!", timeout_s, check_count)
+    
+    # Log which positions are still open
+    try:
+        bin_check = binance.fetch_positions()
+        for p in bin_check:
+            qty = abs(float(_get_signed_from_binance_pos(p) or 0))
+            if qty > 0:
+                logger.error(f"🚨 STILL OPEN: Binance {p.get('symbol')} has {qty} contracts")
+    except Exception:
+        pass
+    
+    try:
+        kc_check = kucoin.fetch_positions()
+        for p in kc_check:
+            qty = abs(float(_get_signed_from_kucoin_pos(p) or 0))
+            if qty > 0:
+                logger.error(f"🚨 STILL OPEN: KuCoin {p.get('symbol')} has {qty} contracts")
+    except Exception:
+        pass
+    
     return result
 
 # Exec price/time/qty extractor and KuCoin poller (preserved)
