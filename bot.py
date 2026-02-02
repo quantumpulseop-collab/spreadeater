@@ -1675,26 +1675,50 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                     continue
                 
                 if (prev_bin_abs > ZERO_ABS_THRESHOLD or bin_initial_nonzero) and cur_bin_abs <= ZERO_ABS_THRESHOLD:
-                    logger.info(f"{datetime.now().isoformat()} Detected immediate ZERO on Binance (prev non-zero -> now zero). Triggering immediate targeted close of KuCoin.")
+                    logger.info(f"{datetime.now().isoformat()} Detected immediate ZERO on Binance (prev non-zero -> now zero).")
+                    
+                    # FIXED: Check if this is a planned TP closure or a real liquidation
+                    if closing_reason == 'TP' or tp_closing_in_progress:
+                        logger.info(f"TP closure detected for {sym} - liquidation watcher exiting normally, bot continues scanning")
+                        break  # Exit watcher, don't terminate bot
+                    
+                    # This is a REAL liquidation or stop-loss hit - EMERGENCY
+                    logger.warning(f"⚠️⚠️⚠️ EMERGENCY: Unexpected position closure on Binance for {sym} - likely liquidation or stop-loss!")
+                    send_telegram(f"🚨 *EMERGENCY CLOSURE* 🚨\n`{sym}` position closed unexpectedly on Binance\nLikely liquidation or stop-loss hit!\nClosing other exchange and stopping bot for safety.\n{timestamp()}")
+                    
                     try:
                         ok = close_single_exchange_position(kucoin, kc_ccxt_sym)
                         if not ok:
                             logger.info(f"{datetime.now().isoformat()} Targeted KuCoin close failed; falling back to global close.")
                         close_all_and_wait()
                     except Exception as e:
-                        logger.exception("Error when closing after Binance immediate zero: %s", e)
+                        logger.exception("Error when closing after Binance liquidation: %s", e)
+                    
                     global terminate_bot
-                    terminate_bot = True
+                    terminate_bot = True  # STOP BOT on real liquidation
                     break
                 if (prev_kc_abs > ZERO_ABS_THRESHOLD or kc_initial_nonzero) and cur_kc_abs <= ZERO_ABS_THRESHOLD:
-                    logger.info(f"{datetime.now().isoformat()} Detected immediate ZERO on KuCoin (prev non-zero -> now zero). Triggering immediate targeted close of Binance.")
+                    logger.info(f"{datetime.now().isoformat()} Detected immediate ZERO on KuCoin (prev non-zero -> now zero).")
+                    
+                    # FIXED: Check if this is a planned TP closure or a real liquidation
+                    if closing_reason == 'TP' or tp_closing_in_progress:
+                        logger.info(f"TP closure detected for {sym} - liquidation watcher exiting normally, bot continues scanning")
+                        break  # Exit watcher, don't terminate bot
+                    
+                    # This is a REAL liquidation or stop-loss hit - EMERGENCY
+                    logger.warning(f"⚠️⚠️⚠️ EMERGENCY: Unexpected position closure on KuCoin for {sym} - likely liquidation or stop-loss!")
+                    send_telegram(f"🚨 *EMERGENCY CLOSURE* 🚨\n`{sym}` position closed unexpectedly on KuCoin\nLikely liquidation or stop-loss hit!\nClosing other exchange and stopping bot for safety.\n{timestamp()}")
+                    
                     try:
                         ok = close_single_exchange_position(binance, bin_sym)
                         if not ok:
                             logger.info(f"{datetime.now().isoformat()} Targeted Binance close failed; falling back to global close.")
                         close_all_and_wait()
                     except Exception as e:
-                        logger.exception("Error when closing after KuCoin immediate zero: %s", e)
+                        logger.exception("Error when closing after KuCoin liquidation: %s", e)
+                    
+                    # FIXED: Stop bot on real liquidation
+                    global terminate_bot
                     terminate_bot = True
                     break
                 if cur_bin_abs > ZERO_ABS_THRESHOLD:
@@ -1711,25 +1735,51 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                         zero_cnt_kc += 1
                 logger.debug(f"{datetime.now().isoformat()} WATCHER {sym} prev_bin={prev_bin_abs:.6f} cur_bin={cur_bin_abs:.6f} prev_kc={prev_kc_abs:.6f} cur_kc={cur_kc_abs:.6f} zero_cnt_bin={zero_cnt_bin}/{WATCHER_DETECT_CONFIRM} zero_cnt_kc={zero_cnt_kc}/{WATCHER_DETECT_CONFIRM}")
                 if zero_cnt_bin >= WATCHER_DETECT_CONFIRM:
-                    logger.info(f"{datetime.now().isoformat()} Detected sustained ZERO on Binance -> targeted close KuCoin & cleanup.")
+                    logger.info(f"{datetime.now().isoformat()} Detected sustained ZERO on Binance.")
+                    
+                    # FIXED: Check if this is a planned TP closure or a real liquidation
+                    if closing_reason == 'TP' or tp_closing_in_progress:
+                        logger.info(f"TP closure detected for {sym} - liquidation watcher exiting normally, bot continues scanning")
+                        break  # Exit watcher, don't terminate bot
+                    
+                    # This is a REAL liquidation or stop-loss hit - EMERGENCY
+                    logger.warning(f"⚠️⚠️⚠️ EMERGENCY: Sustained position closure on Binance for {sym} - likely liquidation or stop-loss!")
+                    send_telegram(f"🚨 *EMERGENCY CLOSURE* 🚨\n`{sym}` position sustained zero on Binance\nLikely liquidation or stop-loss hit!\nClosing other exchange and stopping bot for safety.\n{timestamp()}")
+                    
                     try:
                         ok = close_single_exchange_position(kucoin, kc_ccxt_sym)
                         if not ok:
                             logger.info(f"{datetime.now().isoformat()} Targeted KuCoin close failed; falling back to global close.")
                         close_all_and_wait()
                     except Exception as e:
-                        logger.exception("Error when closing after Binance sustained zero: %s", e)
+                        logger.exception("Error when closing after Binance sustained liquidation: %s", e)
+                    
+                    # FIXED: Stop bot on real liquidation
+                    global terminate_bot
                     terminate_bot = True
                     break
                 if zero_cnt_kc >= WATCHER_DETECT_CONFIRM:
-                    logger.info(f"{datetime.now().isoformat()} Detected sustained ZERO on KuCoin -> targeted close Binance & cleanup.")
+                    logger.info(f"{datetime.now().isoformat()} Detected sustained ZERO on KuCoin.")
+                    
+                    # FIXED: Check if this is a planned TP closure or a real liquidation
+                    if closing_reason == 'TP' or tp_closing_in_progress:
+                        logger.info(f"TP closure detected for {sym} - liquidation watcher exiting normally, bot continues scanning")
+                        break  # Exit watcher, don't terminate bot
+                    
+                    # This is a REAL liquidation or stop-loss hit - EMERGENCY
+                    logger.warning(f"⚠️⚠️⚠️ EMERGENCY: Sustained position closure on KuCoin for {sym} - likely liquidation or stop-loss!")
+                    send_telegram(f"🚨 *EMERGENCY CLOSURE* 🚨\n`{sym}` position sustained zero on KuCoin\nLikely liquidation or stop-loss hit!\nClosing other exchange and stopping bot for safety.\n{timestamp()}")
+                    
                     try:
                         ok = close_single_exchange_position(binance, bin_sym)
                         if not ok:
                             logger.info(f"{datetime.now().isoformat()} Targeted Binance close failed; falling back to global close.")
                         close_all_and_wait()
                     except Exception as e:
-                        logger.exception("Error when closing after KuCoin sustained zero: %s", e)
+                        logger.exception("Error when closing after KuCoin sustained liquidation: %s", e)
+                    
+                    # FIXED: Stop bot on real liquidation
+                    global terminate_bot
                     terminate_bot = True
                     break
                 prev_bin = cur_bin_f
@@ -1747,6 +1797,7 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
 # State
 closing_in_progress = False
 tp_closing_in_progress = False  # NEW: Track if closing for TP (not liquidation)
+closing_reason = None  # NEW: Track WHY we're closing: 'TP', 'LIQUIDATION', 'MANUAL', or None
 positions = {}
 entry_spreads = {}
 entry_prices = {}
@@ -2521,7 +2572,7 @@ def check_take_profit_or_close_conditions():
     FIXED: Now requires 3 consecutive confirmations before exiting (like entry)
     ADDED: Tracks exit trigger spread and real executed spread with slippage
     """
-    global tp_confirm_count, tp_closing_in_progress
+    global tp_confirm_count, tp_closing_in_progress, closing_reason
     
     sym = active_trade.get('symbol')
     if not sym:
@@ -2627,7 +2678,8 @@ def check_take_profit_or_close_conditions():
             pre_total, pre_bin, pre_kc = get_total_futures_balance()
             net_funding_total = active_trade.get('funding_accumulated_pct', 0.0)
             
-            # Set TP closing flag BEFORE closing positions
+            # FIXED: Set closing reason to TP BEFORE closing positions
+            closing_reason = 'TP'
             tp_closing_in_progress = True
             
             # Close positions and capture executed prices
@@ -2757,12 +2809,13 @@ def check_take_profit_or_close_conditions():
         tp_confirm_count = 0
 
 def reset_active_trade():
-    global tp_confirm_count
+    global tp_confirm_count, closing_reason
     sym = active_trade.get('symbol')
     if sym:
         positions[sym] = None
     active_trade.update({'symbol': None, 'ku_api': None, 'ku_ccxt': None, 'case': None, 'entry_spread': None, 'avg_entry_spread': None, 'entry_prices': None, 'notional': None, 'averages_done': 0, 'final_implied_notional': None, 'funding_accumulated_pct': 0.0, 'funding_rounds_seen': set(), 'suppress_full_scan': False, 'plan': None, 'avg_count': 0, 'final_averaged_price_bin': None, 'final_averaged_price_kc': None})
     tp_confirm_count = 0  # NEW: Reset TP confirmation counter
+    closing_reason = None  # FIXED: Reset closing reason
     logger.info("Active trade reset")
 
 def funding_round_accounting_loop():
