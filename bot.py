@@ -1604,6 +1604,7 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
     _liquidation_watchers[key] = stop_flag
 
     def monitor():
+        global terminate_bot  # FIXED: Declare at function start
         logger.info(f"{datetime.now().isoformat()} Liquidation watcher STARTED for {sym} (bin:{bin_sym} kc:{kc_ccxt_sym})")
         prev_bin = _last_known_positions.get(sym, {}).get('bin', 0.0)
         prev_kc = _last_known_positions.get(sym, {}).get('kc', 0.0)
@@ -1694,7 +1695,6 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                     except Exception as e:
                         logger.exception("Error when closing after Binance liquidation: %s", e)
                     
-                    global terminate_bot
                     terminate_bot = True  # STOP BOT on real liquidation
                     break
                 if (prev_kc_abs > ZERO_ABS_THRESHOLD or kc_initial_nonzero) and cur_kc_abs <= ZERO_ABS_THRESHOLD:
@@ -1717,9 +1717,7 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                     except Exception as e:
                         logger.exception("Error when closing after KuCoin liquidation: %s", e)
                     
-                    # FIXED: Stop bot on real liquidation
-                    global terminate_bot
-                    terminate_bot = True
+                    terminate_bot = True  # STOP BOT on real liquidation
                     break
                 if cur_bin_abs > ZERO_ABS_THRESHOLD:
                     seen_nonzero_bin = True
@@ -1754,9 +1752,7 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                     except Exception as e:
                         logger.exception("Error when closing after Binance sustained liquidation: %s", e)
                     
-                    # FIXED: Stop bot on real liquidation
-                    global terminate_bot
-                    terminate_bot = True
+                    terminate_bot = True  # STOP BOT on real liquidation
                     break
                 if zero_cnt_kc >= WATCHER_DETECT_CONFIRM:
                     logger.info(f"{datetime.now().isoformat()} Detected sustained ZERO on KuCoin.")
@@ -1778,9 +1774,7 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                     except Exception as e:
                         logger.exception("Error when closing after KuCoin sustained liquidation: %s", e)
                     
-                    # FIXED: Stop bot on real liquidation
-                    global terminate_bot
-                    terminate_bot = True
+                    terminate_bot = True  # STOP BOT on real liquidation
                     break
                 prev_bin = cur_bin_f
                 prev_kc = cur_kc_f
