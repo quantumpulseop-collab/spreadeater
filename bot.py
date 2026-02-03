@@ -2044,16 +2044,36 @@ def evaluate_entry_conditions(sym, info):
     if abs(trigger_spread) < MIN_SPREAD_THRESHOLD:
         return None  # Spread too small, reject entry
     
-    # NEW: Calculate expected exit spread and check if difference is too large
-    # Exit spread is approximately 0 (spread converges), so difference is ~trigger_spread
-    # Profit target is TAKE_PROFIT_FACTOR * abs(trigger_spread) = 0.5 * abs(trigger_spread)
-    profit_target_pct = TAKE_PROFIT_FACTOR * abs(trigger_spread)
-    spread_difference = abs(trigger_spread)  # Entry to exit (approximately)
-    max_allowed_diff = (MAX_SPREAD_DIFF_PCT_OF_TARGET / 100.0) * profit_target_pct
+    # NEW: Calculate ACTUAL exit spread and check if entry-exit difference is too large
+    # Entry spread uses aggressive prices (e.g., kc_bid - bin_ask for long bin/short kc)
+    # Exit spread uses opposite prices (e.g., kc_ask - bin_bid for same position)
+    # ONLY reject if exit spread > entry spread (unfavorable), meaning spread widened against us
+    # If entry spread > exit spread, that's GOOD (instant profit on exit) - don't reject!
+    if plan == ('binance', 'kucoin'):
+        # Long binance, short kucoin
+        # Entry: kc_bid - bin_ask (already calculated as trigger_spread)
+        # Exit: kc_ask - bin_bid
+        exit_spread = 100 * (kc_ask - bin_bid) / bin_bid if bin_bid > 0 else 0
+    else:
+        # Short binance, long kucoin
+        # Entry: bin_bid - kc_ask (already calculated as trigger_spread)
+        # Exit: bin_ask - kc_bid
+        exit_spread = 100 * (bin_ask - kc_bid) / kc_bid if kc_bid > 0 else 0
     
-    if spread_difference > max_allowed_diff:
-        logger.warning(f"❌ Rejecting {sym}: Spread diff {spread_difference:.4f}% > {MAX_SPREAD_DIFF_PCT_OF_TARGET}% of profit target ({max_allowed_diff:.4f}%)")
-        return None
+    # ONLY check if exit spread is WORSE than entry spread (exit > entry for positive, exit < entry for negative)
+    # This means the spread crossing costs us money
+    if exit_spread > trigger_spread:
+        # Exit spread is worse - calculate how much worse
+        spread_difference = exit_spread - trigger_spread  # How much worse exit is than entry
+        profit_target_pct = TAKE_PROFIT_FACTOR * abs(trigger_spread)  # 50% of entry spread
+        max_allowed_diff = (MAX_SPREAD_DIFF_PCT_OF_TARGET / 100.0) * profit_target_pct  # 30% of profit target
+        
+        if spread_difference > max_allowed_diff:
+            logger.warning(f"❌ Rejecting {sym}: Exit spread worse than entry by {spread_difference:.4f}% > {MAX_SPREAD_DIFF_PCT_OF_TARGET}% of profit target ({max_allowed_diff:.4f}%) | Entry={trigger_spread:.4f}% Exit={exit_spread:.4f}%")
+            return None
+    else:
+        # Exit spread is better than entry spread - GOOD! No need to check, proceed with trade
+        logger.info(f"✅ {sym}: Exit spread better than entry (instant profit!) | Entry={trigger_spread:.4f}% Exit={exit_spread:.4f}%")
     
     # CRITICAL: Fetch funding rates with retry and validation
     bin_fr_info = fetch_binance_funding(sym)
