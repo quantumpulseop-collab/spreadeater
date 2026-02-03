@@ -54,6 +54,13 @@ TAKE_PROFIT_FACTOR = 0.5
 MIN_FR_DIFF_THRESHOLD = 0.01  # CHANGED: Minimum funding rate difference (was 0.12%, now 0.01%)
 MIN_SPREAD_THRESHOLD = 1.8     # CHANGED: Minimum spread required for ANY entry (was 1.5%)
 
+# NEW: Trading fees configuration (0.2% per exchange, 0.4% total round-trip)
+TRADING_FEE_PCT_PER_EXCHANGE = 0.2  # 0.2% fee per exchange (Binance + KuCoin)
+TOTAL_TRADING_FEE_PCT = TRADING_FEE_PCT_PER_EXCHANGE * 2  # 0.4% total for open+close
+
+# NEW: Spread difference filter (reject if entry/exit spread diff > 30% of profit target)
+MAX_SPREAD_DIFF_PCT_OF_TARGET = 30.0  # 30% of profit capture target
+
 SCAN_THRESHOLD = 0.25
 ALERT_THRESHOLD = 5.0
 ALERT_COOLDOWN = 60
@@ -1817,7 +1824,20 @@ active_trade = {
     'plan': None,  # FIXED: Store plan ('binance', 'kucoin') or ('kucoin', 'binance')
     'avg_count': 0,  # NEW: Track averaging count
     'final_averaged_price_bin': None,  # NEW: Track final averaged entry price on Binance
-    'final_averaged_price_kc': None   # NEW: Track final averaged entry price on KuCoin
+    'final_averaged_price_kc': None,   # NEW: Track final averaged entry price on KuCoin
+    # NEW: Accumulated expenses tracking
+    'accumulated_expenses_pct': 0.0,  # Total expenses including fees (as % of notional)
+    'total_notional': 0.0,  # Total position size for fee calculation
+    # NEW: Exit spread tracking
+    'exit_trigger_spread': None,  # Spread when exit was triggered
+    'exit_real_spread': None,  # Actual spread from executed prices
+    'exit_trigger_bin_bid': None,
+    'exit_trigger_bin_ask': None,
+    'exit_trigger_kc_bid': None,
+    'exit_trigger_kc_ask': None,
+    # NEW: Balance tracking
+    'balance_before_close': None,
+    'balance_after_close': None
 }
 
 # Confirm counters per symbol (consecutive confirms)
@@ -2024,6 +2044,17 @@ def evaluate_entry_conditions(sym, info):
     if abs(trigger_spread) < MIN_SPREAD_THRESHOLD:
         return None  # Spread too small, reject entry
     
+    # NEW: Calculate expected exit spread and check if difference is too large
+    # Exit spread is approximately 0 (spread converges), so difference is ~trigger_spread
+    # Profit target is TAKE_PROFIT_FACTOR * abs(trigger_spread) = 0.5 * abs(trigger_spread)
+    profit_target_pct = TAKE_PROFIT_FACTOR * abs(trigger_spread)
+    spread_difference = abs(trigger_spread)  # Entry to exit (approximately)
+    max_allowed_diff = (MAX_SPREAD_DIFF_PCT_OF_TARGET / 100.0) * profit_target_pct
+    
+    if spread_difference > max_allowed_diff:
+        logger.warning(f"❌ Rejecting {sym}: Spread diff {spread_difference:.4f}% > {MAX_SPREAD_DIFF_PCT_OF_TARGET}% of profit target ({max_allowed_diff:.4f}%)")
+        return None
+    
     # CRITICAL: Fetch funding rates with retry and validation
     bin_fr_info = fetch_binance_funding(sym)
     kc_fr_info = fetch_kucoin_funding(ku_api_sym)
@@ -2227,6 +2258,17 @@ def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, 
     active_trade['funding_rounds_seen'] = set()
     active_trade['suppress_full_scan'] = abs(trigger_spread) >= BIG_SPREAD_THRESHOLD
     active_trade['plan'] = plan  # FIXED: Store plan for later reference in averaging/TP
+    
+    # FIXED: Initialize accumulated expenses with ONLY entry trading fees (0.4% total)
+    total_notional = implied_bin_amt + implied_kc_amt
+    active_trade['total_notional'] = total_notional
+    # Trading fees: 0.2% per exchange for entry (open position) = 0.4% total
+    # Exit fees are NOT pre-counted, only actual entry fees
+    entry_trading_fees_pct = TOTAL_TRADING_FEE_PCT  # 0.4% for opening (0.2% Binance + 0.2% KuCoin)
+    active_trade['accumulated_expenses_pct'] = entry_trading_fees_pct  # Start with ONLY entry fees (0.4%)
+    
+    logger.info(f"NEW: Accumulated expenses initialized with entry fees: {entry_trading_fees_pct:.4f}% of ${total_notional:.2f} = ${(entry_trading_fees_pct/100.0)*total_notional:.2f}")
+    
     entry_spreads[sym] = practical_entry_spread  # FIXED: Store with sign preserved
     entry_prices.setdefault(sym, {})['kucoin'] = exec_price_kc
     entry_prices.setdefault(sym, {})['binance'] = exec_price_bin
@@ -2297,13 +2339,19 @@ def place_reduce_only_stop(exchange, symbol, side, qty, liq_price, buffer_pct=0.
             logger.info("✅ STOP PRICE CALCULATED FROM LIQUIDATION PRICE: %s side=%s liq_price=%s stop_price=%s", 
                        exchange.id, side, liq_price, stop_price)
         elif exec_price_fallback is not None and exec_price_fallback > 0:
-            # Use exec price with larger buffer if no liq
+            # Use exec price with 25% buffer (simulating liquidation price) if no liq price available
+            # This happens when position size is small relative to account balance (liq price would be >100% away)
+            simulated_liq_pct = 0.25  # 25% away from execution price as simulated liquidation
             if side == 'long':
-                stop_price = exec_price_fallback * (1 - buffer_pct * 3)
+                # For long: simulated liq is 25% below exec, stop is 2% above that
+                simulated_liq_price = exec_price_fallback * (1 - simulated_liq_pct)
+                stop_price = simulated_liq_price * (1 + buffer_pct)
             elif side == 'short':
-                stop_price = exec_price_fallback * (1 + buffer_pct * 3)
-            logger.warning("⚠️  FALLBACK: Using exec price for stop (no liquidation price available): %s side=%s exec_price=%s stop_price=%s", 
-                         exchange.id, side, exec_price_fallback, stop_price)
+                # For short: simulated liq is 25% above exec, stop is 2% below that
+                simulated_liq_price = exec_price_fallback * (1 + simulated_liq_pct)
+                stop_price = simulated_liq_price * (1 - buffer_pct)
+            logger.warning("⚠️  FALLBACK: Using simulated liq price (25%% from exec) for stop (no liquidation price available): %s side=%s exec_price=%s simulated_liq=%s stop_price=%s", 
+                         exchange.id, side, exec_price_fallback, simulated_liq_price, stop_price)
         
         if stop_price is None or stop_price <= 0:
             logger.warning("Cannot determine valid stop price for %s %s (liq=%s, exec=%s, side=%s)", 
@@ -2644,15 +2692,26 @@ def check_take_profit_or_close_conditions():
             should_exit = True
             exit_reason = f"TAKE PROFIT (convergence={spread_convergence:.4f}% >= target={target_convergence:.4f}%)"
         else:
-            # Check funding accumulation
-            funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
-            # CHANGED: Now funding_acc can be negative (net received) or positive (net paid)
-            # Only close if NET PAID funding exceeds target (positive funding_acc > target)
-            if funding_acc > 0 and funding_acc > target_convergence:
-                # Only close if spread hasn't widened too much
-                if abs(current_spread) <= (1.5 * abs(avg_entry_spread)):
-                    should_exit = True
-                    exit_reason = f"FUNDING LOSS (net paid={funding_acc:.4f}% > target={target_convergence:.4f}%)"
+            # FIXED: Check if accumulated expenses exceed profit target
+            # accumulated_expenses_pct includes entry fees (0.4%) + net funding paid
+            accumulated_expenses_pct = active_trade.get('accumulated_expenses_pct', 0.0)
+            
+            if accumulated_expenses_pct > target_convergence:
+                # Accumulated expenses exceeded profit target - close position
+                should_exit = True
+                exit_reason = f"EXPENSE LIMIT (expenses={accumulated_expenses_pct:.4f}% > target={target_convergence:.4f}%)"
+                logger.warning("CLOSING DUE TO EXPENSES: accumulated_expenses_pct=%.4f%% > target_convergence=%.4f%%", 
+                             accumulated_expenses_pct, target_convergence)
+            else:
+                # Also check funding accumulation as backup
+                funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
+                # CHANGED: Now funding_acc can be negative (net received) or positive (net paid)
+                # Only close if NET PAID funding exceeds target (positive funding_acc > target)
+                if funding_acc > 0 and funding_acc > target_convergence:
+                    # Only close if spread hasn't widened too much
+                    if abs(current_spread) <= (1.5 * abs(avg_entry_spread)):
+                        should_exit = True
+                        exit_reason = f"FUNDING LOSS (net paid={funding_acc:.4f}% > target={target_convergence:.4f}%)"
     
     # NEW: 3-confirmation logic for exit
     if should_exit:
@@ -2671,10 +2730,34 @@ def check_take_profit_or_close_conditions():
             # ADDED: Capture pre-trade balance
             pre_total, pre_bin, pre_kc = get_total_futures_balance()
             net_funding_total = active_trade.get('funding_accumulated_pct', 0.0)
+            total_notional = active_trade.get('total_notional', NOTIONAL)
+            
+            # NEW: Store pre-close balance in active_trade
+            active_trade['balance_before_close'] = {
+                'total': pre_total,
+                'binance': pre_bin,
+                'kucoin': pre_kc
+            }
             
             # FIXED: Set closing reason to TP BEFORE closing positions
             closing_reason = 'TP'
             tp_closing_in_progress = True
+            
+            # NEW: Store exit trigger prices for slippage calculation
+            try:
+                bin_book = requests.get("https://fapi.binance.com/fapi/v1/ticker/bookTicker", timeout=5).json()
+                for item in bin_book:
+                    if item['symbol'] == sym:
+                        active_trade['exit_trigger_bin_bid'] = float(item['bidPrice'])
+                        active_trade['exit_trigger_bin_ask'] = float(item['askPrice'])
+                        break
+                kc_api = active_trade.get('ku_api') or sym + "M"
+                kc_resp = requests.get(f"https://api-futures.kucoin.com/api/v1/ticker?symbol={kc_api}", timeout=5).json()
+                d = kc_resp.get('data', {})
+                active_trade['exit_trigger_kc_bid'] = float(d.get('bestBidPrice', '0') or 0)
+                active_trade['exit_trigger_kc_ask'] = float(d.get('bestAskPrice', '0') or 0)
+            except Exception as e:
+                logger.warning(f"Error storing exit trigger prices: {e}")
             
             # Close positions and capture executed prices
             close_result = close_all_and_wait_with_tracking(sym)
@@ -2685,6 +2768,27 @@ def check_take_profit_or_close_conditions():
             # ADDED: Capture post-trade balance
             post_total, post_bin, post_kc = get_total_futures_balance()
             
+            # NEW: Store post-close balance in active_trade
+            active_trade['balance_after_close'] = {
+                'total': post_total,
+                'binance': post_bin,
+                'kucoin': post_kc
+            }
+            
+            # NEW: Calculate balance change breakdown
+            balance_change = post_total - pre_total
+            
+            # Calculate exit trading fees (0.4% of total notional for closing)
+            exit_trading_fees_pct = TOTAL_TRADING_FEE_PCT  # 0.4%
+            exit_trading_fees_dollars = (exit_trading_fees_pct / 100.0) * total_notional
+            
+            # Total trading fees (entry + exit = 0.8% total)
+            total_trading_fees_pct = 2 * TOTAL_TRADING_FEE_PCT  # 0.8% (0.4% entry + 0.4% exit)
+            total_trading_fees_dollars = (total_trading_fees_pct / 100.0) * total_notional
+            
+            # Funding fees (convert % to dollars)
+            funding_acc_dollars = (net_funding_total / 100.0) * total_notional
+            
             if close_result:
                 exit_exec_bin_price = close_result.get('bin_exec_price')
                 exit_exec_kc_price = close_result.get('kc_exec_price')
@@ -2693,19 +2797,33 @@ def check_take_profit_or_close_conditions():
                 if exit_exec_bin_price and exit_exec_kc_price:
                     # FIXED: Use plan direction for exit spread calculation
                     if plan == ('binance', 'kucoin'):
-                        # Long binance, short kucoin: use (kc - bin) / bin
+                        # Long binance, short kucoin: when closing, sell bin at bid, buy kc at ask
+                        # Exit spread: (kc_ask - bin_bid) / bin_bid
                         exit_exec_spread = 100 * (exit_exec_kc_price - exit_exec_bin_price) / exit_exec_bin_price
                     else:
-                        # Short binance, long kucoin: use (bin - kc) / kc
+                        # Short binance, long kucoin: when closing, buy bin at ask, sell kc at bid
+                        # Exit spread: (bin_ask - kc_bid) / kc_bid
                         exit_exec_spread = 100 * (exit_exec_bin_price - exit_exec_kc_price) / exit_exec_kc_price
                     
-                    # Calculate slippage
-                    exit_slippage = exit_trigger_spread - exit_exec_spread
+                    # Calculate slippage (difference between trigger and executed spread)
+                    exit_slippage_pct = exit_trigger_spread - exit_exec_spread
+                    exit_slippage_dollars = (exit_slippage_pct / 100.0) * total_notional
                     
                     logger.info("EXIT SPREADS | trigger=%.4f%% executed=%.4f%% slippage=%.4f%%", 
-                                exit_trigger_spread, exit_exec_spread, exit_slippage)
+                                exit_trigger_spread, exit_exec_spread, exit_slippage_pct)
                     
-                    # CHANGED: Enhanced telegram message with pre/post balance and net funding
+                    # NEW: Calculate net P&L breakdown
+                    # balance_change = spread_profit - total_fees + funding_income - exit_slippage
+                    # Therefore: spread_profit = balance_change + total_fees - funding_income + exit_slippage
+                    
+                    # Note: net_funding_total is NEGATIVE when we received funding (income)
+                    # So funding_income = -funding_acc_dollars (negate to get income)
+                    funding_income = -funding_acc_dollars  # Positive when we received funding
+                    
+                    # Estimate gross spread profit
+                    gross_spread_profit = balance_change + total_trading_fees_dollars - funding_income + exit_slippage_dollars
+                    
+                    # CHANGED: Enhanced telegram message with detailed breakdown
                     # NEW: Add averaging information if averaging occurred
                     funding_status = "received" if net_funding_total < 0 else "paid"
                     avg_count = active_trade.get('avg_count', 0)
@@ -2713,56 +2831,68 @@ def check_take_profit_or_close_conditions():
                     if avg_count > 0:
                         final_bin_price = active_trade.get('final_averaged_price_bin')
                         final_kc_price = active_trade.get('final_averaged_price_kc')
-                        averaging_info = f"Averaging: `{avg_count}x`\n"
+                        averaging_info = f"Averaging: `×{avg_count}`\n"
                         if final_bin_price:
-                            averaging_info += f"Avg Entry Bin: `{final_bin_price:.6f}`\n"
+                            averaging_info += f"Avg Bin: `{final_bin_price:.6f}`\n"
                         if final_kc_price:
-                            averaging_info += f"Avg Entry KC: `{final_kc_price:.6f}`\n"
+                            averaging_info += f"Avg KC: `{final_kc_price:.6f}`\n"
                     
                     msg = (
                         f"*{exit_reason}* `{sym}`\n"
                         f"{averaging_info}"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📊 *SPREADS*\n"
                         f"Entry: `{avg_entry_spread:.4f}%`\n"
                         f"Exit Trigger: `{exit_trigger_spread:.4f}%`\n"
                         f"Exit Executed: `{exit_exec_spread:.4f}%`\n"
-                        f"Slippage: `{exit_slippage:.4f}%`\n"
+                        f"Exit Slippage: `{exit_slippage_pct:.4f}%` (`${exit_slippage_dollars:+.2f}`)\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"Net Funding: `{abs(net_funding_total):.4f}%` ({funding_status})\n"
+                        f"💰 *BALANCE CHANGE*\n"
+                        f"Before: `${pre_total:.2f}`\n"
+                        f"After: `${post_total:.2f}`\n"
+                        f"Net Change: `${balance_change:+.2f}`\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"Pre-Balance: `${pre_total:.2f}`\n"
-                        f"  Binance: `${pre_bin:.2f}`\n"
-                        f"  KuCoin: `${pre_kc:.2f}`\n"
-                        f"Post-Balance: `${post_total:.2f}`\n"
-                        f"  Binance: `${post_bin:.2f}`\n"
-                        f"  KuCoin: `${post_kc:.2f}`\n"
-                        f"P&L: `${post_total - pre_total:.2f}`\n"
+                        f"📋 *P&L BREAKDOWN*\n"
+                        f"Gross Profit: `${gross_spread_profit:+.2f}`\n"
+                        f"Trading Fees: `-${total_trading_fees_dollars:.2f}` ({total_trading_fees_pct:.2f}%)\n"
+                        f"Funding: `${funding_income:+.2f}` ({funding_status})\n"
+                        f"Exit Slippage: `-${exit_slippage_dollars:.2f}`\n"
+                        f"Net P&L: `${balance_change:+.2f}`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"{exit_trigger_time}"
                     )
                 else:
-                    # NEW: Add averaging information
+                    # No executed prices available
+                    funding_status = "received" if net_funding_total < 0 else "paid"
+                    funding_income = -funding_acc_dollars
+                    
                     avg_count = active_trade.get('avg_count', 0)
                     averaging_info = ""
                     if avg_count > 0:
                         final_bin_price = active_trade.get('final_averaged_price_bin')
                         final_kc_price = active_trade.get('final_averaged_price_kc')
-                        averaging_info = f"Averaging: `{avg_count}x`\n"
+                        averaging_info = f"Averaging: `×{avg_count}`\n"
                         if final_bin_price:
-                            averaging_info += f"Avg Entry Bin: `{final_bin_price:.6f}`\n"
+                            averaging_info += f"Avg Bin: `{final_bin_price:.6f}`\n"
                         if final_kc_price:
-                            averaging_info += f"Avg Entry KC: `{final_kc_price:.6f}`\n"
+                            averaging_info += f"Avg KC: `{final_kc_price:.6f}`\n"
                     
-                    funding_status = "received" if net_funding_total < 0 else "paid"
                     msg = (
                         f"*{exit_reason}* `{sym}`\n"
                         f"{averaging_info}"
                         f"Entry: `{avg_entry_spread:.4f}%`\n"
                         f"Exit Trigger: `{exit_trigger_spread:.4f}%`\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"Net Funding: `{abs(net_funding_total):.4f}%` ({funding_status})\n"
+                        f"💰 *BALANCE CHANGE*\n"
+                        f"Before: `${pre_total:.2f}`\n"
+                        f"After: `${post_total:.2f}`\n"
+                        f"Net Change: `${balance_change:+.2f}`\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"Pre-Balance: `${pre_total:.2f}`\n"
-                        f"Post-Balance: `${post_total:.2f}`\n"
-                        f"P&L: `${post_total - pre_total:.2f}`\n"
+                        f"📋 *P&L BREAKDOWN*\n"
+                        f"Trading Fees: `-${total_trading_fees_dollars:.2f}` ({total_trading_fees_pct:.2f}%)\n"
+                        f"Funding: `${funding_income:+.2f}` ({funding_status})\n"
+                        f"Net P&L: `${balance_change:+.2f}`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"{exit_trigger_time}"
                     )
             else:
@@ -2807,7 +2937,16 @@ def reset_active_trade():
     sym = active_trade.get('symbol')
     if sym:
         positions[sym] = None
-    active_trade.update({'symbol': None, 'ku_api': None, 'ku_ccxt': None, 'case': None, 'entry_spread': None, 'avg_entry_spread': None, 'entry_prices': None, 'notional': None, 'averages_done': 0, 'final_implied_notional': None, 'funding_accumulated_pct': 0.0, 'funding_rounds_seen': set(), 'suppress_full_scan': False, 'plan': None, 'avg_count': 0, 'final_averaged_price_bin': None, 'final_averaged_price_kc': None})
+    active_trade.update({
+        'symbol': None, 'ku_api': None, 'ku_ccxt': None, 'case': None, 'entry_spread': None, 
+        'avg_entry_spread': None, 'entry_prices': None, 'notional': None, 'averages_done': 0, 
+        'final_implied_notional': None, 'funding_accumulated_pct': 0.0, 'funding_rounds_seen': set(), 
+        'suppress_full_scan': False, 'plan': None, 'avg_count': 0, 'final_averaged_price_bin': None, 
+        'final_averaged_price_kc': None, 'accumulated_expenses_pct': 0.0, 'total_notional': 0.0,
+        'exit_trigger_spread': None, 'exit_real_spread': None, 'exit_trigger_bin_bid': None,
+        'exit_trigger_bin_ask': None, 'exit_trigger_kc_bid': None, 'exit_trigger_kc_ask': None,
+        'balance_before_close': None, 'balance_after_close': None
+    })
     tp_confirm_count = 0  # NEW: Reset TP confirmation counter
     closing_reason = None  # FIXED: Reset closing reason
     logger.info("Active trade reset")
@@ -2844,8 +2983,22 @@ def funding_round_accounting_loop():
                         # This allows received funding to offset paid funding
                         active_trade['funding_accumulated_pct'] += net  # Direct addition (negative reduces, positive increases)
                         active_trade['funding_rounds_seen'].add(next_ft)
+                        
+                        # NEW: Update accumulated expenses
+                        # If net funding is positive (we paid), add to expenses
+                        # If net funding is negative (we received), subtract from expenses
+                        if net > 0:
+                            # We paid funding - add to expenses
+                            active_trade['accumulated_expenses_pct'] += abs(net)
+                        else:
+                            # We received funding - subtract from expenses
+                            active_trade['accumulated_expenses_pct'] -= abs(net)
+                        
                         funding_status = "received" if net > 0 else "paid"
-                        send_telegram(f"*FUNDING ROUND APPLIED* `{sym}`\nBinance: `{b_pct:.4f}`% KuCoin: `{k_pct:.4f}`%\nNet: `{net:.4f}%` ({funding_status})\nNet accumulated funding: `{active_trade['funding_accumulated_pct']:.4f}%`\n{timestamp()}")
+                        total_not = active_trade.get('total_notional', 0.0)
+                        accumulated_exp_dollars = (active_trade['accumulated_expenses_pct'] / 100.0) * total_not if total_not > 0 else 0.0
+                        
+                        send_telegram(f"*FUNDING ROUND APPLIED* `{sym}`\nBinance: `{b_pct:.4f}`% KuCoin: `{k_pct:.4f}`%\nNet: `{net:.4f}%` ({funding_status})\nNet accumulated funding: `{active_trade['funding_accumulated_pct']:.4f}%`\nAccum. Expenses: `{active_trade['accumulated_expenses_pct']:.4f}%` (`${accumulated_exp_dollars:.2f}`)\n{timestamp()}")
                 except Exception:
                     logger.exception("Error in funding_round_accounting loop")
             time.sleep(10)
@@ -2907,20 +3060,56 @@ def periodic_summary_loop():
                 total_not = active_trade.get('total_notional', 0.0)
                 funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
                 
-                # Get current spread
-                with candidates_shared_lock:
-                    info = candidates_shared.get(sym)
-                current_spread = info.get('max_spread', 0.0) if info else 0.0
+                # NEW: Get accumulated expenses (includes trading fees + funding)
+                accumulated_expenses_pct = active_trade.get('accumulated_expenses_pct', 0.0)
+                accumulated_expenses_dollars = (accumulated_expenses_pct / 100.0) * total_not if total_not > 0 else 0.0
+                
+                # Get current spread (live)
+                try:
+                    bin_book = requests.get("https://fapi.binance.com/fapi/v1/ticker/bookTicker", timeout=5).json()
+                    bin_prices = None
+                    for item in bin_book:
+                        if item['symbol'] == sym:
+                            bin_prices = (float(item['bidPrice']), float(item['askPrice']))
+                            break
+                    kc_api = active_trade.get('ku_api') or sym + "M"
+                    kc_resp = requests.get(f"https://api-futures.kucoin.com/api/v1/ticker?symbol={kc_api}", timeout=5).json()
+                    d = kc_resp.get('data', {}) if isinstance(kc_resp, dict) else {}
+                    kc_prices = (float(d.get('bestBidPrice') or 0), float(d.get('bestAskPrice') or 0))
+                    
+                    if bin_prices and kc_prices:
+                        bin_bid, bin_ask = bin_prices
+                        kc_bid, kc_ask = kc_prices
+                        plan = active_trade.get('plan')
+                        
+                        # Calculate entry spread (what we'd get if entering now)
+                        if plan == ('binance', 'kucoin'):
+                            entry_spread_live = 100 * (kc_bid - bin_ask) / bin_ask if bin_ask > 0 else 0.0
+                            # For exit, reverse positions: close long bin (sell at bid), close short kc (buy at ask)
+                            exit_spread_live = 100 * (kc_ask - bin_bid) / bin_bid if bin_bid > 0 else 0.0
+                        else:
+                            entry_spread_live = 100 * (bin_bid - kc_ask) / kc_ask if kc_ask > 0 else 0.0
+                            # For exit, reverse positions: close short bin (buy at ask), close long kc (sell at bid)
+                            exit_spread_live = 100 * (bin_ask - kc_bid) / kc_bid if kc_bid > 0 else 0.0
+                    else:
+                        entry_spread_live = 0.0
+                        exit_spread_live = 0.0
+                except Exception as e:
+                    logger.warning(f"Error fetching live spreads: {e}")
+                    entry_spread_live = 0.0
+                    exit_spread_live = 0.0
                 
                 summary = (
                     f"📊 *BOT STATUS SUMMARY*\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🟢 *ACTIVE TRADE*\n"
-                    f"Symbol: `{sym}` ({case})\n"
-                    f"Entry: `{avg_spread:.4f}%` (×{avg_count})\n"
-                    f"Current: `{current_spread:.4f}%`\n"
+                    f"🟢 *ACTIVE TRADE* `{sym}`\n"
+                    f"Case: `{case}` | Averages: `×{avg_count}`\n"
+                    f"Entry Spread: `{avg_spread:.4f}%`\n"
+                    f"Live Entry Spread: `{entry_spread_live:.4f}%`\n"
+                    f"Live Exit Spread: `{exit_spread_live:.4f}%`\n"
                     f"Notional: `${total_not:.2f}`\n"
-                    f"Funding Cost: `{funding_acc:.4f}%`\n"
+                    f"Funding: `{funding_acc:.4f}%` (`${(funding_acc/100.0)*total_not:.2f}`)\n"
+                    f"Accum. Expenses: `{accumulated_expenses_pct:.4f}%` (`${accumulated_expenses_dollars:.2f}`)\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"📈 *MAX POSITIVE SPREAD*\n"
                     f"`{max_pos_sym}`: `{max_pos_spread:.4f}%`\n"
@@ -2933,9 +3122,49 @@ def periodic_summary_loop():
                     f"⏰ {timestamp()}"
                 )
             else:
-                # No active trade
+                # No active trade - show entry/exit spreads for max +ve and max -ve
                 with candidates_shared_lock:
                     num_candidates = len(candidates_shared)
+                
+                # Calculate entry and exit spreads for max positive
+                max_pos_entry_spread = 0.0
+                max_pos_exit_spread = 0.0
+                if best_pos:
+                    pos_sym, pos_info = best_pos
+                    bin_bid = pos_info.get('bin_bid', 0)
+                    bin_ask = pos_info.get('bin_ask', 0)
+                    kc_bid = pos_info.get('ku_bid', 0)
+                    kc_ask = pos_info.get('ku_ask', 0)
+                    if bin_bid > 0 and bin_ask > 0 and kc_bid > 0 and kc_ask > 0:
+                        # Determine plan based on spread direction
+                        if kc_bid > bin_ask:
+                            # Long binance, short kucoin
+                            max_pos_entry_spread = 100 * (kc_bid - bin_ask) / bin_ask
+                            max_pos_exit_spread = 100 * (kc_ask - bin_bid) / bin_bid
+                        else:
+                            # Short binance, long kucoin
+                            max_pos_entry_spread = 100 * (bin_bid - kc_ask) / kc_ask
+                            max_pos_exit_spread = 100 * (bin_ask - kc_bid) / kc_bid
+                
+                # Calculate entry and exit spreads for max negative
+                max_neg_entry_spread = 0.0
+                max_neg_exit_spread = 0.0
+                if best_neg:
+                    neg_sym, neg_info = best_neg
+                    bin_bid = neg_info.get('bin_bid', 0)
+                    bin_ask = neg_info.get('bin_ask', 0)
+                    kc_bid = neg_info.get('ku_bid', 0)
+                    kc_ask = neg_info.get('ku_ask', 0)
+                    if bin_bid > 0 and bin_ask > 0 and kc_bid > 0 and kc_ask > 0:
+                        # Determine plan based on spread direction
+                        if kc_bid > bin_ask:
+                            # Long binance, short kucoin
+                            max_neg_entry_spread = 100 * (kc_bid - bin_ask) / bin_ask
+                            max_neg_exit_spread = 100 * (kc_ask - bin_bid) / bin_bid
+                        else:
+                            # Short binance, long kucoin
+                            max_neg_entry_spread = 100 * (bin_bid - kc_ask) / kc_ask
+                            max_neg_exit_spread = 100 * (bin_ask - kc_bid) / kc_bid
                 
                 summary = (
                     f"📊 *BOT STATUS SUMMARY*\n"
@@ -2946,10 +3175,14 @@ def periodic_summary_loop():
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"📈 *MAX POSITIVE SPREAD*\n"
                     f"`{max_pos_sym}`: `{max_pos_spread:.4f}%`\n"
+                    f"Entry Spread: `{max_pos_entry_spread:.4f}%`\n"
+                    f"Exit Spread: `{max_pos_exit_spread:.4f}%`\n"
                     f"FR → Bin: `{max_pos_fr_bin:.4f}%` | KC: `{max_pos_fr_kc:.4f}%`\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"📉 *MAX NEGATIVE SPREAD*\n"
                     f"`{max_neg_sym}`: `{max_neg_spread:.4f}%`\n"
+                    f"Entry Spread: `{max_neg_entry_spread:.4f}%`\n"
+                    f"Exit Spread: `{max_neg_exit_spread:.4f}%`\n"
                     f"FR → Bin: `{max_neg_fr_bin:.4f}%` | KC: `{max_neg_fr_kc:.4f}%`\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"⏰ {timestamp()}"
