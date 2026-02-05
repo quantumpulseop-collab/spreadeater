@@ -1,26 +1,5 @@
 #!/usr/bin/env python3
-# Integrated Arb Bot - FUNDING FEE FIX
-# 
-# CRITICAL CHANGE: Funding Fee Tracking
-# =====================================
-# Previous approach: Theoretical calculation based on funding rates
-# - Problem: Confusing logic about when funding is paid vs received
-# - Problem: Bot didn't exit when funding fees exceeded profit target
-# 
-# New approach: Fetch actual funding fee history from exchanges
-# - Fetches real payment history from Binance and KuCoin APIs
-# - Sums up actual dollars paid/received since entry
-# - Updates accumulated_expenses with real fees (no theoretical calculation)
-# - Simpler, more accurate, no confusion about signs
-# 
-# Key changes:
-# 1. Added fetch_binance_funding_history() - gets actual fee history from Binance
-# 2. Added fetch_kucoin_funding_history() - gets actual fee history from KuCoin  
-# 3. Added calculate_total_funding_fees_from_history() - sums real fees from both exchanges
-# 4. Replaced funding_round_accounting_loop() - now fetches history every 30s instead of theoretical calc
-# 5. Added entry_time_ms to active_trade - needed to fetch history since entry
-# 
-# Funding fee check interval: 30 seconds (configurable via FUNDING_FEE_CHECK_INTERVAL)
+# Integrated Arb Bot - final with 3-confirm and pre/post balance snapshots
 # WARNING: Live trading bot. Test carefully.
 
 import os
@@ -75,16 +54,13 @@ TAKE_PROFIT_FACTOR = 0.5
 MIN_FR_DIFF_THRESHOLD = 0.01  # CHANGED: Minimum funding rate difference (was 0.12%, now 0.01%)
 MIN_SPREAD_THRESHOLD = 1.8     # CHANGED: Minimum spread required for ANY entry (was 1.5%)
 
-# FIXED: Trading fees configuration
-# Entry fees: 0.1% per exchange = 0.2% total for opening position
-# Exit fees: 0.1% per exchange = 0.2% total for closing position
-# IMPORTANT: We only charge ENTRY fees upfront in accumulated_expenses, exit fees are NOT pre-counted
-TRADING_FEE_PCT_PER_EXCHANGE = 0.1  # 0.1% fee per exchange (industry standard for futures)
-ENTRY_TRADING_FEE_PCT = TRADING_FEE_PCT_PER_EXCHANGE * 2  # 0.2% total for entry (Binance + KuCoin)
-EXIT_TRADING_FEE_PCT = TRADING_FEE_PCT_PER_EXCHANGE * 2   # 0.2% total for exit (Binance + KuCoin)
+# UPDATED: Trading fees configuration (0.2% per exchange, 0.4% total for entry ONLY)
+TRADING_FEE_PCT_PER_EXCHANGE = 0.2  # 0.2% fee per exchange (Binance + KuCoin)
+ENTRY_TRADING_FEE_PCT = TRADING_FEE_PCT_PER_EXCHANGE * 2  # 0.4% total for opening (entry only, no exit fees)
 
-# NEW: Funding fee history check interval (in seconds)
-FUNDING_HISTORY_CHECK_INTERVAL = 60  # Check every 60 seconds
+# NEW: Funding fee tracking configuration
+FUNDING_FEE_CHECK_INTERVAL = 30  # Check for new funding fees every 30 seconds
+FUNDING_HISTORY_LOOKBACK_HOURS = 1  # Look back 1 hour for funding fee history
 
 # NEW: Spread difference filter (reject if entry/exit spread diff > 30% of profit target)
 MAX_SPREAD_DIFF_PCT_OF_TARGET = 30.0  # 30% of profit capture target
@@ -481,6 +457,139 @@ def fetch_kucoin_funding(symbol, max_retries=2):
     logger.error(f"❌ Failed to fetch KuCoin funding rate for {symbol} after {max_retries} attempts")
     return None
 
+# NEW: Functions to fetch ACTUAL funding fee history (real paid/received amounts)
+def fetch_binance_funding_history(symbol, start_time_ms, end_time_ms=None):
+    """
+    Fetch actual funding fees paid/received from Binance.
+    Returns list of funding fee entries with timestamp and amount in USD.
+    
+    API: GET /fapi/v1/income (incomeType=FUNDING_FEE)
+    """
+    try:
+        if end_time_ms is None:
+            end_time_ms = int(time.time() * 1000)
+        
+        # Binance requires authenticated request
+        params = {
+            'symbol': symbol,
+            'incomeType': 'FUNDING_FEE',
+            'startTime': start_time_ms,
+            'endTime': end_time_ms,
+            'limit': 1000
+        }
+        
+        # Use CCXT to make authenticated request
+        response = binance.fapiPrivateGetIncome(params)
+        
+        funding_fees = []
+        for entry in response:
+            funding_fees.append({
+                'timestamp': entry['time'],
+                'symbol': entry['symbol'],
+                'income': float(entry['income']),  # USD amount (positive = received, negative = paid)
+                'asset': entry['asset']
+            })
+        
+        logger.debug(f"✓ Fetched {len(funding_fees)} Binance funding fee entries for {symbol}")
+        return funding_fees
+        
+    except Exception as e:
+        logger.warning(f"Error fetching Binance funding history for {symbol}: {e}")
+        return []
+
+def fetch_kucoin_funding_history(symbol, start_time_ms, end_time_ms=None):
+    """
+    Fetch actual funding fees paid/received from KuCoin.
+    Returns list of funding fee entries with timestamp and amount in USD.
+    
+    API: GET /api/v1/funding-history (for futures)
+    """
+    try:
+        if end_time_ms is None:
+            end_time_ms = int(time.time() * 1000)
+        
+        params = {
+            'symbol': symbol,
+            'startAt': start_time_ms,
+            'endAt': end_time_ms
+        }
+        
+        # Use CCXT to make authenticated request
+        # KuCoin uses /api/v1/funding-history endpoint
+        response = kucoin.futuresPrivateGetFundingHistory(params)
+        
+        funding_fees = []
+        if response.get('code') == '200000' and response.get('data'):
+            data_list = response['data'].get('dataList', [])
+            for entry in data_list:
+                funding_fees.append({
+                    'timestamp': entry['timePoint'],
+                    'symbol': entry['symbol'],
+                    'income': float(entry['funding']),  # USD amount (positive = received, negative = paid)
+                })
+        
+        logger.debug(f"✓ Fetched {len(funding_fees)} KuCoin funding fee entries for {symbol}")
+        return funding_fees
+        
+    except Exception as e:
+        logger.warning(f"Error fetching KuCoin funding history for {symbol}: {e}")
+        return []
+
+def get_total_funding_fees_since_entry(symbol, ku_api_symbol, entry_timestamp_ms):
+    """
+    Get total funding fees paid/received since trade entry.
+    Returns net funding amount in USD (positive = we paid, negative = we received).
+    
+    Args:
+        symbol: Binance symbol (e.g., 'BTCUSDT')
+        ku_api_symbol: KuCoin symbol (e.g., 'BTCUSDTM')
+        entry_timestamp_ms: Entry time in milliseconds
+        
+    Returns:
+        dict with 'binance_fees_usd', 'kucoin_fees_usd', 'net_fees_usd'
+    """
+    try:
+        current_time_ms = int(time.time() * 1000)
+        
+        # Fetch funding history from both exchanges
+        binance_history = fetch_binance_funding_history(symbol, entry_timestamp_ms, current_time_ms)
+        kucoin_history = fetch_kucoin_funding_history(ku_api_symbol, entry_timestamp_ms, current_time_ms)
+        
+        # Sum up the funding fees
+        binance_fees_usd = sum(entry['income'] for entry in binance_history)
+        kucoin_fees_usd = sum(entry['income'] for entry in kucoin_history)
+        
+        # Determine net based on position direction
+        plan = active_trade.get('plan')
+        if plan == ('binance', 'kucoin'):
+            # Long binance, short kucoin
+            # Binance: negative income = we paid (increase expense)
+            # KuCoin: positive income = we received (decrease expense)
+            net_fees_usd = -binance_fees_usd + kucoin_fees_usd
+        else:
+            # Short binance, long kucoin
+            # Binance: positive income = we received (decrease expense)
+            # KuCoin: negative income = we paid (increase expense)
+            net_fees_usd = binance_fees_usd - kucoin_fees_usd
+        
+        logger.info(f"Funding fees since entry | Binance: ${binance_fees_usd:+.4f} | KuCoin: ${kucoin_fees_usd:+.4f} | Net: ${net_fees_usd:+.4f}")
+        
+        return {
+            'binance_fees_usd': binance_fees_usd,
+            'kucoin_fees_usd': kucoin_fees_usd,
+            'net_fees_usd': net_fees_usd,
+            'timestamp_checked': current_time_ms
+        }
+        
+    except Exception as e:
+        logger.exception(f"Error calculating total funding fees: {e}")
+        return {
+            'binance_fees_usd': 0.0,
+            'kucoin_fees_usd': 0.0,
+            'net_fees_usd': 0.0,
+            'timestamp_checked': int(time.time() * 1000)
+        }
+
 def compute_net_funding_for_plan(bin_fr_pct, kc_fr_pct, plan_long='binance', plan_short='kucoin'):
     """
     FIXED: Don't treat None as 0.0 - if either funding rate is None, return None
@@ -561,137 +670,6 @@ def detect_funding_interval_hours(bin_next_ms, kc_next_ms):
     except Exception:
         logger.exception("Error detecting funding interval")
         return 4  # Default fallback
-
-# NEW: Funding fee history fetching functions
-def fetch_binance_funding_history(symbol, start_time_ms=None, limit=100):
-    """
-    Fetch actual funding fee history from Binance.
-    Returns list of funding fee records with 'income' (positive = received, negative = paid).
-    If start_time_ms is None, fetches last 'limit' records.
-    """
-    try:
-        params = {
-            'symbol': symbol,
-            'incomeType': 'FUNDING_FEE',  # Only funding fees
-            'limit': limit
-        }
-        if start_time_ms:
-            params['startTime'] = int(start_time_ms)
-        
-        # Use Binance futures income API
-        income = binance.fapiPrivateGetIncome(params)
-        
-        results = []
-        for record in income:
-            try:
-                results.append({
-                    'symbol': record.get('symbol'),
-                    'income': float(record.get('income', 0)),  # Positive = received, negative = paid
-                    'asset': record.get('asset'),
-                    'time': int(record.get('time', 0)),
-                    'info': record.get('info', ''),
-                    'tranId': record.get('tranId')
-                })
-            except Exception as e:
-                logger.warning(f"Error parsing Binance funding record: {e}")
-                continue
-        
-        logger.debug(f"✓ Fetched {len(results)} Binance funding records for {symbol}")
-        return results
-    except Exception as e:
-        logger.exception(f"Error fetching Binance funding history for {symbol}: {e}")
-        return []
-
-def fetch_kucoin_funding_history(symbol, start_time_ms=None, max_count=100):
-    """
-    Fetch actual funding fee history from KuCoin.
-    Returns list of funding fee records with 'amount' (positive = received, negative = paid).
-    If start_time_ms is None, fetches recent records.
-    """
-    try:
-        params = {
-            'symbol': symbol,
-            'maxCount': max_count,
-            'hasMore': True
-        }
-        if start_time_ms:
-            params['startAt'] = int(start_time_ms // 1000)  # KuCoin uses seconds, not ms
-        
-        # Use KuCoin funding history API
-        response = kucoin.futuresPrivateGetFundingHistory(params)
-        
-        data = response.get('data', {})
-        records = data.get('dataList', [])
-        
-        results = []
-        for record in records:
-            try:
-                results.append({
-                    'symbol': record.get('symbol'),
-                    'amount': float(record.get('funding', 0)),  # Positive = received, negative = paid
-                    'time': int(record.get('timePoint', 0)),  # In milliseconds
-                    'funding_rate': float(record.get('fundingRate', 0))
-                })
-            except Exception as e:
-                logger.warning(f"Error parsing KuCoin funding record: {e}")
-                continue
-        
-        logger.debug(f"✓ Fetched {len(results)} KuCoin funding records for {symbol}")
-        return results
-    except Exception as e:
-        logger.exception(f"Error fetching KuCoin funding history for {symbol}: {e}")
-        return []
-
-def get_actual_funding_fees_since(symbol, ku_api_sym, since_time_ms):
-    """
-    Fetch actual funding fees paid/received from both exchanges since given timestamp.
-    Returns dict with:
-        - 'binance_total': total $ received (positive) or paid (negative)
-        - 'kucoin_total': total $ received (positive) or paid (negative)
-        - 'net_total': net funding (positive = received, negative = paid)
-        - 'binance_count': number of funding events
-        - 'kucoin_count': number of funding events
-    """
-    try:
-        # Fetch from Binance
-        bin_history = fetch_binance_funding_history(symbol, start_time_ms=since_time_ms)
-        binance_total = sum(record['income'] for record in bin_history)
-        binance_count = len(bin_history)
-        
-        # Fetch from KuCoin
-        kc_history = fetch_kucoin_funding_history(ku_api_sym, start_time_ms=since_time_ms)
-        kucoin_total = sum(record['amount'] for record in kc_history)
-        kucoin_count = len(kc_history)
-        
-        # Calculate net (binance + kucoin, accounting for long/short positions)
-        # Note: The sign is already correct from exchange APIs:
-        #   - Positive = we received funding (income)
-        #   - Negative = we paid funding (cost)
-        net_total = binance_total + kucoin_total
-        
-        result = {
-            'binance_total': binance_total,
-            'kucoin_total': kucoin_total,
-            'net_total': net_total,
-            'binance_count': binance_count,
-            'kucoin_count': kucoin_count
-        }
-        
-        logger.info(f"💰 Funding since {datetime.fromtimestamp(since_time_ms/1000)} | "
-                   f"Binance: ${binance_total:+.4f} ({binance_count} events) | "
-                   f"KuCoin: ${kucoin_total:+.4f} ({kucoin_count} events) | "
-                   f"Net: ${net_total:+.4f}")
-        
-        return result
-    except Exception as e:
-        logger.exception(f"Error getting actual funding fees: {e}")
-        return {
-            'binance_total': 0.0,
-            'kucoin_total': 0.0,
-            'net_total': 0.0,
-            'binance_count': 0,
-            'kucoin_count': 0
-        }
 
 # Spreadeater helpers (preserved)
 def ensure_markets_loaded():
@@ -1984,7 +1962,7 @@ active_trade = {
     'avg_count': 0,  # NEW: Track averaging count
     'final_averaged_price_bin': None,  # NEW: Track final averaged entry price on Binance
     'final_averaged_price_kc': None,   # NEW: Track final averaged entry price on KuCoin
-    # FIXED: Accumulated expenses tracking (includes trading fees + net funding PAID)
+    # NEW: Accumulated expenses tracking
     'accumulated_expenses_pct': 0.0,  # Total expenses including fees (as % of notional)
     'total_notional': 0.0,  # Total position size for fee calculation
     # NEW: Exit spread tracking
@@ -1994,11 +1972,9 @@ active_trade = {
     'exit_trigger_bin_ask': None,
     'exit_trigger_kc_bid': None,
     'exit_trigger_kc_ask': None,
-    # NEW: Balance and timing tracking
+    # NEW: Balance tracking
     'balance_before_close': None,
-    'balance_after_close': None,
-    'entry_time': None,  # NEW: Track when position was opened
-    'exit_time': None    # NEW: Track when position was closed
+    'balance_after_close': None
 }
 
 # Confirm counters per symbol (consecutive confirms)
@@ -2439,18 +2415,35 @@ def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, 
     active_trade['funding_rounds_seen'] = set()
     active_trade['suppress_full_scan'] = abs(trigger_spread) >= BIG_SPREAD_THRESHOLD
     active_trade['plan'] = plan  # FIXED: Store plan for later reference in averaging/TP
-    active_trade['entry_time'] = timestamp()  # NEW: Record entry time
-    active_trade['entry_time_ms'] = int(time.time() * 1000)  # NEW: Record entry time in ms for funding history
+    active_trade['entry_timestamp_ms'] = int(time.time() * 1000)  # NEW: Store entry time for funding history
+    active_trade['last_funding_check_ms'] = 0  # NEW: Track last time we checked funding history
     
-    # FIXED: Initialize accumulated expenses with ONLY entry trading fees (0.2% total)
+    # COMPLETELY CHANGED: Track accumulated expenses in USD directly (not percentage)
+    # This makes comparison with profit target (also in USD) crystal clear
     total_notional = implied_bin_amt + implied_kc_amt
     active_trade['total_notional'] = total_notional
-    # Trading fees: 0.1% per exchange for entry (open position) = 0.2% total
-    # Exit fees are NOT pre-counted, only actual entry fees
-    entry_trading_fees_pct = ENTRY_TRADING_FEE_PCT  # 0.2% for opening (0.1% Binance + 0.1% KuCoin)
-    active_trade['accumulated_expenses_pct'] = entry_trading_fees_pct  # Start with ONLY entry fees (0.2%)
     
-    logger.info(f"✅ Accumulated expenses initialized: entry_fees={entry_trading_fees_pct:.4f}% of ${total_notional:.2f} = ${(entry_trading_fees_pct/100.0)*total_notional:.4f}")
+    # Calculate fees per exchange IN DOLLARS
+    binance_entry_fees_dollars = (TRADING_FEE_PCT_PER_EXCHANGE / 100.0) * implied_bin_amt
+    kucoin_entry_fees_dollars = (TRADING_FEE_PCT_PER_EXCHANGE / 100.0) * implied_kc_amt
+    total_entry_fees_dollars = binance_entry_fees_dollars + kucoin_entry_fees_dollars
+    
+    # Store accumulated expenses in USD (not percentage!)
+    active_trade['accumulated_expenses_usd'] = total_entry_fees_dollars
+    
+    logger.info(f"PURE USD TRACKING: Entry fees = ${total_entry_fees_dollars:.4f} (Binance: ${binance_entry_fees_dollars:.4f} + KuCoin: ${kucoin_entry_fees_dollars:.4f})")
+    
+    # NEW: Check if practical entry spread is less than 1.2% - if so, close immediately
+    if abs(practical_entry_spread) < 1.2:
+        logger.warning(f"❌ IMMEDIATE EXIT TRIGGERED: Practical entry spread {practical_entry_spread:.4f}% < 1.2% (no profit left due to slippage)")
+        send_telegram(f"*IMMEDIATE EXIT* `{sym}`\n❌ Entry spread too low: `{practical_entry_spread:.4f}%` < 1.2%\nNo profit left after slippage. Closing immediately.\n{timestamp()}")
+        # Close positions immediately
+        try:
+            close_all_and_wait()
+            reset_active_trade()
+        except Exception as e:
+            logger.exception(f"Error closing positions after low spread detection: {e}")
+        return False  # Return False to indicate entry failed
     
     entry_spreads[sym] = practical_entry_spread  # FIXED: Store with sign preserved
     entry_prices.setdefault(sym, {})['kucoin'] = exec_price_kc
@@ -2782,35 +2775,29 @@ def attempt_averaging_if_needed():
                 active_trade['avg_entry_spread'] = new_avg
                 active_trade['final_implied_notional']['bin'] = prev_bin + new_implied_bin
                 active_trade['final_implied_notional']['kc'] = prev_kc + new_implied_kc
-                
-                # FIXED: Update total notional after averaging
-                new_total_notional = active_trade['final_implied_notional']['bin'] + active_trade['final_implied_notional']['kc']
-                old_total_notional = active_trade['total_notional']
-                active_trade['total_notional'] = new_total_notional
-                
-                # FIXED: Add averaging trading fees to accumulated expenses
-                # Each averaging adds 0.2% trading fees (0.1% per exchange for opening the additional position)
-                averaging_added_notional = new_implied_bin + new_implied_kc
-                averaging_fees_pct = (ENTRY_TRADING_FEE_PCT / 100.0) * averaging_added_notional / new_total_notional * 100.0
-                active_trade['accumulated_expenses_pct'] += averaging_fees_pct
-                
-                logger.info(f"✅ AVERAGING FEES: added {averaging_fees_pct:.4f}% for ${averaging_added_notional:.2f} averaging on ${new_total_notional:.2f} total notional")
-                logger.info(f"✅ NOTIONAL UPDATED: ${old_total_notional:.2f} → ${new_total_notional:.2f}")
-                logger.info(f"✅ ACCUMULATED EXPENSES: {active_trade['accumulated_expenses_pct']:.4f}% = ${(active_trade['accumulated_expenses_pct']/100.0)*new_total_notional:.4f}")
-                
                 # NEW: Track final averaged entry prices
                 active_trade['final_averaged_price_bin'] = exec_price_bin
                 active_trade['final_averaged_price_kc'] = exec_price_kc
-                try_place_stops_after_entry(sym, kc_ccxt, exec_price_bin or None, exec_price_kc or None, None, None)
                 
-                send_telegram(
-                    f"*AVERAGE ADDED* `{sym}` #{active_trade['averages_done']}\n"
-                    f"New Avg Spread: `{new_avg:.4f}%`\n"
-                    f"Bin: `{exec_price_bin:.6f}` | KC: `{exec_price_kc:.6f}`\n"
-                    f"Notional: `${new_total_notional:.2f}` (was `${old_total_notional:.2f}`)\n"
-                    f"Accum. Expenses: `{active_trade['accumulated_expenses_pct']:.4f}%`\n"
-                    f"{timestamp()}"
-                )
+                # PURE USD: Calculate additional fees in dollars
+                new_total_notional = active_trade['final_implied_notional']['bin'] + active_trade['final_implied_notional']['kc']
+                
+                # Calculate fees on the NEW notional added IN DOLLARS
+                binance_additional_fees_dollars = (TRADING_FEE_PCT_PER_EXCHANGE / 100.0) * new_implied_bin
+                kucoin_additional_fees_dollars = (TRADING_FEE_PCT_PER_EXCHANGE / 100.0) * new_implied_kc
+                total_additional_fees_dollars = binance_additional_fees_dollars + kucoin_additional_fees_dollars
+                
+                # Update total notional
+                old_total_notional = active_trade['total_notional']
+                active_trade['total_notional'] = new_total_notional
+                
+                # Add the additional fees to accumulated expenses (in USD)
+                active_trade['accumulated_expenses_usd'] += total_additional_fees_dollars
+                
+                logger.info(f"AVERAGING UPDATE | New Notional: ${new_total_notional:.2f} (was ${old_total_notional:.2f}) | Additional Fees: ${total_additional_fees_dollars:.4f} (Bin: ${binance_additional_fees_dollars:.4f} + KC: ${kucoin_additional_fees_dollars:.4f}) | Total Expenses: ${active_trade['accumulated_expenses_usd']:.4f}")
+                
+                try_place_stops_after_entry(sym, kc_ccxt, exec_price_bin or None, exec_price_kc or None, None, None)
+                send_telegram(f"*AVERAGE ADDED* `{sym}` → new avg spread `{new_avg:.4f}%` (averages_done={active_trade['averages_done']})\nBin: `{exec_price_bin:.6f}` | KC: `{exec_price_kc:.6f}`\n📊 New Notional: `${new_total_notional:.2f}`\n📊 Additional Fees: `${total_additional_fees_dollars:.4f}`\n💰 Total Expenses: `${active_trade['accumulated_expenses_usd']:.4f}`\n{timestamp()}")
             except Exception:
                 logger.exception("Error aggregating averaging results")
         else:
@@ -2891,34 +2878,61 @@ def check_take_profit_or_close_conditions():
             # Negative spread case: profit = current_spread - entry_spread (both negative, so this is positive when converging)
             spread_convergence = current_spread - avg_entry_spread
         
-        target_convergence = abs(avg_entry_spread) * TAKE_PROFIT_FACTOR  # 50% of entry spread
+        # PURE USD COMPARISON: Calculate profit target and compare with expenses
+        # Both in USD - crystal clear comparison!
         
-        logger.info("TP CALC | convergence=%.4f%% target=%.4f%%", spread_convergence, target_convergence)
+        # Get individual notionals
+        bin_notional = active_trade.get('final_implied_notional', {}).get('bin', 0)
+        kc_notional = active_trade.get('final_implied_notional', {}).get('kc', 0)
+        total_notional = bin_notional + kc_notional
         
-        if spread_convergence >= target_convergence:
+        # Profit is earned on SINGLE notional (use larger for conservative estimate)
+        profit_base_notional = max(bin_notional, kc_notional)
+        
+        # Calculate target profit in USD
+        target_convergence_pct = abs(avg_entry_spread) * TAKE_PROFIT_FACTOR  # 50% of entry spread
+        target_profit_usd = (target_convergence_pct / 100.0) * profit_base_notional
+        
+        # Get accumulated expenses in USD (already tracked in pure USD)
+        accumulated_expenses_usd = active_trade.get('accumulated_expenses_usd', 0.0)
+        
+        logger.info("TP CHECK (PURE USD) | entry=%.4f%% current=%.4f%% | Target profit: $%.4f (%.2f%% of $%.2f) | Expenses: $%.4f",
+                   avg_entry_spread, current_spread, target_profit_usd, target_convergence_pct, profit_base_notional, accumulated_expenses_usd)
+        
+        if spread_convergence >= target_convergence_pct:
             should_exit = True
-            exit_reason = f"TAKE PROFIT (convergence={spread_convergence:.4f}% >= target={target_convergence:.4f}%)"
+            exit_reason = f"TAKE PROFIT (convergence={spread_convergence:.4f}% >= target={target_convergence_pct:.4f}%)"
         else:
-            # FIXED: Check if accumulated expenses exceed profit target
-            # accumulated_expenses_pct includes entry fees (0.4%) + net funding paid
-            accumulated_expenses_pct = active_trade.get('accumulated_expenses_pct', 0.0)
-            
-            if accumulated_expenses_pct > target_convergence:
-                # Accumulated expenses exceeded profit target - close position
-                should_exit = True
-                exit_reason = f"EXPENSE LIMIT (expenses={accumulated_expenses_pct:.4f}% > target={target_convergence:.4f}%)"
-                logger.warning("CLOSING DUE TO EXPENSES: accumulated_expenses_pct=%.4f%% > target_convergence=%.4f%%", 
-                             accumulated_expenses_pct, target_convergence)
+            # PURE USD COMPARISON: Compare expenses (USD) vs profit target (USD)
+            if accumulated_expenses_usd > target_profit_usd:
+                # CRITICAL: Check if spread is still > 1.5x entry (wide enough for averaging)
+                # If spread > 1.5x entry, DON'T close - averaging might be triggered
+                # Only close if spread has narrowed (< 1.5x entry) and expenses exceed target
+                spread_ratio = abs(current_spread) / abs(avg_entry_spread) if avg_entry_spread != 0 else 0
+                
+                if spread_ratio > 1.5:
+                    # Spread is still very wide (> 1.5x entry)
+                    # Averaging might be triggered soon, so don't close yet
+                    logger.info("Expenses exceed target ($%.4f > $%.4f) BUT spread is still wide (%.4f%% = %.2fx entry %.4f%%) - waiting for averaging or convergence", 
+                               accumulated_expenses_usd, target_profit_usd, current_spread, spread_ratio, avg_entry_spread)
+                else:
+                    # Spread has narrowed (< 1.5x entry) and expenses exceed target
+                    # Close position - no more averaging opportunity and expenses too high
+                    should_exit = True
+                    exit_reason = f"EXPENSE LIMIT (expenses=${accumulated_expenses_usd:.4f} > target=${target_profit_usd:.4f}, spread={current_spread:.4f}% = {spread_ratio:.2f}x entry)"
+                    logger.warning("CLOSING DUE TO EXPENSES: expenses=$%.4f > target=$%.4f | current_spread=%.4f%% (%.2fx entry %.4f%%) - spread too narrow for averaging", 
+                                 accumulated_expenses_usd, target_profit_usd, current_spread, spread_ratio, avg_entry_spread)
             else:
-                # Also check funding accumulation as backup
-                funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
-                # CHANGED: Now funding_acc can be negative (net received) or positive (net paid)
-                # Only close if NET PAID funding exceeds target (positive funding_acc > target)
-                if funding_acc > 0 and funding_acc > target_convergence:
-                    # Only close if spread hasn't widened too much
-                    if abs(current_spread) <= (1.5 * abs(avg_entry_spread)):
+                # Also check funding accumulation as backup (in USD)
+                funding_acc_usd = active_trade.get('funding_accumulated_usd', 0.0)
+                
+                # Only close if NET PAID funding exceeds target
+                if funding_acc_usd > 0 and funding_acc_usd > target_profit_usd:
+                    # Check spread ratio - only close if spread < 1.5x entry (no averaging opportunity)
+                    spread_ratio = abs(current_spread) / abs(avg_entry_spread) if avg_entry_spread != 0 else 0
+                    if spread_ratio <= 1.5:
                         should_exit = True
-                        exit_reason = f"FUNDING LOSS (net paid={funding_acc:.4f}% > target={target_convergence:.4f}%)"
+                        exit_reason = f"FUNDING LOSS (net paid=${funding_acc_usd:.4f} > target=${target_profit_usd:.4f}, spread={spread_ratio:.2f}x entry)"
     
     # NEW: 3-confirmation logic for exit
     if should_exit:
@@ -2933,7 +2947,6 @@ def check_take_profit_or_close_conditions():
             # Store trigger spread before closing
             exit_trigger_spread = current_spread
             exit_trigger_time = timestamp()
-            active_trade['exit_time'] = exit_trigger_time  # NEW: Record exit time
             
             # ADDED: Capture pre-trade balance
             pre_total, pre_bin, pre_kc = get_total_futures_balance()
@@ -2986,27 +2999,11 @@ def check_take_profit_or_close_conditions():
             # NEW: Calculate balance change breakdown
             balance_change = post_total - pre_total
             
-            # Calculate exit trading fees (0.2% of total notional for closing)
-            exit_trading_fees_pct = EXIT_TRADING_FEE_PCT  # 0.2%
-            exit_trading_fees_dollars = (exit_trading_fees_pct / 100.0) * total_notional
+            # PURE USD: Get accumulated expenses directly in USD
+            accumulated_expenses_usd = active_trade.get('accumulated_expenses_usd', 0.0)
             
-            # Entry trading fees (already in accumulated_expenses)
-            entry_trading_fees_pct = ENTRY_TRADING_FEE_PCT  # 0.2%
-            entry_trading_fees_dollars = (entry_trading_fees_pct / 100.0) * total_notional
-            
-            # Total trading fees (entry + exit = 0.4% total)
-            total_trading_fees_pct = entry_trading_fees_pct + exit_trading_fees_pct  # 0.4%
-            total_trading_fees_dollars = entry_trading_fees_dollars + exit_trading_fees_dollars
-            
-            # Funding fees (convert % to dollars)
-            # Note: funding_accumulated_pct is POSITIVE when we received (income), NEGATIVE when we paid (cost)
-            net_funding_total = active_trade.get('funding_accumulated_pct', 0.0)
-            funding_dollars = (net_funding_total / 100.0) * total_notional
-            
-            # Get entry details
-            entry_time_str = active_trade.get('entry_time', 'N/A')
-            entry_price_bin = active_trade.get('entry_prices', {}).get('binance', {}).get('price', 0)
-            entry_price_kc = active_trade.get('entry_prices', {}).get('kucoin', {}).get('price', 0)
+            # Funding fees (convert % to dollars for backward compatibility display)
+            net_funding_total = active_trade.get('funding_accumulated_usd', 0.0)
             
             if close_result:
                 exit_exec_bin_price = close_result.get('bin_exec_price')
@@ -3031,92 +3028,56 @@ def check_take_profit_or_close_conditions():
                     logger.info("EXIT SPREADS | trigger=%.4f%% executed=%.4f%% slippage=%.4f%%", 
                                 exit_trigger_spread, exit_exec_spread, exit_slippage_pct)
                     
-                    # Calculate realized spread profit
-                    # Entry spread is what we entered at, exit spread is what we exited at
-                    # For positive entry spread: profit = entry - exit (spread converged)
-                    # For negative entry spread: profit = exit - entry (spread converged toward zero)
-                    if avg_entry_spread > 0:
-                        realized_spread_profit_pct = avg_entry_spread - exit_exec_spread
-                    else:
-                        realized_spread_profit_pct = exit_exec_spread - avg_entry_spread
+                    # PURE USD: Calculate net P&L breakdown
+                    # accumulated_expenses_usd includes: entry trading fees + actual funding paid/received (all in USD)
                     
-                    realized_spread_profit_dollars = (realized_spread_profit_pct / 100.0) * total_notional
+                    # Funding status (positive = we paid, negative = we received)
+                    funding_status = "received" if net_funding_total < 0 else "paid"
                     
-                    # Calculate slippage impact (how much we lost/gained compared to trigger)
-                    slippage_favorable = exit_slippage_pct < 0  # Negative slippage means we got better execution
-                    slippage_status = "favorable" if slippage_favorable else "unfavorable"
+                    # Estimate gross spread profit
+                    # balance_change = spread_profit - accumulated_expenses - exit_slippage
+                    # Therefore: spread_profit = balance_change + accumulated_expenses + exit_slippage
+                    gross_spread_profit = balance_change + accumulated_expenses_usd + exit_slippage_dollars
                     
-                    # Determine funding status (received = income, paid = cost)
-                    # funding_accumulated_pct is POSITIVE when we RECEIVED (income)
-                    if net_funding_total > 0:
-                        funding_status = f"Received (income): +${funding_dollars:.4f}"
-                    elif net_funding_total < 0:
-                        funding_status = f"Paid (cost): -${abs(funding_dollars):.4f}"
-                    else:
-                        funding_status = "None: $0.00"
-                    
-                    # Build comprehensive message
+                    # UPDATED: Enhanced telegram message with accumulated expenses
                     avg_count = active_trade.get('avg_count', 0)
                     averaging_info = ""
                     if avg_count > 0:
                         final_bin_price = active_trade.get('final_averaged_price_bin')
                         final_kc_price = active_trade.get('final_averaged_price_kc')
-                        averaging_info = (
-                            f"*AVERAGING: ×{avg_count}*\n"
-                            f"Final Avg Bin: `{final_bin_price:.6f}`\n"
-                            f"Final Avg KC: `{final_kc_price:.6f}`\n"
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                        )
+                        averaging_info = f"Averaging: `×{avg_count}`\n"
+                        if final_bin_price:
+                            averaging_info += f"Avg Bin: `{final_bin_price:.6f}`\n"
+                        if final_kc_price:
+                            averaging_info += f"Avg KC: `{final_kc_price:.6f}`\n"
                     
                     msg = (
                         f"*{exit_reason}* `{sym}`\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"{averaging_info}"
-                        f"*POSITION DETAILS*\n"
-                        f"Coin: `{sym}`\n"
-                        f"Entry Time: `{entry_time_str}`\n"
-                        f"Exit Time: `{exit_trigger_time}`\n"
-                        f"Notional: `${total_notional:.2f}`\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"*SPREAD ANALYSIS*\n"
-                        f"Entry Spread (avg): `{avg_entry_spread:.4f}%`\n"
-                        f"Exit Trigger Spread: `{exit_trigger_spread:.4f}%`\n"
-                        f"Exit Executed Spread: `{exit_exec_spread:.4f}%`\n"
-                        f"Exit Slippage: `{exit_slippage_pct:+.4f}%` (`${exit_slippage_dollars:+.4f}`) - {slippage_status}\n"
-                        f"Realized Spread: `{realized_spread_profit_pct:.4f}%` (`${realized_spread_profit_dollars:+.4f}`)\n"
+                        f"📊 *SPREADS*\n"
+                        f"Entry: `{avg_entry_spread:.4f}%`\n"
+                        f"Exit Trigger: `{exit_trigger_spread:.4f}%`\n"
+                        f"Exit Executed: `{exit_exec_spread:.4f}%`\n"
+                        f"Exit Slippage: `{exit_slippage_pct:.4f}%` (`${exit_slippage_dollars:+.2f}`)\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"*ENTRY PRICES*\n"
-                        f"Binance: `{entry_price_bin:.6f}`\n"
-                        f"KuCoin: `{entry_price_kc:.6f}`\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"*EXIT PRICES*\n"
-                        f"Binance: `{exit_exec_bin_price:.6f}`\n"
-                        f"KuCoin: `{exit_exec_kc_price:.6f}`\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"*BALANCE CHANGE*\n"
+                        f"💰 *BALANCE CHANGE*\n"
                         f"Before: `${pre_total:.2f}`\n"
                         f"After: `${post_total:.2f}`\n"
                         f"Net Change: `${balance_change:+.2f}`\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"*P&L BREAKDOWN*\n"
-                        f"Spread Profit: `${realized_spread_profit_dollars:+.2f}`\n"
-                        f"Trading Fees: `-${total_trading_fees_dollars:.4f}` ({total_trading_fees_pct:.2f}%)\n"
-                        f"  Entry: `-${entry_trading_fees_dollars:.4f}`\n"
-                        f"  Exit: `-${exit_trading_fees_dollars:.4f}`\n"
-                        f"Net Funding: {funding_status}\n"
-                        f"Exit Slippage: `${exit_slippage_dollars:+.4f}` ({slippage_status})\n"
-                        f"*NET P&L: `${balance_change:+.2f}`*\n"
-                        f"━━━━━━━━━━━━━━━━━━━━"
+                        f"📋 *P&L BREAKDOWN*\n"
+                        f"Gross Profit: `${gross_spread_profit:+.2f}`\n"
+                        f"Total Expenses: `-${accumulated_expenses_usd:.2f}`\n"
+                        f"  → Entry Fees + Funding {funding_status}\n"
+                        f"Exit Slippage: `-${exit_slippage_dollars:.2f}`\n"
+                        f"Net P&L: `${balance_change:+.2f}`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"{exit_trigger_time}"
                     )
                 else:
-                    # No executed prices available - simplified message
-                    # Determine funding status
-                    if net_funding_total > 0:
-                        funding_status = f"Received: +${funding_dollars:.4f}"
-                    elif net_funding_total < 0:
-                        funding_status = f"Paid: -${abs(funding_dollars):.4f}"
-                    else:
-                        funding_status = "None"
+                    # No executed prices available
+                    funding_status = "received" if net_funding_total < 0 else "paid"
                     
                     avg_count = active_trade.get('avg_count', 0)
                     averaging_info = ""
@@ -3132,8 +3093,6 @@ def check_take_profit_or_close_conditions():
                     msg = (
                         f"*{exit_reason}* `{sym}`\n"
                         f"{averaging_info}"
-                        f"Entry Time: `{entry_time_str}`\n"
-                        f"Exit Time: `{exit_trigger_time}`\n"
                         f"Entry: `{avg_entry_spread:.4f}%`\n"
                         f"Exit Trigger: `{exit_trigger_spread:.4f}%`\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -3143,13 +3102,12 @@ def check_take_profit_or_close_conditions():
                         f"Net Change: `${balance_change:+.2f}`\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"📋 *P&L BREAKDOWN*\n"
-                        f"Trading Fees: `-${total_trading_fees_dollars:.4f}` ({total_trading_fees_pct:.2f}%)\n"
-                        f"Net Funding: {funding_status}\n"
+                        f"Total Expenses: `-${accumulated_expenses_usd:.2f}`\n"
+                        f"  → Entry Fees + Funding {funding_status}\n"
                         f"Net P&L: `${balance_change:+.2f}`\n"
-                        f"━━━━━━━━━━━━━━━━━━━━"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"{exit_trigger_time}"
                     )
-                
-                send_telegram(msg)
             else:
                 close_all_and_wait()
                 # NEW: Add averaging information
@@ -3170,7 +3128,8 @@ def check_take_profit_or_close_conditions():
                     f"{averaging_info}"
                     f"Entry: `{avg_entry_spread:.4f}%`\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"Net Funding: `{abs(net_funding_total):.4f}%` ({funding_status})\n"
+                    f"Total Expenses: `${accumulated_expenses_usd:.2f}`\n"
+                    f"  → Entry Fees + Funding {funding_status}\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"Pre-Balance: `${pre_total:.2f}`\n"
                     f"Post-Balance: `${post_total:.2f}`\n"
@@ -3200,54 +3159,24 @@ def reset_active_trade():
         'final_averaged_price_kc': None, 'accumulated_expenses_pct': 0.0, 'total_notional': 0.0,
         'exit_trigger_spread': None, 'exit_real_spread': None, 'exit_trigger_bin_bid': None,
         'exit_trigger_bin_ask': None, 'exit_trigger_kc_bid': None, 'exit_trigger_kc_ask': None,
-        'balance_before_close': None, 'balance_after_close': None,
-        'entry_time': None, 'entry_time_ms': None, 'exit_time': None  # NEW: Reset timing fields including entry_time_ms
+        'balance_before_close': None, 'balance_after_close': None
     })
     tp_confirm_count = 0  # NEW: Reset TP confirmation counter
     closing_reason = None  # FIXED: Reset closing reason
     logger.info("Active trade reset")
 
-def calculate_total_funding_fees_from_history(symbol, ku_api_sym, entry_time_ms):
-    """
-    NEW: Calculate total funding fees from actual exchange history.
-    Fetches real funding fee data from both Binance and KuCoin.
-    Returns: (total_fees_pct, bin_fees_dollars, kc_fees_dollars)
-        - total_fees_pct: percentage of notional (positive = received, negative = paid)
-        - bin_fees_dollars: Binance fees in dollars (positive = received, negative = paid)
-        - kc_fees_dollars: KuCoin fees in dollars (positive = received, negative = paid)
-    """
-    try:
-        total_notional = active_trade.get('total_notional', 0.0)
-        if total_notional == 0:
-            return 0.0, 0.0, 0.0
-        
-        # Fetch actual funding fee history from both exchanges
-        funding_data = get_actual_funding_fees_since(symbol, ku_api_sym, entry_time_ms)
-        
-        bin_fees_dollars = funding_data.get('binance_total', 0.0)
-        kc_fees_dollars = funding_data.get('kucoin_total', 0.0)
-        net_fees_dollars = funding_data.get('net_total', 0.0)
-        
-        # Convert to percentage of notional
-        total_fees_pct = (net_fees_dollars / total_notional) * 100.0 if total_notional > 0 else 0.0
-        
-        logger.debug(
-            f"📊 Funding from history: {symbol}\n"
-            f"   Binance: ${bin_fees_dollars:+.4f} ({funding_data.get('binance_count', 0)} events)\n"
-            f"   KuCoin: ${kc_fees_dollars:+.4f} ({funding_data.get('kucoin_count', 0)} events)\n"
-            f"   Net: ${net_fees_dollars:+.4f} ({total_fees_pct:+.4f}%)"
-        )
-        
-        return total_fees_pct, bin_fees_dollars, kc_fees_dollars
-    except Exception as e:
-        logger.exception(f"Error calculating funding fees from history: {e}")
-        return 0.0, 0.0, 0.0
-
 def funding_round_accounting_loop():
     """
-    CRITICAL FIX: Instead of theoretical funding rate calculations,
-    we now fetch ACTUAL funding fee history from both exchanges
-    and update accumulated expenses with real paid/received fees.
+    COMPLETELY REWRITTEN: Fetches ACTUAL funding fees from exchange history.
+    
+    Every 30 seconds, it:
+    1. Fetches actual funding fee history from both Binance and KuCoin
+    2. Calculates net fees paid/received in USD
+    3. Converts to percentage of notional
+    4. Updates accumulated_expenses_pct immediately
+    
+    - Funding PAID (positive net_fees_usd) increases accumulated expenses
+    - Funding RECEIVED (negative net_fees_usd) decreases accumulated expenses
     """
     while True:
         try:
@@ -3256,70 +3185,87 @@ def funding_round_accounting_loop():
                 time.sleep(5)
                 continue
             
-            # Get entry time and symbol info
-            entry_time_ms = active_trade.get('entry_time_ms')
-            ku_api_sym = active_trade.get('ku_api') or sym + "M"
-            total_notional = active_trade.get('total_notional', 0.0)
-            
-            if not entry_time_ms:
-                logger.warning("No entry_time_ms found, skipping funding fee update")
-                time.sleep(FUNDING_HISTORY_CHECK_INTERVAL)
+            # Get entry timestamp and current time
+            entry_timestamp_ms = active_trade.get('entry_timestamp_ms')
+            if not entry_timestamp_ms:
+                logger.warning("No entry timestamp found, cannot fetch funding history")
+                time.sleep(5)
                 continue
             
-            # Fetch actual funding fee history from both exchanges
-            total_fees_pct, bin_fees_dollars, kc_fees_dollars = calculate_total_funding_fees_from_history(
-                sym, ku_api_sym, entry_time_ms
-            )
+            # Check if it's time to update (every FUNDING_FEE_CHECK_INTERVAL seconds)
+            current_time_ms = int(time.time() * 1000)
+            last_check = active_trade.get('last_funding_check_ms', 0)
             
-            # Update active_trade with actual funding fees
-            # Positive total_fees_pct = we RECEIVED funding (income) - reduces expenses
-            # Negative total_fees_pct = we PAID funding (cost) - increases expenses
+            if (current_time_ms - last_check) < (FUNDING_FEE_CHECK_INTERVAL * 1000):
+                time.sleep(1)
+                continue
             
-            # Store cumulative funding separately for reporting
-            active_trade['funding_accumulated_pct'] = total_fees_pct
+            # Fetch actual funding fees from both exchanges
+            ku_api_sym = active_trade.get('ku_api') or sym + "M"
+            funding_data = get_total_funding_fees_since_entry(sym, ku_api_sym, entry_timestamp_ms)
             
-            # Update accumulated expenses: entry fees (0.2%) +/- actual funding
-            # If total_fees_pct > 0: we received funding (income) → subtract from expenses
-            # If total_fees_pct < 0: we paid funding (cost) → add to expenses
-            entry_fees_pct = ENTRY_TRADING_FEE_PCT  # 0.2%
-            if total_fees_pct > 0:
-                # We RECEIVED funding (income) - subtract from expenses
-                active_trade['accumulated_expenses_pct'] = entry_fees_pct - abs(total_fees_pct)
+            if not funding_data:
+                logger.warning("Failed to fetch funding data")
+                time.sleep(FUNDING_FEE_CHECK_INTERVAL)
+                continue
+            
+            # Extract net fees in USD (already in dollars)
+            net_fees_usd = funding_data['net_fees_usd']
+            binance_fees_usd = funding_data['binance_fees_usd']
+            kucoin_fees_usd = funding_data['kucoin_fees_usd']
+            
+            # PURE USD: Update accumulated expenses directly in dollars
+            # Previously we had entry fees + previous funding
+            # Now we have entry fees + current total funding (all in USD)
+            
+            # Get current entry fees (stored in USD)
+            # Calculate entry fees from current notionals
+            bin_notional = active_trade.get('final_implied_notional', {}).get('bin', 0)
+            kc_notional = active_trade.get('final_implied_notional', {}).get('kc', 0)
+            
+            binance_entry_fees = (TRADING_FEE_PCT_PER_EXCHANGE / 100.0) * bin_notional
+            kucoin_entry_fees = (TRADING_FEE_PCT_PER_EXCHANGE / 100.0) * kc_notional
+            total_entry_fees_usd = binance_entry_fees + kucoin_entry_fees
+            
+            # New accumulated expenses = entry fees + cumulative funding
+            new_accumulated_expenses_usd = total_entry_fees_usd + net_fees_usd
+            
+            # Calculate change since last check
+            old_expenses = active_trade.get('accumulated_expenses_usd', total_entry_fees_usd)
+            expense_change = new_accumulated_expenses_usd - old_expenses
+            
+            # Update active trade
+            active_trade['accumulated_expenses_usd'] = new_accumulated_expenses_usd
+            active_trade['funding_accumulated_usd'] = net_fees_usd  # Store funding portion separately
+            active_trade['last_funding_check_ms'] = current_time_ms
+            
+            # Determine status
+            if net_fees_usd > 0:
+                funding_status = "PAID"
+            elif net_fees_usd < 0:
+                funding_status = "RECEIVED"
             else:
-                # We PAID funding (cost) - add to expenses
-                active_trade['accumulated_expenses_pct'] = entry_fees_pct + abs(total_fees_pct)
+                funding_status = "NEUTRAL"
             
-            accumulated_exp_pct = active_trade['accumulated_expenses_pct']
-            accumulated_exp_dollars = (accumulated_exp_pct / 100.0) * total_notional if total_notional > 0 else 0.0
-            net_funding_dollars = bin_fees_dollars + kc_fees_dollars
+            # Log the update
+            logger.info(f"FUNDING UPDATE | {sym} | Binance: ${binance_fees_usd:+.4f} | KuCoin: ${kucoin_fees_usd:+.4f} | Net: ${net_fees_usd:+.4f} ({funding_status}) | Total Expenses: ${new_accumulated_expenses_usd:.4f}")
             
-            # Log and send update
-            logger.info(
-                f"💰 Funding Update: {sym}\n"
-                f"   Binance: ${bin_fees_dollars:+.4f}\n"
-                f"   KuCoin: ${kc_fees_dollars:+.4f}\n"
-                f"   Net: ${net_funding_dollars:+.4f} ({total_fees_pct:+.4f}%)\n"
-                f"   Accumulated Expenses: {accumulated_exp_pct:.4f}% (${accumulated_exp_dollars:.4f})"
-            )
-            
-            # Only send Telegram update if there's meaningful funding activity
-            # (to avoid spam when no funding has occurred yet)
-            if abs(net_funding_dollars) > 0.01:  # More than 1 cent
+            # Only send Telegram if there's a meaningful change (> $0.01 or first update)
+            if abs(expense_change) > 0.01 or old_expenses == total_entry_fees_usd:
                 send_telegram(
-                    f"*FUNDING FEE UPDATE* `{sym}`\n"
-                    f"Binance: `${bin_fees_dollars:+.4f}`\n"
-                    f"KuCoin: `${kc_fees_dollars:+.4f}`\n"
-                    f"Net Funding: `${net_funding_dollars:+.4f}` (`{total_fees_pct:+.4f}%`)\n"
-                    f"Total Expenses: `{accumulated_exp_pct:.4f}%` (`${accumulated_exp_dollars:.4f}`)\n"
-                    f"Notional: `${total_notional:.2f}`\n"
+                    f"*FUNDING UPDATE* `{sym}`\n"
+                    f"Binance: `${binance_fees_usd:+.4f}` | KuCoin: `${kucoin_fees_usd:+.4f}`\n"
+                    f"Net Funding: `${net_fees_usd:+.4f}` ({funding_status})\n"
+                    f"💰 Total Expenses: `${new_accumulated_expenses_usd:.4f}`\n"
+                    f"  → Entry Fees + Funding ({funding_status})\n"
                     f"{timestamp()}"
                 )
             
-            # Sleep before next check
-            time.sleep(FUNDING_HISTORY_CHECK_INTERVAL)
+            # Sleep for the configured interval
+            time.sleep(FUNDING_FEE_CHECK_INTERVAL)
             
-        except Exception:
-            logger.exception("Funding accounting loop fatal error")
+        except Exception as e:
+            logger.exception(f"Funding accounting loop fatal error: {e}")
             time.sleep(5)
 
 def periodic_summary_loop():
@@ -3374,11 +3320,10 @@ def periodic_summary_loop():
                 avg_spread = active_trade.get('avg_entry_spread', 0.0)
                 avg_count = active_trade.get('avg_count', 0)
                 total_not = active_trade.get('total_notional', 0.0)
-                funding_acc = active_trade.get('funding_accumulated_pct', 0.0)
+                funding_acc = active_trade.get('funding_accumulated_usd', 0.0)  # Now in USD
                 
-                # NEW: Get accumulated expenses (includes trading fees + funding)
-                accumulated_expenses_pct = active_trade.get('accumulated_expenses_pct', 0.0)
-                accumulated_expenses_dollars = (accumulated_expenses_pct / 100.0) * total_not if total_not > 0 else 0.0
+                # PURE USD: Get accumulated expenses in dollars
+                accumulated_expenses_usd = active_trade.get('accumulated_expenses_usd', 0.0)
                 
                 # Get current spread (live)
                 try:
@@ -3424,8 +3369,8 @@ def periodic_summary_loop():
                     f"Live Entry Spread: `{entry_spread_live:.4f}%`\n"
                     f"Live Exit Spread: `{exit_spread_live:.4f}%`\n"
                     f"Notional: `${total_not:.2f}`\n"
-                    f"Funding: `{funding_acc:.4f}%` (`${(funding_acc/100.0)*total_not:.2f}`)\n"
-                    f"Accum. Expenses: `{accumulated_expenses_pct:.4f}%` (`${accumulated_expenses_dollars:.2f}`)\n"
+                    f"Funding: `${funding_acc:+.4f}`\n"
+                    f"💰 Total Expenses: `${accumulated_expenses_usd:.4f}`\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"📈 *MAX POSITIVE SPREAD*\n"
                     f"`{max_pos_sym}`: `{max_pos_spread:.4f}%`\n"
