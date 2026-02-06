@@ -637,6 +637,60 @@ def get_total_funding_fees_since_entry(symbol, ku_api_symbol, entry_timestamp_ms
             'kucoin_events_count': 0
         }
 
+def fetch_binance_book_ticker(symbol):
+    """
+    Fetch Binance book ticker data for a specific symbol.
+    Returns dict with 'bid' and 'ask' keys, or None on failure.
+    """
+    try:
+        url = f"https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol={symbol}"
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        
+        if 'bidPrice' in data and 'askPrice' in data:
+            return {
+                'bid': float(data['bidPrice']),
+                'ask': float(data['askPrice'])
+            }
+        else:
+            logger.warning(f"❌ fetch_binance_book_ticker: Missing price data for {symbol}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ fetch_binance_book_ticker error for {symbol}: {e}")
+        return None
+
+def fetch_kucoin_book_ticker(symbol):
+    """
+    Fetch KuCoin book ticker data for a specific symbol.
+    Returns dict with 'bid' and 'ask' keys, or None on failure.
+    """
+    try:
+        url = f"https://api-futures.kucoin.com/api/v1/ticker?symbol={symbol}"
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        
+        if data.get('code') == '200000' and 'data' in data:
+            ticker_data = data['data']
+            best_bid = ticker_data.get('bestBidPrice')
+            best_ask = ticker_data.get('bestAskPrice')
+            
+            if best_bid and best_ask:
+                return {
+                    'bid': float(best_bid),
+                    'ask': float(best_ask)
+                }
+            else:
+                logger.warning(f"❌ fetch_kucoin_book_ticker: Missing price data for {symbol}")
+                return None
+        else:
+            logger.warning(f"❌ fetch_kucoin_book_ticker: Invalid response for {symbol}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ fetch_kucoin_book_ticker error for {symbol}: {e}")
+        return None
+
 def reconfirm_entry_spread(sym, ku_api_sym, bin_ask, bin_bid, kc_ask, kc_bid, expected_plan):
     """
     Reconfirm entry spread by fetching fresh prices.
