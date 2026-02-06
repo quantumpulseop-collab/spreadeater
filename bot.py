@@ -3992,7 +3992,7 @@ try:
                             break
                 
                 if big_spread_candidate and big_spread_info:
-                    global override_confirm_count
+                    global override_confirm_count, closing_reason, override_execution_in_progress
                     
                     # Increment override confirmation counter
                     override_confirm_count += 1
@@ -4040,7 +4040,6 @@ try:
                             send_telegram(f"*BIG SPREAD OVERRIDE*\nClosing `{active_trade.get('symbol')}` (entry={current_practical_entry:.4f}%)\nEntering `{sym}` (main={big_spread_info.get('max_spread', 0.0):.4f}%, entry={entry_spread:.4f}%)\n{timestamp()}")
                             
                             # CRITICAL FIX: Set flags to prevent race conditions and inform liquidation watcher
-                            global closing_reason, override_execution_in_progress
                             closing_reason = 'OVERRIDE'
                             override_execution_in_progress = True
                             override_confirm_count = 0  # Reset counter before execution
