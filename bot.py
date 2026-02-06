@@ -1546,7 +1546,7 @@ def extract_executed_price_time_qty(exchange, symbol, order_obj):
             elif t.get('last'):
                 mid = float(t.get('last'))
         if mid:
-            return float(mid), datetime.utcnow().isoformat() + 'Z', None
+            return float(mid), datetime.now(datetime.UTC).isoformat() + 'Z', None
     except Exception:
         pass
     return None, None, None
@@ -1661,7 +1661,7 @@ def poll_kucoin_until_filled(kucoin_exchange, create_order_resp, symbol, timeout
             elif t.get('last'):
                 mid = float(t.get('last'))
             if mid:
-                return float(mid), datetime.utcnow().isoformat() + 'Z', None
+                return float(mid), datetime.now(datetime.UTC).isoformat() + 'Z', None
     except Exception:
         pass
     return None, None, None
@@ -1685,13 +1685,13 @@ def safe_create_order(exchange, side, notional, price, symbol, trigger_time=None
                 elif t.get('last'):
                     mid = float(t.get('last'))
             exec_price = mid
-            exec_time = datetime.utcnow().isoformat() + 'Z'
+            exec_time = datetime.now(datetime.UTC).isoformat() + 'Z'
             executed_qty = amt
             msg = f"*DRY RUN TRADE (simulated)* on `{exchange.id}` — {side.upper()} {symbol}\nprice: `{exec_price}`\nqty: `{executed_qty}`\nnotional: `{notional}`\n{timestamp()}"
             send_telegram(msg)
             return True, exec_price, exec_time, executed_qty
         except Exception:
-            return True, price, datetime.utcnow().isoformat() + 'Z', amt
+            return True, price, datetime.now(datetime.UTC).isoformat() + 'Z', amt
     try:
         order = None
         if exchange.id == 'binance':
@@ -1932,7 +1932,7 @@ def _fetch_signed_binance(sym):
                     logger.debug(f"Using cached position for {sym} due to rate limit")
                     return _binance_position_cache[sym]
         else:
-            logger.info(f"{datetime.utcnow().isoformat()} BINANCE fetch error for {sym}: {e}")
+            logger.info(f"{datetime.now(datetime.UTC).isoformat()} BINANCE fetch error for {sym}: {e}")
         return None
 
 def _fetch_signed_kucoin(ccxt_sym):
@@ -1953,6 +1953,103 @@ def _fetch_signed_kucoin(ccxt_sym):
         return _get_signed_from_kucoin_pos(pos)
     except Exception as e:
         raise
+
+def verify_positions_after_order(sym, kc_ccxt_sym, expected_bin_qty, expected_kc_qty, operation="order"):
+    """
+    IMPROVED: Verify actual positions match expected after order execution
+    Returns: (success: bool, actual_bin_qty, actual_kc_qty, error_msg, is_rate_limit_error)
+    
+    Changes from v1:
+    - 25% tolerance (was 0.1%)
+    - Detects API rate limit errors
+    - Returns is_rate_limit_error flag
+    - Market orders used so immediate execution expected
+    
+    This prevents the bot from continuing with incorrect position assumptions
+    when an order is reported as executed but actually cancelled by the exchange.
+    """
+    try:
+        logger.info(f"[POSITION_VERIFY] Verifying positions after {operation} for {sym}")
+        logger.info(f"[POSITION_VERIFY] Expected - Binance: {expected_bin_qty}, KuCoin: {expected_kc_qty}")
+        
+        # Fetch actual positions from exchanges
+        actual_bin_qty = None
+        actual_kc_qty = None
+        bin_rate_limited = False
+        kc_rate_limited = False
+        
+        try:
+            actual_bin_qty = _fetch_signed_binance(sym)
+        except Exception as e:
+            error_str = str(e).lower()
+            if 'rate' in error_str or 'limit' in error_str or '429' in error_str:
+                bin_rate_limited = True
+                logger.warning(f"[POSITION_VERIFY] Binance rate limited during verification: {e}")
+            else:
+                logger.error(f"[POSITION_VERIFY] Error fetching Binance position: {e}")
+        
+        try:
+            actual_kc_qty = _fetch_signed_kucoin(kc_ccxt_sym)
+        except Exception as e:
+            error_str = str(e).lower()
+            if 'rate' in error_str or 'limit' in error_str or '429' in error_str:
+                kc_rate_limited = True
+                logger.warning(f"[POSITION_VERIFY] KuCoin rate limited during verification: {e}")
+            else:
+                logger.error(f"[POSITION_VERIFY] Error fetching KuCoin position: {e}")
+        
+        # If BOTH exchanges are rate limited, return rate limit error
+        if bin_rate_limited and kc_rate_limited:
+            logger.warning(f"[POSITION_VERIFY] ⚠️ Both exchanges rate limited, cannot verify positions")
+            return True, None, None, "Both exchanges rate limited", True  # Don't close positions
+        
+        # If one is rate limited but we have the other, use partial verification
+        if bin_rate_limited or kc_rate_limited:
+            logger.warning(f"[POSITION_VERIFY] ⚠️ Partial rate limiting (Bin:{bin_rate_limited}, KC:{kc_rate_limited})")
+            # We'll verify what we can below
+        
+        logger.info(f"[POSITION_VERIFY] Actual - Binance: {actual_bin_qty}, KuCoin: {actual_kc_qty}")
+        
+        # UPDATED: 25% tolerance for mismatch (not 0.1%)
+        # Slippage on market orders can be significant, especially for averaging
+        tolerance_pct = 0.25  # 25% tolerance
+        
+        bin_matches = True
+        kc_matches = True
+        error_details = []
+        
+        # Check Binance (if not rate limited)
+        if not bin_rate_limited and expected_bin_qty is not None and actual_bin_qty is not None:
+            if abs(expected_bin_qty) > 0:
+                bin_diff_pct = abs(actual_bin_qty - expected_bin_qty) / abs(expected_bin_qty)
+                if bin_diff_pct > tolerance_pct:
+                    bin_matches = False
+                    error_details.append(f"Binance: expected {expected_bin_qty}, got {actual_bin_qty} ({bin_diff_pct*100:.2f}% diff > {tolerance_pct*100}% tolerance)")
+                else:
+                    logger.info(f"[POSITION_VERIFY] Binance OK: {bin_diff_pct*100:.2f}% diff <= {tolerance_pct*100}% tolerance")
+        
+        # Check KuCoin (if not rate limited)
+        if not kc_rate_limited and expected_kc_qty is not None and actual_kc_qty is not None:
+            if abs(expected_kc_qty) > 0:
+                kc_diff_pct = abs(actual_kc_qty - expected_kc_qty) / abs(expected_kc_qty)
+                if kc_diff_pct > tolerance_pct:
+                    kc_matches = False
+                    error_details.append(f"KuCoin: expected {expected_kc_qty}, got {actual_kc_qty} ({kc_diff_pct*100:.2f}% diff > {tolerance_pct*100}% tolerance)")
+                else:
+                    logger.info(f"[POSITION_VERIFY] KuCoin OK: {kc_diff_pct*100:.2f}% diff <= {tolerance_pct*100}% tolerance")
+        
+        if bin_matches and kc_matches:
+            logger.info(f"[POSITION_VERIFY] ✅ Positions verified successfully for {sym}")
+            return True, actual_bin_qty, actual_kc_qty, None, False
+        else:
+            error_msg = "; ".join(error_details)
+            logger.error(f"[POSITION_VERIFY] ❌ Position mismatch for {sym}: {error_msg}")
+            return False, actual_bin_qty, actual_kc_qty, error_msg, False
+            
+    except Exception as e:
+        logger.exception(f"[POSITION_VERIFY] Error verifying positions for {sym}: {e}")
+        # Unknown error - treat as non-rate-limit error
+        return False, None, None, str(e), False
 
 def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
     key = f"{sym}:{bin_sym}:{kc_ccxt_sym}"
@@ -2551,13 +2648,13 @@ def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
     if plan == ('binance','kucoin'):
         notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL * initial_multiplier, bin_ask, kc_bid)
         results = {}
-        trigger_time = datetime.utcnow()
+        trigger_time = datetime.now(datetime.UTC)
         def exec_kc(): results['kc'] = safe_create_order(kucoin, 'sell', notional_kc, kc_bid, kc_ccxt, trigger_time=trigger_time, trigger_price=kc_bid)
         def exec_bin(): results['bin'] = safe_create_order(binance, 'buy', notional_bin, bin_ask, sym, trigger_time=trigger_time, trigger_price=bin_ask)
     else:
         notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL * initial_multiplier, bin_bid, kc_ask)
         results = {}
-        trigger_time = datetime.utcnow()
+        trigger_time = datetime.now(datetime.UTC)
         def exec_kc(): results['kc'] = safe_create_order(kucoin, 'buy', notional_kc, kc_ask, kc_ccxt, trigger_time=trigger_time, trigger_price=kc_ask)
         def exec_bin(): results['bin'] = safe_create_order(binance, 'sell', notional_bin, bin_bid, sym, trigger_time=trigger_time, trigger_price=bin_bid)
     # Execute orders in parallel
@@ -2571,6 +2668,51 @@ def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
         close_all_and_wait()
         confirm_counts[sym] = 0
         return False
+    
+    # CRITICAL FIX: Verify positions actually changed as expected before finalizing
+    logger.info(f"[ORDER_EXEC] Initial entry orders reported as executed, verifying actual positions...")
+    
+    # Calculate expected positions based on plan
+    if plan == ('binance', 'kucoin'):
+        # Long binance, short kucoin
+        expected_bin_qty = exec_qty_bin if exec_qty_bin else 0
+        expected_kc_qty = -exec_qty_kc if exec_qty_kc else 0  # Negative for short
+    else:
+        # Short binance, long kucoin
+        expected_bin_qty = -exec_qty_bin if exec_qty_bin else 0  # Negative for short
+        expected_kc_qty = exec_qty_kc if exec_qty_kc else 0
+    
+    # Wait briefly for exchange to process market orders
+    logger.info(f"[ORDER_EXEC] Waiting 2 seconds for exchange settlement...")
+    time.sleep(2.0)
+    
+    # Verify positions
+    success_verify, actual_bin, actual_kc, error_msg, is_rate_limit = verify_positions_after_order(
+        sym, kc_ccxt, expected_bin_qty, expected_kc_qty, operation="initial_entry"
+    )
+    
+    if not success_verify:
+        if is_rate_limit:
+            # Rate limit error - DON'T close positions, just log warning and continue
+            logger.warning(f"[ORDER_EXEC] ⚠️ Position verification skipped due to rate limiting")
+            logger.warning(f"[ORDER_EXEC] Continuing with entry assuming orders filled correctly")
+            send_telegram(f"*ENTRY WARNING* `{sym}`\n⚠️ Could not verify positions (rate limited)\nAssuming orders filled correctly\nMonitor positions manually\n{timestamp()}")
+        else:
+            # Real mismatch error - close positions for safety
+            logger.error(f"[ORDER_EXEC] ❌ POSITION VERIFICATION FAILED: {error_msg}")
+            logger.error(f"[ORDER_EXEC] One or both entry orders may have been cancelled by the exchange")
+            logger.error(f"[ORDER_EXEC] Closing all positions for safety")
+            send_telegram(f"*ENTRY FAILED* `{sym}`\n❌ Position verification failed\n{error_msg}\nOrders reported filled but positions don't match\nClosing for safety\n{timestamp()}")
+            try:
+                close_all_and_wait()
+                reset_active_trade()
+            except Exception as e:
+                logger.exception(f"Error closing positions after entry verification failure: {e}")
+            confirm_counts[sym] = 0
+            return False
+    else:
+        logger.info(f"[ORDER_EXEC] ✅ Position verification passed, finalizing entry...")
+    
     # Finalize entry (reuse finalize_entry logic but minimal side-effects already included)
     success = finalize_entry_postexec(sym, ku_api, kc_ccxt, entry_case, eval_info.get('trigger_spread'), exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc, notional_bin, notional_kc, eval_info.get('net_fr'), eval_info)
     if success:
@@ -2975,7 +3117,71 @@ def attempt_averaging_if_needed():
         t1.start(); t2.start(); t1.join(); t2.join()
         ok_kc, exec_price_kc, exec_time_kc, exec_qty_kc = results.get('kc', (False, None, None, None))
         ok_bin, exec_price_bin, exec_time_bin, exec_qty_bin = results.get('bin', (False, None, None, None))
+        
         if ok_kc and ok_bin:
+            # CRITICAL FIX: Verify positions actually changed as expected
+            logger.info(f"[AVERAGING] Orders reported as executed, verifying actual positions...")
+            
+            # Calculate expected new cumulative positions
+            # Get current positions from active_trade
+            prev_bin_qty = 0
+            prev_kc_qty = 0
+            try:
+                # Try to get from entry_prices first
+                prev_bin_qty = active_trade.get('entry_prices', {}).get('binance', {}).get('qty', 0)
+                prev_kc_qty = active_trade.get('entry_prices', {}).get('kucoin', {}).get('qty', 0)
+                
+                # If not available, fetch current positions
+                if prev_bin_qty == 0 and prev_kc_qty == 0:
+                    prev_bin_qty = _fetch_signed_binance(sym)
+                    prev_kc_qty = _fetch_signed_kucoin(kc_ccxt)
+            except Exception as e:
+                logger.warning(f"[AVERAGING] Could not get previous positions, using 0: {e}")
+                prev_bin_qty = 0
+                prev_kc_qty = 0
+            
+            # Calculate expected cumulative positions after this average
+            if plan == ('binance', 'kucoin'):
+                # Long binance, short kucoin
+                expected_bin_qty = prev_bin_qty + exec_qty_bin if exec_qty_bin else prev_bin_qty
+                expected_kc_qty = prev_kc_qty - exec_qty_kc if exec_qty_kc else prev_kc_qty  # More negative
+            else:
+                # Short binance, long kucoin
+                expected_bin_qty = prev_bin_qty - exec_qty_bin if exec_qty_bin else prev_bin_qty  # More negative
+                expected_kc_qty = prev_kc_qty + exec_qty_kc if exec_qty_kc else prev_kc_qty
+            
+            logger.info(f"[AVERAGING] Expected cumulative positions: Binance {expected_bin_qty}, KuCoin {expected_kc_qty}")
+            
+            # Wait briefly for exchange to process market orders
+            logger.info(f"[AVERAGING] Waiting 2 seconds for exchange settlement...")
+            time.sleep(2.0)
+            
+            # Verify positions
+            success_verify, actual_bin, actual_kc, error_msg, is_rate_limit = verify_positions_after_order(
+                sym, kc_ccxt, expected_bin_qty, expected_kc_qty, operation="averaging"
+            )
+            
+            if not success_verify:
+                if is_rate_limit:
+                    # Rate limit error - DON'T close positions, just log warning and continue
+                    logger.warning(f"[AVERAGING] ⚠️ Position verification skipped due to rate limiting")
+                    logger.warning(f"[AVERAGING] Continuing with averaging assuming orders filled correctly")
+                    send_telegram(f"*AVERAGING WARNING* `{sym}`\n⚠️ Could not verify positions (rate limited)\nAssuming orders filled correctly\nMonitor positions manually\n{timestamp()}")
+                else:
+                    # Real mismatch error - close positions for safety
+                    logger.error(f"[AVERAGING] ❌ POSITION VERIFICATION FAILED: {error_msg}")
+                    logger.error(f"[AVERAGING] One or both averaging orders may have been cancelled by the exchange")
+                    logger.error(f"[AVERAGING] Closing all positions for safety")
+                    send_telegram(f"*AVERAGING FAILED* `{sym}`\n❌ Position verification failed\n{error_msg}\nOrders reported filled but positions don't match\nClosing for safety\n{timestamp()}")
+                    try:
+                        close_all_and_wait()
+                        reset_active_trade()
+                    except Exception as e:
+                        logger.exception(f"Error closing positions after averaging verification failure: {e}")
+                    return
+            else:
+                logger.info(f"[AVERAGING] ✅ Position verification passed, continuing...")
+            
             try:
                 market_bin = get_market(binance, sym)
                 bin_contract_size = float(market_bin.get('contractSize') or market_bin.get('info', {}).get('contractSize') or 1.0) if market_bin else 1.0
@@ -3481,11 +3687,13 @@ def funding_round_accounting_loop():
             active_trade['funding_accumulated_usd'] = net_fees_usd  # Store funding portion separately
             active_trade['last_funding_check_ms'] = current_time_ms
             
-            # Determine status
+            # FIXED: Determine status (negative = paid/debit, positive = received/credit)
+            # When net_fees_usd is NEGATIVE (like -0.0617), money LEFT your account = PAID
+            # When net_fees_usd is POSITIVE (like +0.0617), money ENTERED your account = RECEIVED
             if net_fees_usd > 0:
-                funding_status = "PAID"
+                funding_status = "RECEIVED"  # Positive = credit to account
             elif net_fees_usd < 0:
-                funding_status = "RECEIVED"
+                funding_status = "PAID"  # Negative = debit from account
             else:
                 funding_status = "NEUTRAL"
             
