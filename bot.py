@@ -3970,6 +3970,7 @@ try:
             # Active trade present
             # NEW: Check for 7.5%+ big spread override - close current trade and enter new one
             # Only if current practical entry spread < 4%
+            global override_confirm_count, closing_reason, override_execution_in_progress
             current_practical_entry = active_trade.get('avg_entry_spread', 0.0)
             
             if abs(current_practical_entry) < 4.0:
@@ -3992,8 +3993,6 @@ try:
                             break
                 
                 if big_spread_candidate and big_spread_info:
-                    global override_confirm_count, closing_reason, override_execution_in_progress
-                    
                     # Increment override confirmation counter
                     override_confirm_count += 1
                     logger.info(f"⏳ Confirming override for {big_spread_candidate}: {override_confirm_count}/{OVERRIDE_CONFIRM_COUNT} (main_spread={big_spread_info.get('max_spread', 0.0):.4f}%)")
