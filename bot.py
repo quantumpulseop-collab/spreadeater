@@ -3825,6 +3825,7 @@ print("="*80 + "\n", flush=True)
 try:
     loop_count = 0
     while True:
+        global override_confirm_count, closing_reason, override_execution_in_progress
         loop_count += 1
         if loop_count % 30 == 0:  # Every 30 seconds
             print(f"💓 Main loop heartbeat #{loop_count} - {timestamp()}", flush=True)
@@ -3970,7 +3971,6 @@ try:
             # Active trade present
             # NEW: Check for 7.5%+ big spread override - close current trade and enter new one
             # Only if current practical entry spread < 4%
-            global override_confirm_count, closing_reason, override_execution_in_progress
             current_practical_entry = active_trade.get('avg_entry_spread', 0.0)
             
             if abs(current_practical_entry) < 4.0:
