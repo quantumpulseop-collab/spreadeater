@@ -33,7 +33,7 @@ if missing:
 # Config (defaults)
 NOTIONAL = float(os.getenv('NOTIONAL', "10.0"))
 LEVERAGE = int(os.getenv('LEVERAGE', "5"))
-WATCHER_POLL_INTERVAL = float(os.getenv('WATCHER_POLL_INTERVAL', "0.5"))
+WATCHER_POLL_INTERVAL = float(os.getenv('WATCHER_POLL_INTERVAL', "2.0"))  # FIXED: Increased from 0.5s to 2s to reduce API calls
 WATCHER_DETECT_CONFIRM = int(os.getenv('WATCHER_DETECT_CONFIRM', "2"))
 MAX_NOTIONAL_MISMATCH_PCT = float(os.getenv('MAX_NOTIONAL_MISMATCH_PCT', "0.5"))
 REBALANCE_MIN_DOLLARS = float(os.getenv('REBALANCE_MIN_DOLLARS', "0.5"))
@@ -42,7 +42,7 @@ KC_TRANSIENT_ERROR_THRESHOLD = int(os.getenv('KC_TRANSIENT_ERROR_THRESHOLD', "10
 KC_TRANSIENT_BACKOFF_SECONDS = float(os.getenv('KC_TRANSIENT_BACKOFF_SECONDS', "2.0"))
 
 # Strategy-specific params (as agreed)
-FR_ADVANTAGE_THRESHOLD = 0.01
+FR_ADVANTAGE_THRESHOLD = 0.0001  # CHANGED: Was 0.01%, now 0.0001%
 CASE1_MIN_SPREAD = 1.8  # CHANGED: Was 1.5%, now 1.8%
 CASE2_MULT = 13.0
 CASE3_MULT = 15.0
@@ -51,7 +51,7 @@ BIG_SPREAD_ENTRY_MULTIPLIER = 2
 MAX_AVERAGES = 2
 AVERAGE_TRIGGER_MULTIPLIER = 2.0
 TAKE_PROFIT_FACTOR = 0.5
-MIN_FR_DIFF_THRESHOLD = 0.01  # CHANGED: Minimum funding rate difference (was 0.12%, now 0.01%)
+MIN_FR_DIFF_THRESHOLD = 0.0001  # CHANGED: Minimum funding rate difference (was 0.01%, now 0.0001%)
 MIN_SPREAD_THRESHOLD = 1.8     # CHANGED: Minimum spread required for ANY entry (was 1.5%)
 
 # UPDATED: Trading fees configuration (0.2% per exchange, 0.4% total for entry ONLY)
@@ -355,20 +355,21 @@ def calculate_spread(bin_bid, bin_ask, ku_bid, ku_ask):
 # Funding rate helpers
 def fetch_binance_funding(symbol, max_retries=2):
     """
-    FIXED: Add retry logic and better error handling for 418 (rate limit) errors
+    FIXED: Add retry logic with exponential backoff for 418 (rate limit) errors
     """
     for attempt in range(max_retries):
         try:
             r = requests.get(BINANCE_FUND_URL.format(symbol=symbol), timeout=6)
             if r.status_code == 418:
                 # Binance rate limit (I'm a teapot)
-                logger.warning(f"Binance funding rate 418 (rate limit) for {symbol}, attempt {attempt+1}/{max_retries}")
+                wait_time = (attempt + 1) * 2.0  # Exponential backoff: 2s, 4s, etc.
+                logger.debug(f"Binance funding rate 418 (rate limit) for {symbol}, attempt {attempt+1}/{max_retries}, waiting {wait_time}s")
                 if attempt < max_retries - 1:
-                    time.sleep(1.0)  # Wait before retry
+                    time.sleep(wait_time)
                     continue
                 return None
             if r.status_code != 200:
-                logger.warning(f"Binance funding rate non-200: {r.status_code} for {symbol}")
+                logger.debug(f"Binance funding rate non-200: {r.status_code} for {symbol}")
                 return None
             d = r.json()
             fr_raw = d.get('fundingRate') or d.get('lastFundingRate')
@@ -380,18 +381,18 @@ def fetch_binance_funding(symbol, max_retries=2):
                 # CRITICAL FIX: Check if funding rate is exactly 0.0000 (all zeros)
                 # This is likely a data glitch - reject it
                 if fr == 0.0 or abs(fr) < 1e-8:
-                    logger.warning(f"⚠️  Binance funding rate is 0.0000 for {symbol} - likely data glitch, rejecting")
+                    logger.debug(f"Binance funding rate is 0.0000 for {symbol} - likely data glitch, rejecting")
                     return None  # Treat as fetch failure
                     
             next_ft = int(nft) if nft else None
             logger.debug(f"✓ Binance FR for {symbol}: {fr:.6f}% (next: {next_ft})")
             return {'fundingRatePct': fr, 'nextFundingTimeMs': next_ft}
         except Exception as e:
-            logger.warning(f"fetch_binance_funding error for {symbol} (attempt {attempt+1}/{max_retries}): {e}")
+            logger.debug(f"fetch_binance_funding error for {symbol} (attempt {attempt+1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
-                time.sleep(0.5)
+                time.sleep(1.0)
     
-    logger.error(f"❌ Failed to fetch Binance funding rate for {symbol} after {max_retries} attempts")
+    logger.warning(f"❌ Failed to fetch Binance funding rate for {symbol} after {max_retries} attempts")
     return None
 
 def fetch_kucoin_funding(symbol, max_retries=2):
@@ -538,6 +539,10 @@ def fetch_kucoin_funding_history(symbol, start_time_ms, end_time_ms=None):
 def get_total_funding_fees_since_entry(symbol, ku_api_symbol, entry_timestamp_ms):
     """
     Get total funding fees paid/received since trade entry.
+    
+    FIXED: Now tracks individual funding events by timestamp to prevent double counting.
+    Only processes NEW funding events that haven't been seen before.
+    
     Returns net funding amount in USD (positive = we paid, negative = we received).
     
     Args:
@@ -546,7 +551,7 @@ def get_total_funding_fees_since_entry(symbol, ku_api_symbol, entry_timestamp_ms
         entry_timestamp_ms: Entry time in milliseconds
         
     Returns:
-        dict with 'binance_fees_usd', 'kucoin_fees_usd', 'net_fees_usd'
+        dict with 'binance_fees_usd', 'kucoin_fees_usd', 'net_fees_usd', 'new_events_count'
     """
     try:
         current_time_ms = int(time.time() * 1000)
@@ -555,30 +560,69 @@ def get_total_funding_fees_since_entry(symbol, ku_api_symbol, entry_timestamp_ms
         binance_history = fetch_binance_funding_history(symbol, entry_timestamp_ms, current_time_ms)
         kucoin_history = fetch_kucoin_funding_history(ku_api_symbol, entry_timestamp_ms, current_time_ms)
         
-        # Sum up the funding fees
-        binance_fees_usd = sum(entry['income'] for entry in binance_history)
-        kucoin_fees_usd = sum(entry['income'] for entry in kucoin_history)
+        # Get previously seen timestamps from active_trade
+        seen_binance_timestamps = active_trade.get('seen_binance_funding_timestamps', set())
+        seen_kucoin_timestamps = active_trade.get('seen_kucoin_funding_timestamps', set())
+        binance_events = active_trade.get('binance_funding_events', [])
+        kucoin_events = active_trade.get('kucoin_funding_events', [])
         
-        # Determine net based on position direction
-        plan = active_trade.get('plan')
-        if plan == ('binance', 'kucoin'):
-            # Long binance, short kucoin
-            # Binance: negative income = we paid (increase expense)
-            # KuCoin: positive income = we received (decrease expense)
-            net_fees_usd = -binance_fees_usd + kucoin_fees_usd
-        else:
-            # Short binance, long kucoin
-            # Binance: positive income = we received (decrease expense)
-            # KuCoin: negative income = we paid (increase expense)
-            net_fees_usd = binance_fees_usd - kucoin_fees_usd
+        # Process NEW Binance funding events only
+        new_binance_events = 0
+        for entry in binance_history:
+            timestamp = entry['timestamp']
+            income = entry['income']
+            
+            # Only process if we haven't seen this timestamp before
+            if timestamp not in seen_binance_timestamps:
+                seen_binance_timestamps.add(timestamp)
+                binance_events.append({
+                    'timestamp': timestamp,
+                    'amount': income,
+                    'datetime': datetime.fromtimestamp(timestamp / 1000.0).isoformat()
+                })
+                new_binance_events += 1
+                logger.info(f"  ✓ NEW Binance funding event at {datetime.fromtimestamp(timestamp / 1000.0)}: ${income:+.4f}")
         
-        logger.info(f"Funding fees since entry | Binance: ${binance_fees_usd:+.4f} | KuCoin: ${kucoin_fees_usd:+.4f} | Net: ${net_fees_usd:+.4f}")
+        # Process NEW KuCoin funding events only
+        new_kucoin_events = 0
+        for entry in kucoin_history:
+            timestamp = entry['timestamp']
+            income = entry['income']
+            
+            # Only process if we haven't seen this timestamp before
+            if timestamp not in seen_kucoin_timestamps:
+                seen_kucoin_timestamps.add(timestamp)
+                kucoin_events.append({
+                    'timestamp': timestamp,
+                    'amount': income,
+                    'datetime': datetime.fromtimestamp(timestamp / 1000.0).isoformat()
+                })
+                new_kucoin_events += 1
+                logger.info(f"  ✓ NEW KuCoin funding event at {datetime.fromtimestamp(timestamp / 1000.0)}: ${income:+.4f}")
+        
+        # Calculate total fees from ALL tracked events (not just new ones)
+        binance_fees_total = sum(evt['amount'] for evt in binance_events)
+        kucoin_fees_total = sum(evt['amount'] for evt in kucoin_events)
+        net_fees_usd = binance_fees_total + kucoin_fees_total
+        
+        # Update active_trade with new tracking data
+        active_trade['seen_binance_funding_timestamps'] = seen_binance_timestamps
+        active_trade['seen_kucoin_funding_timestamps'] = seen_kucoin_timestamps
+        active_trade['binance_funding_events'] = binance_events
+        active_trade['kucoin_funding_events'] = kucoin_events
+        
+        logger.info(f"Funding summary | Binance: {len(binance_events)} events (${binance_fees_total:+.4f}) | "
+                   f"KuCoin: {len(kucoin_events)} events (${kucoin_fees_total:+.4f}) | "
+                   f"Net: ${net_fees_usd:+.4f} | New events: {new_binance_events + new_kucoin_events}")
         
         return {
-            'binance_fees_usd': binance_fees_usd,
-            'kucoin_fees_usd': kucoin_fees_usd,
+            'binance_fees_usd': binance_fees_total,
+            'kucoin_fees_usd': kucoin_fees_total,
             'net_fees_usd': net_fees_usd,
-            'timestamp_checked': current_time_ms
+            'timestamp_checked': current_time_ms,
+            'new_events_count': new_binance_events + new_kucoin_events,
+            'binance_events_count': len(binance_events),
+            'kucoin_events_count': len(kucoin_events)
         }
         
     except Exception as e:
@@ -587,8 +631,51 @@ def get_total_funding_fees_since_entry(symbol, ku_api_symbol, entry_timestamp_ms
             'binance_fees_usd': 0.0,
             'kucoin_fees_usd': 0.0,
             'net_fees_usd': 0.0,
-            'timestamp_checked': int(time.time() * 1000)
+            'timestamp_checked': int(time.time() * 1000),
+            'new_events_count': 0,
+            'binance_events_count': 0,
+            'kucoin_events_count': 0
         }
+
+def reconfirm_entry_spread(sym, ku_api_sym, bin_ask, bin_bid, kc_ask, kc_bid, expected_plan):
+    """
+    Reconfirm entry spread by fetching fresh prices.
+    Returns (success, entry_spread, plan, bin_bid, bin_ask, kc_bid, kc_ask) or (False, None, None, None, None, None, None)
+    """
+    try:
+        # Fetch fresh book data
+        bin_data = fetch_binance_book_ticker(sym)
+        kc_data = fetch_kucoin_book_ticker(ku_api_sym)
+        
+        if not bin_data or not kc_data:
+            logger.warning(f"❌ Reconfirm failed for {sym}: Could not fetch fresh prices")
+            return (False, None, None, None, None, None, None)
+        
+        fresh_bin_bid = bin_data.get('bid')
+        fresh_bin_ask = bin_data.get('ask')
+        fresh_kc_bid = kc_data.get('bid')
+        fresh_kc_ask = kc_data.get('ask')
+        
+        if not all([fresh_bin_bid, fresh_bin_ask, fresh_kc_bid, fresh_kc_ask]):
+            logger.warning(f"❌ Reconfirm failed for {sym}: Missing price data")
+            return (False, None, None, None, None, None, None)
+        
+        # Calculate entry spread based on plan
+        if expected_plan == ('binance', 'kucoin'):
+            # Long binance, short kucoin: use kc_bid - bin_ask
+            entry_spread = 100 * (fresh_kc_bid - fresh_bin_ask) / fresh_bin_ask if fresh_bin_ask > 0 else 0
+            plan = ('binance', 'kucoin')
+        else:
+            # Short binance, long kucoin: use bin_bid - kc_ask
+            entry_spread = 100 * (fresh_bin_bid - fresh_kc_ask) / fresh_kc_ask if fresh_kc_ask > 0 else 0
+            plan = ('kucoin', 'binance')
+        
+        logger.info(f"📊 Reconfirmed entry spread for {sym}: {entry_spread:.4f}% (plan={plan})")
+        return (True, entry_spread, plan, fresh_bin_bid, fresh_bin_ask, fresh_kc_bid, fresh_kc_ask)
+        
+    except Exception as e:
+        logger.exception(f"Error reconfirming entry spread for {sym}: {e}")
+        return (False, None, None, None, None, None, None)
 
 def compute_net_funding_for_plan(bin_fr_pct, kc_fr_pct, plan_long='binance', plan_short='kucoin'):
     """
@@ -1014,7 +1101,19 @@ def close_single_exchange_position(exchange, symbol):
 def close_all_and_wait(timeout_s=20, poll_interval=0.5):
     global closing_in_progress
     closing_in_progress = True
-    logger.info("Closing all positions...")
+    
+    # ENHANCED LOGGING: Track who called this function and why
+    import traceback
+    stack = traceback.extract_stack()
+    caller_info = f"{stack[-2].filename}:{stack[-2].lineno} in {stack[-2].name}"
+    
+    logger.info("=" * 80)
+    logger.info(f"🔄 CLOSING ALL POSITIONS (reason={closing_reason or 'UNKNOWN'})")
+    logger.info(f"📞 Called from: {caller_info}")
+    logger.info(f"🔒 Flags: closing_reason={closing_reason}, tp_closing_in_progress={tp_closing_in_progress}, override_execution_in_progress={override_execution_in_progress}")
+    logger.info("=" * 80)
+    print(f"🔄 Closing all positions (reason={closing_reason or 'UNKNOWN'})...", flush=True)
+    
     # Close on Binance and KuCoin
     try:
         all_bin_pos = binance.fetch_positions()
@@ -1686,7 +1785,52 @@ _liquidation_watchers = {}
 _binance_position_cache = {}
 _binance_position_cache_lock = threading.Lock()
 _binance_position_cache_time = {}
-BINANCE_POSITION_CACHE_TTL = 2.0  # Cache for 2 seconds
+BINANCE_POSITION_CACHE_TTL = 5.0  # FIXED: Increased from 2s to 5s to reduce API calls
+
+# FIXED: Global rate limit tracking to automatically slow down
+_binance_rate_limit_hits = 0
+_binance_rate_limit_lock = threading.Lock()
+_last_rate_limit_time = 0
+
+def check_and_handle_rate_limit():
+    """
+    Check if we're hitting rate limits too often and slow down if needed
+    Returns: sleep_time in seconds (0 if no slowdown needed)
+    """
+    global _binance_rate_limit_hits, _last_rate_limit_time
+    
+    with _binance_rate_limit_lock:
+        now = time.time()
+        
+        # Reset counter every 60 seconds
+        if now - _last_rate_limit_time > 60:
+            _binance_rate_limit_hits = 0
+            _last_rate_limit_time = now
+            return 0
+        
+        # If we've hit rate limits more than 5 times in a minute, slow down dramatically
+        if _binance_rate_limit_hits > 5:
+            logger.warning(f"⚠️  Hit rate limits {_binance_rate_limit_hits} times in last minute - forcing 10s cooldown")
+            return 10.0
+        elif _binance_rate_limit_hits > 3:
+            logger.info(f"Hit rate limits {_binance_rate_limit_hits} times in last minute - forcing 5s cooldown")
+            return 5.0
+        elif _binance_rate_limit_hits > 0:
+            return 2.0
+        
+        return 0
+
+def record_rate_limit_hit():
+    """Record that we hit a rate limit"""
+    global _binance_rate_limit_hits, _last_rate_limit_time
+    
+    with _binance_rate_limit_lock:
+        now = time.time()
+        if now - _last_rate_limit_time > 60:
+            _binance_rate_limit_hits = 1
+            _last_rate_limit_time = now
+        else:
+            _binance_rate_limit_hits += 1
 
 def _fetch_signed_binance(sym):
     """
@@ -1694,6 +1838,11 @@ def _fetch_signed_binance(sym):
     This function is called very frequently by the liquidation watcher.
     """
     try:
+        # FIXED: Check if we need to slow down due to rate limits
+        sleep_time = check_and_handle_rate_limit()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        
         now = time.time()
         with _binance_position_cache_lock:
             # Check if we have a recent cached value
@@ -1718,7 +1867,18 @@ def _fetch_signed_binance(sym):
         
         return signed_qty
     except Exception as e:
-        logger.info(f"{datetime.utcnow().isoformat()} BINANCE fetch error for {sym}: {e}")
+        # FIXED: Only log rate limit errors at DEBUG level to reduce noise
+        error_str = str(e)
+        if '418' in error_str or 'rate limit' in error_str.lower() or 'banned' in error_str.lower():
+            logger.debug(f"BINANCE rate limit for {sym}: {e}")
+            record_rate_limit_hit()  # Track this hit
+            # If rate limited, return last known value from cache
+            with _binance_position_cache_lock:
+                if sym in _binance_position_cache:
+                    logger.debug(f"Using cached position for {sym} due to rate limit")
+                    return _binance_position_cache[sym]
+        else:
+            logger.info(f"{datetime.utcnow().isoformat()} BINANCE fetch error for {sym}: {e}")
         return None
 
 def _fetch_signed_kucoin(ccxt_sym):
@@ -1779,7 +1939,7 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                 cur_bin = _fetch_signed_binance(bin_sym)
                 if cur_bin is None:
                     cur_bin = _last_known_positions.get(sym, {}).get('bin', 0.0)
-                    logger.info(f"{datetime.now().isoformat()} WATCHER BINANCE fetch error -> using last-known bin qty {cur_bin}")
+                    logger.debug(f"{datetime.now().isoformat()} WATCHER BINANCE fetch error -> using last-known bin qty {cur_bin}")
                 else:
                     _last_known_positions.setdefault(sym, {})['bin'] = cur_bin
                 cur_kc = None
@@ -1789,10 +1949,10 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                     _last_known_positions.setdefault(sym, {})['kc_err_count'] = 0
                 except Exception as e:
                     _last_known_positions.setdefault(sym, {})['kc_err_count'] = _last_known_positions.setdefault(sym, {}).get('kc_err_count', 0) + 1
-                    logger.info(f"{datetime.now().isoformat()} KUCOIN fetch error for {kc_ccxt_sym}: {e} (consecutive_errors={_last_known_positions[sym]['kc_err_count']})")
+                    logger.debug(f"{datetime.now().isoformat()} KUCOIN fetch error for {kc_ccxt_sym}: {e} (consecutive_errors={_last_known_positions[sym]['kc_err_count']})")
                     cur_kc = _last_known_positions.get(sym, {}).get('kc', None)
                     if _last_known_positions[sym]['kc_err_count'] >= KC_TRANSIENT_ERROR_THRESHOLD:
-                        logger.info(f"{datetime.now().isoformat()} KUCOIN persistent errors >= {KC_TRANSIENT_ERROR_THRESHOLD}; backing off")
+                        logger.warning(f"{datetime.now().isoformat()} KUCOIN persistent errors >= {KC_TRANSIENT_ERROR_THRESHOLD}; backing off")
                         time.sleep(KC_TRANSIENT_BACKOFF_SECONDS * _last_known_positions[sym]['kc_err_count'])
                 try:
                     cur_bin_f = 0.0 if cur_bin is None else float(cur_bin)
@@ -1803,7 +1963,7 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                 except Exception:
                     cur_kc_f = None
                 if cur_kc_f is None:
-                    logger.info(f"{datetime.now().isoformat()} WATCHER SKIP (no KuCoin reading available) prev_bin={prev_bin} prev_kc={prev_kc} cur_bin={cur_bin_f} cur_kc=None")
+                    logger.debug(f"{datetime.now().isoformat()} WATCHER SKIP (no KuCoin reading available) prev_bin={prev_bin} prev_kc={prev_kc} cur_bin={cur_bin_f} cur_kc=None")
                     prev_bin = cur_bin_f
                     time.sleep(WATCHER_POLL_INTERVAL)
                     continue
@@ -1822,13 +1982,14 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                 if (prev_bin_abs > ZERO_ABS_THRESHOLD or bin_initial_nonzero) and cur_bin_abs <= ZERO_ABS_THRESHOLD:
                     logger.info(f"{datetime.now().isoformat()} Detected immediate ZERO on Binance (prev non-zero -> now zero).")
                     
-                    # FIXED: Check if this is a planned TP closure or a real liquidation
-                    if closing_reason == 'TP' or tp_closing_in_progress:
-                        logger.info(f"TP closure detected for {sym} - liquidation watcher exiting normally, bot continues scanning")
+                    # FIXED: Check if this is a planned closure (TP, OVERRIDE, MANUAL) or a real liquidation
+                    if closing_reason in ['TP', 'OVERRIDE'] or tp_closing_in_progress:
+                        logger.info(f"✅ PLANNED CLOSURE detected for {sym} (reason: {closing_reason or 'TP'}) - liquidation watcher exiting normally, bot continues scanning")
                         break  # Exit watcher, don't terminate bot
                     
                     # This is a REAL liquidation or stop-loss hit - EMERGENCY
                     logger.warning(f"⚠️⚠️⚠️ EMERGENCY: Unexpected position closure on Binance for {sym} - likely liquidation or stop-loss!")
+                    logger.warning(f"⚠️⚠️⚠️ closing_reason={closing_reason}, tp_closing_in_progress={tp_closing_in_progress}, override_execution_in_progress={override_execution_in_progress}")
                     send_telegram(f"🚨 *EMERGENCY CLOSURE* 🚨\n`{sym}` position closed unexpectedly on Binance\nLikely liquidation or stop-loss hit!\nClosing other exchange and stopping bot for safety.\n{timestamp()}")
                     
                     try:
@@ -1844,13 +2005,14 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                 if (prev_kc_abs > ZERO_ABS_THRESHOLD or kc_initial_nonzero) and cur_kc_abs <= ZERO_ABS_THRESHOLD:
                     logger.info(f"{datetime.now().isoformat()} Detected immediate ZERO on KuCoin (prev non-zero -> now zero).")
                     
-                    # FIXED: Check if this is a planned TP closure or a real liquidation
-                    if closing_reason == 'TP' or tp_closing_in_progress:
-                        logger.info(f"TP closure detected for {sym} - liquidation watcher exiting normally, bot continues scanning")
+                    # FIXED: Check if this is a planned closure (TP, OVERRIDE, MANUAL) or a real liquidation
+                    if closing_reason in ['TP', 'OVERRIDE'] or tp_closing_in_progress:
+                        logger.info(f"✅ PLANNED CLOSURE detected for {sym} (reason: {closing_reason or 'TP'}) - liquidation watcher exiting normally, bot continues scanning")
                         break  # Exit watcher, don't terminate bot
                     
                     # This is a REAL liquidation or stop-loss hit - EMERGENCY
                     logger.warning(f"⚠️⚠️⚠️ EMERGENCY: Unexpected position closure on KuCoin for {sym} - likely liquidation or stop-loss!")
+                    logger.warning(f"⚠️⚠️⚠️ closing_reason={closing_reason}, tp_closing_in_progress={tp_closing_in_progress}, override_execution_in_progress={override_execution_in_progress}")
                     send_telegram(f"🚨 *EMERGENCY CLOSURE* 🚨\n`{sym}` position closed unexpectedly on KuCoin\nLikely liquidation or stop-loss hit!\nClosing other exchange and stopping bot for safety.\n{timestamp()}")
                     
                     try:
@@ -1879,13 +2041,14 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                 if zero_cnt_bin >= WATCHER_DETECT_CONFIRM:
                     logger.info(f"{datetime.now().isoformat()} Detected sustained ZERO on Binance.")
                     
-                    # FIXED: Check if this is a planned TP closure or a real liquidation
-                    if closing_reason == 'TP' or tp_closing_in_progress:
-                        logger.info(f"TP closure detected for {sym} - liquidation watcher exiting normally, bot continues scanning")
+                    # FIXED: Check if this is a planned closure (TP, OVERRIDE, MANUAL) or a real liquidation
+                    if closing_reason in ['TP', 'OVERRIDE'] or tp_closing_in_progress:
+                        logger.info(f"✅ PLANNED CLOSURE detected for {sym} (reason: {closing_reason or 'TP'}) - liquidation watcher exiting normally, bot continues scanning")
                         break  # Exit watcher, don't terminate bot
                     
                     # This is a REAL liquidation or stop-loss hit - EMERGENCY
                     logger.warning(f"⚠️⚠️⚠️ EMERGENCY: Sustained position closure on Binance for {sym} - likely liquidation or stop-loss!")
+                    logger.warning(f"⚠️⚠️⚠️ closing_reason={closing_reason}, tp_closing_in_progress={tp_closing_in_progress}, override_execution_in_progress={override_execution_in_progress}")
                     send_telegram(f"🚨 *EMERGENCY CLOSURE* 🚨\n`{sym}` position sustained zero on Binance\nLikely liquidation or stop-loss hit!\nClosing other exchange and stopping bot for safety.\n{timestamp()}")
                     
                     try:
@@ -1901,13 +2064,14 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                 if zero_cnt_kc >= WATCHER_DETECT_CONFIRM:
                     logger.info(f"{datetime.now().isoformat()} Detected sustained ZERO on KuCoin.")
                     
-                    # FIXED: Check if this is a planned TP closure or a real liquidation
-                    if closing_reason == 'TP' or tp_closing_in_progress:
-                        logger.info(f"TP closure detected for {sym} - liquidation watcher exiting normally, bot continues scanning")
+                    # FIXED: Check if this is a planned closure (TP, OVERRIDE, MANUAL) or a real liquidation
+                    if closing_reason in ['TP', 'OVERRIDE'] or tp_closing_in_progress:
+                        logger.info(f"✅ PLANNED CLOSURE detected for {sym} (reason: {closing_reason or 'TP'}) - liquidation watcher exiting normally, bot continues scanning")
                         break  # Exit watcher, don't terminate bot
                     
                     # This is a REAL liquidation or stop-loss hit - EMERGENCY
                     logger.warning(f"⚠️⚠️⚠️ EMERGENCY: Sustained position closure on KuCoin for {sym} - likely liquidation or stop-loss!")
+                    logger.warning(f"⚠️⚠️⚠️ closing_reason={closing_reason}, tp_closing_in_progress={tp_closing_in_progress}, override_execution_in_progress={override_execution_in_progress}")
                     send_telegram(f"🚨 *EMERGENCY CLOSURE* 🚨\n`{sym}` position sustained zero on KuCoin\nLikely liquidation or stop-loss hit!\nClosing other exchange and stopping bot for safety.\n{timestamp()}")
                     
                     try:
@@ -1935,7 +2099,10 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
 # State
 closing_in_progress = False
 tp_closing_in_progress = False  # NEW: Track if closing for TP (not liquidation)
-closing_reason = None  # NEW: Track WHY we're closing: 'TP', 'LIQUIDATION', 'MANUAL', or None
+closing_reason = None  # NEW: Track WHY we're closing: 'TP', 'LIQUIDATION', 'OVERRIDE', or None
+override_execution_in_progress = False  # NEW: Track if override trade is executing (prevents race conditions)
+override_confirm_count = 0  # NEW: Confirmation counter for override (requires 3 consecutive detections)
+override_candidate_symbol = None  # NEW: Track which symbol is being confirmed for override
 positions = {}
 entry_spreads = {}
 entry_prices = {}
@@ -1974,7 +2141,12 @@ active_trade = {
     'exit_trigger_kc_ask': None,
     # NEW: Balance tracking
     'balance_before_close': None,
-    'balance_after_close': None
+    'balance_after_close': None,
+    # FIXED: Track individual funding events by timestamp to prevent double counting
+    'seen_binance_funding_timestamps': set(),  # Set of timestamps we've already processed
+    'seen_kucoin_funding_timestamps': set(),   # Set of timestamps we've already processed
+    'binance_funding_events': [],  # List of {'timestamp': ms, 'amount': usd, 'datetime': str}
+    'kucoin_funding_events': []    # List of {'timestamp': ms, 'amount': usd, 'datetime': str}
 }
 
 # Confirm counters per symbol (consecutive confirms)
@@ -2417,6 +2589,12 @@ def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, 
     active_trade['plan'] = plan  # FIXED: Store plan for later reference in averaging/TP
     active_trade['entry_timestamp_ms'] = int(time.time() * 1000)  # NEW: Store entry time for funding history
     active_trade['last_funding_check_ms'] = 0  # NEW: Track last time we checked funding history
+    
+    # FIXED: Initialize funding tracking sets and lists to prevent double counting
+    active_trade['seen_binance_funding_timestamps'] = set()
+    active_trade['seen_kucoin_funding_timestamps'] = set()
+    active_trade['binance_funding_events'] = []
+    active_trade['kucoin_funding_events'] = []
     
     # COMPLETELY CHANGED: Track accumulated expenses in USD directly (not percentage)
     # This makes comparison with profit target (also in USD) crystal clear
@@ -3159,7 +3337,14 @@ def reset_active_trade():
         'final_averaged_price_kc': None, 'accumulated_expenses_pct': 0.0, 'total_notional': 0.0,
         'exit_trigger_spread': None, 'exit_real_spread': None, 'exit_trigger_bin_bid': None,
         'exit_trigger_bin_ask': None, 'exit_trigger_kc_bid': None, 'exit_trigger_kc_ask': None,
-        'balance_before_close': None, 'balance_after_close': None
+        'balance_before_close': None, 'balance_after_close': None,
+        'entry_timestamp_ms': None, 'last_funding_check_ms': 0,
+        'accumulated_expenses_usd': 0.0, 'funding_accumulated_usd': 0.0, 'funding_check_count': 0,
+        # FIXED: Clear funding tracking sets and lists to prevent double counting
+        'seen_binance_funding_timestamps': set(),
+        'seen_kucoin_funding_timestamps': set(),
+        'binance_funding_events': [],
+        'kucoin_funding_events': []
     })
     tp_confirm_count = 0  # NEW: Reset TP confirmation counter
     closing_reason = None  # FIXED: Reset closing reason
@@ -3171,12 +3356,14 @@ def funding_round_accounting_loop():
     
     Every 30 seconds, it:
     1. Fetches actual funding fee history from both Binance and KuCoin
-    2. Calculates net fees paid/received in USD
-    3. Converts to percentage of notional
-    4. Updates accumulated_expenses_pct immediately
+    2. Identifies NEW funding events (by timestamp deduplication)
+    3. Calculates net fees paid/received in USD
+    4. Updates accumulated_expenses_usd immediately
     
     - Funding PAID (positive net_fees_usd) increases accumulated expenses
     - Funding RECEIVED (negative net_fees_usd) decreases accumulated expenses
+    
+    FIXED: Now tracks individual funding events by timestamp to prevent double counting.
     """
     while True:
         try:
@@ -3200,7 +3387,7 @@ def funding_round_accounting_loop():
                 time.sleep(1)
                 continue
             
-            # Fetch actual funding fees from both exchanges
+            # Fetch actual funding fees from both exchanges (with timestamp deduplication)
             ku_api_sym = active_trade.get('ku_api') or sym + "M"
             funding_data = get_total_funding_fees_since_entry(sym, ku_api_sym, entry_timestamp_ms)
             
@@ -3209,17 +3396,16 @@ def funding_round_accounting_loop():
                 time.sleep(FUNDING_FEE_CHECK_INTERVAL)
                 continue
             
-            # Extract net fees in USD (already in dollars)
+            # Extract net fees in USD (already in dollars, deduplicated by timestamp)
             net_fees_usd = funding_data['net_fees_usd']
             binance_fees_usd = funding_data['binance_fees_usd']
             kucoin_fees_usd = funding_data['kucoin_fees_usd']
+            new_events_count = funding_data.get('new_events_count', 0)
+            binance_events_count = funding_data.get('binance_events_count', 0)
+            kucoin_events_count = funding_data.get('kucoin_events_count', 0)
             
             # PURE USD: Update accumulated expenses directly in dollars
-            # Previously we had entry fees + previous funding
-            # Now we have entry fees + current total funding (all in USD)
-            
             # Get current entry fees (stored in USD)
-            # Calculate entry fees from current notionals
             bin_notional = active_trade.get('final_implied_notional', {}).get('bin', 0)
             kc_notional = active_trade.get('final_implied_notional', {}).get('kc', 0)
             
@@ -3227,7 +3413,7 @@ def funding_round_accounting_loop():
             kucoin_entry_fees = (TRADING_FEE_PCT_PER_EXCHANGE / 100.0) * kc_notional
             total_entry_fees_usd = binance_entry_fees + kucoin_entry_fees
             
-            # New accumulated expenses = entry fees + cumulative funding
+            # New accumulated expenses = entry fees + cumulative funding (all deduplicated)
             new_accumulated_expenses_usd = total_entry_fees_usd + net_fees_usd
             
             # Calculate change since last check
@@ -3248,18 +3434,47 @@ def funding_round_accounting_loop():
                 funding_status = "NEUTRAL"
             
             # Log the update
-            logger.info(f"FUNDING UPDATE | {sym} | Binance: ${binance_fees_usd:+.4f} | KuCoin: ${kucoin_fees_usd:+.4f} | Net: ${net_fees_usd:+.4f} ({funding_status}) | Total Expenses: ${new_accumulated_expenses_usd:.4f}")
+            logger.info(f"FUNDING UPDATE | {sym} | "
+                       f"Binance: ${binance_fees_usd:+.4f} ({binance_events_count} events) | "
+                       f"KuCoin: ${kucoin_fees_usd:+.4f} ({kucoin_events_count} events) | "
+                       f"Net: ${net_fees_usd:+.4f} ({funding_status}) | "
+                       f"New events this check: {new_events_count} | "
+                       f"Total Expenses: ${new_accumulated_expenses_usd:.4f}")
             
-            # Only send Telegram if there's a meaningful change (> $0.01 or first update)
-            if abs(expense_change) > 0.01 or old_expenses == total_entry_fees_usd:
+            # Send Telegram if:
+            # 1. There are NEW events (new_events_count > 0), OR
+            # 2. There's a meaningful change (> $0.01), OR
+            # 3. First update (old_expenses == total_entry_fees_usd), OR
+            # 4. Every 10 checks even if no change (to show bot is alive)
+            check_count = active_trade.get('funding_check_count', 0) + 1
+            active_trade['funding_check_count'] = check_count
+            
+            should_send = (
+                new_events_count > 0 or  # NEW: Send if we detected new funding events
+                abs(expense_change) > 0.01 or 
+                old_expenses == total_entry_fees_usd or
+                check_count % 10 == 0  # Every 10 checks (5 minutes)
+            )
+            
+            if should_send:
+                logger.info(f"📤 Sending funding update to Telegram (check #{check_count}, new events={new_events_count}, change=${expense_change:.4f})")
+                
+                # Build event details if there are new events
+                event_details = ""
+                if new_events_count > 0:
+                    event_details = f"\n🆕 NEW: {new_events_count} funding event(s) detected"
+                
                 send_telegram(
                     f"*FUNDING UPDATE* `{sym}`\n"
-                    f"Binance: `${binance_fees_usd:+.4f}` | KuCoin: `${kucoin_fees_usd:+.4f}`\n"
-                    f"Net Funding: `${net_fees_usd:+.4f}` ({funding_status})\n"
+                    f"Binance: `${binance_fees_usd:+.4f}` ({binance_events_count} events)\n"
+                    f"KuCoin: `${kucoin_fees_usd:+.4f}` ({kucoin_events_count} events)\n"
+                    f"Net Funding: `${net_fees_usd:+.4f}` ({funding_status}){event_details}\n"
                     f"💰 Total Expenses: `${new_accumulated_expenses_usd:.4f}`\n"
                     f"  → Entry Fees + Funding ({funding_status})\n"
                     f"{timestamp()}"
                 )
+            else:
+                logger.debug(f"⏭️  Skipping Telegram update (check #{check_count}, no new events or significant change)")
             
             # Sleep for the configured interval
             time.sleep(FUNDING_FEE_CHECK_INTERVAL)
@@ -3620,6 +3835,13 @@ try:
             except Exception:
                 pass
             break
+        
+        # CRITICAL FIX: Skip all trading logic if override execution is in progress
+        if override_execution_in_progress:
+            logger.debug("⏸️ Override execution in progress, skipping normal trading logic")
+            time.sleep(0.5)
+            continue
+        
         if not active_trade.get('symbol'):
             # FIXED: Check for 7.5%+ big spread entry even when no trade is active
             best_pos, best_neg = get_best_positive_and_negative()
@@ -3634,15 +3856,17 @@ try:
                     if abs(max_spread) >= BIG_SPREAD_THRESHOLD:
                         big_spread_candidate = sym
                         big_spread_info = info
-                        logger.info("BIG SPREAD DETECTED (no active trade): %s spread=%.4f%%", sym, max_spread)
+                        logger.info("🚨 BIG SPREAD DETECTED (no active trade): %s spread=%.4f%% >= %.1f%%", sym, max_spread, BIG_SPREAD_THRESHOLD)
+                        print(f"🚨 BIG SPREAD DETECTED: {sym} @ {max_spread:.4f}% (threshold: {BIG_SPREAD_THRESHOLD}%)", flush=True)
                         break
             
-            # If big spread found, enter immediately
+            # If big spread found, reconfirm with entry spread before entering
             if big_spread_candidate and big_spread_info:
-                logger.info("Entering on BIG SPREAD (>=%.1f%%) with no active trade: %s", BIG_SPREAD_THRESHOLD, big_spread_candidate)
-                send_telegram(f"*BIG SPREAD ENTRY* `{big_spread_candidate}` spread `{big_spread_info.get('max_spread', 0.0):.4f}%` >= {BIG_SPREAD_THRESHOLD}%\nEntering with 2x notional\n{timestamp()}")
+                logger.info("🔍 BIG SPREAD ENTRY (no active trade): %s (main spread=%.4f%%, threshold=%.1f%%)", 
+                           big_spread_candidate, big_spread_info.get('max_spread', 0.0), BIG_SPREAD_THRESHOLD)
+                print(f"🔍 Reconfirming big spread entry for {big_spread_candidate}...", flush=True)
                 
-                # Create eval_info for execution
+                # Get initial prices
                 sym = big_spread_candidate
                 ku_api_sym = big_spread_info.get('ku_sym')
                 bin_bid = big_spread_info.get('bin_bid')
@@ -3650,26 +3874,47 @@ try:
                 kc_bid = big_spread_info.get('ku_bid')
                 kc_ask = big_spread_info.get('ku_ask')
                 
+                # Determine expected plan from main spread
                 if kc_bid > bin_ask:
-                    trigger_spread = 100 * (kc_bid - bin_ask) / bin_ask
-                    plan = ('binance', 'kucoin')
+                    expected_plan = ('binance', 'kucoin')
                 else:
-                    trigger_spread = 100 * (bin_bid - kc_ask) / kc_ask
-                    plan = ('kucoin', 'binance')
+                    expected_plan = ('kucoin', 'binance')
+                
+                # CRITICAL FIX: Reconfirm with fresh entry spread
+                success, entry_spread, plan, fresh_bin_bid, fresh_bin_ask, fresh_kc_bid, fresh_kc_ask = reconfirm_entry_spread(
+                    sym, ku_api_sym, bin_ask, bin_bid, kc_ask, kc_bid, expected_plan
+                )
+                
+                if not success:
+                    logger.warning(f"❌ Big spread entry REJECTED for {sym}: Reconfirmation failed")
+                    print(f"❌ Big spread reconfirmation failed for {sym}", flush=True)
+                    continue
+                
+                # Check if entry spread still meets threshold
+                if abs(entry_spread) < BIG_SPREAD_THRESHOLD:
+                    logger.warning(f"❌ Big spread entry REJECTED for {sym}: Entry spread {entry_spread:.4f}% < {BIG_SPREAD_THRESHOLD}%")
+                    print(f"❌ Big spread entry rejected: {sym} @ {entry_spread:.4f}% < {BIG_SPREAD_THRESHOLD}%", flush=True)
+                    continue
+                
+                logger.info(f"✅ Big spread entry CONFIRMED for {sym}: Entry spread {entry_spread:.4f}% >= {BIG_SPREAD_THRESHOLD}%")
+                print(f"✅ BIG SPREAD ENTRY CONFIRMED: {sym} @ {entry_spread:.4f}%", flush=True)
+                send_telegram(f"*BIG SPREAD ENTRY* `{sym}`\nMain spread: `{big_spread_info.get('max_spread', 0.0):.4f}%`\nEntry spread: `{entry_spread:.4f}%` >= {BIG_SPREAD_THRESHOLD}%\nEntering with 2x notional\n{timestamp()}")
                 
                 eval_info = {
                     'case': 'big_spread',
                     'plan': plan,
-                    'trigger_spread': trigger_spread,
+                    'trigger_spread': entry_spread,
                     'net_fr': 0.0,
                     'time_left_min': None,
-                    'bin_bid': bin_bid,
-                    'bin_ask': bin_ask,
-                    'kc_bid': kc_bid,
-                    'kc_ask': kc_ask,
+                    'bin_bid': fresh_bin_bid,
+                    'bin_ask': fresh_bin_ask,
+                    'kc_bid': fresh_kc_bid,
+                    'kc_ask': fresh_kc_ask,
                     'ku_api_sym': ku_api_sym
                 }
                 
+                logger.info(f"🚀 Executing big spread entry for {sym} with 2x notional")
+                print(f"🚀 Executing big spread entry: {sym}", flush=True)
                 execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=BIG_SPREAD_ENTRY_MULTIPLIER)
                 time.sleep(1)
                 continue
@@ -3739,22 +3984,32 @@ try:
                         if abs(max_spread) >= BIG_SPREAD_THRESHOLD:
                             big_spread_candidate = sym
                             big_spread_info = info
-                            logger.info("BIG SPREAD OVERRIDE DETECTED: %s spread=%.4f%% (current trade entry=%.4f%%)", 
-                                      sym, max_spread, current_practical_entry)
-                            break
+                            logger.info("🚨 BIG SPREAD OVERRIDE DETECTED: %s spread=%.4f%% >= %.1f%% (current trade %s entry=%.4f%%)", 
+                                      sym, max_spread, BIG_SPREAD_THRESHOLD, active_trade.get('symbol'), current_practical_entry)
+                            print(f"🚨 OVERRIDE DETECTED: {sym} @ {max_spread:.4f}% (current: {active_trade.get('symbol')} @ {current_practical_entry:.4f}%)", flush=True)
+                            break                # NEW: Confirmation counter logic for override (requires 3 consecutive detections)
+                global override_confirm_count, override_candidate_symbol
                 
                 if big_spread_candidate and big_spread_info:
-                    logger.info("CLOSING current trade to enter BIG SPREAD: %s (%.4f%%)", big_spread_candidate, big_spread_info.get('max_spread'))
-                    send_telegram(f"*BIG SPREAD OVERRIDE*\nClosing `{active_trade.get('symbol')}` (entry={current_practical_entry:.4f}%)\nEntering `{big_spread_candidate}` ({big_spread_info.get('max_spread', 0.0):.4f}%)\n{timestamp()}")
+                    # Check if same candidate as before
+                    if override_candidate_symbol == big_spread_candidate:
+                        override_confirm_count += 1
+                        logger.info(f"🔄 Override confirmation {override_confirm_count}/3 for {big_spread_candidate}")
+                        print(f"🔄 Override confirmation {override_confirm_count}/3 for {big_spread_candidate}", flush=True)
+                    else:
+                        # New candidate, reset counter
+                        override_candidate_symbol = big_spread_candidate
+                        override_confirm_count = 1
+                        logger.info(f"🔄 New override candidate {big_spread_candidate}, starting confirmation 1/3")
+                        print(f"🔄 New override candidate {big_spread_candidate}, confirmation 1/3", flush=True)
                     
-                    # Close current trade
-                    try:
-                        close_all_and_wait()
-                        reset_active_trade()
-                    except Exception:
-                        logger.exception("Error closing current trade for big spread override")
+                    # Only execute after 3 consecutive confirmations
+                    if override_confirm_count >= 3:
+                        logger.info("🔍 BIG SPREAD OVERRIDE: %s (main spread=%.4f%%, current trade %s entry=%.4f%%)", 
+                               big_spread_candidate, big_spread_info.get('max_spread'), active_trade.get('symbol'), current_practical_entry)
+                    print(f"🔍 Reconfirming override for {big_spread_candidate}...", flush=True)
                     
-                    # Enter new big spread trade
+                    # Get initial prices
                     sym = big_spread_candidate
                     ku_api_sym = big_spread_info.get('ku_sym')
                     bin_bid = big_spread_info.get('bin_bid')
@@ -3762,29 +4017,117 @@ try:
                     kc_bid = big_spread_info.get('ku_bid')
                     kc_ask = big_spread_info.get('ku_ask')
                     
+                    # Determine expected plan from main spread
                     if kc_bid > bin_ask:
-                        trigger_spread = 100 * (kc_bid - bin_ask) / bin_ask
-                        plan = ('binance', 'kucoin')
+                        expected_plan = ('binance', 'kucoin')
                     else:
-                        trigger_spread = 100 * (bin_bid - kc_ask) / kc_ask
-                        plan = ('kucoin', 'binance')
+                        expected_plan = ('kucoin', 'binance')
                     
-                    eval_info = {
-                        'case': 'big_spread_override',
-                        'plan': plan,
-                        'trigger_spread': trigger_spread,
-                        'net_fr': 0.0,
-                        'time_left_min': None,
-                        'bin_bid': bin_bid,
-                        'bin_ask': bin_ask,
-                        'kc_bid': kc_bid,
-                        'kc_ask': kc_ask,
-                        'ku_api_sym': ku_api_sym
-                    }
+                    # CRITICAL FIX: Reconfirm with fresh entry spread
+                    success, entry_spread, plan, fresh_bin_bid, fresh_bin_ask, fresh_kc_bid, fresh_kc_ask = reconfirm_entry_spread(
+                        sym, ku_api_sym, bin_ask, bin_bid, kc_ask, kc_bid, expected_plan
+                    )
                     
-                    execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=BIG_SPREAD_ENTRY_MULTIPLIER)
-                    time.sleep(1)
-                    continue
+                        if not success:
+                            logger.warning(f"❌ Big spread override REJECTED for {sym}: Reconfirmation failed")
+                            print(f"❌ Override reconfirmation failed for {sym}", flush=True)
+                            # Reset confirmation counter
+                            override_confirm_count = 0
+                            override_candidate_symbol = None
+                            pass  # Continue with active trade monitoring
+                        elif abs(entry_spread) < BIG_SPREAD_THRESHOLD:
+                            logger.warning(f"❌ Big spread override REJECTED for {sym}: Entry spread {entry_spread:.4f}% < {BIG_SPREAD_THRESHOLD}%")
+                            print(f"❌ Override rejected: {sym} @ {entry_spread:.4f}% < {BIG_SPREAD_THRESHOLD}%", flush=True)
+                            # Reset confirmation counter
+                            override_confirm_count = 0
+                            override_candidate_symbol = None
+                            pass  # Continue with active trade monitoring
+                        else:
+                            logger.info(f"✅ Big spread override CONFIRMED for {sym}: Entry spread {entry_spread:.4f}% >= {BIG_SPREAD_THRESHOLD}%")
+                            print(f"✅ OVERRIDE CONFIRMED: {sym} @ {entry_spread:.4f}%", flush=True)
+                            logger.info(f"🔄 OVERRIDE EXECUTION STARTING: Closing {active_trade.get('symbol')} to enter {sym}")
+                            print(f"🔄 Closing {active_trade.get('symbol')} to enter {sym}...", flush=True)
+                            send_telegram(f"*BIG SPREAD OVERRIDE*\nClosing `{active_trade.get('symbol')}` (entry={current_practical_entry:.4f}%)\nEntering `{sym}` (main={big_spread_info.get('max_spread', 0.0):.4f}%, entry={entry_spread:.4f}%)\n{timestamp()}")
+                            
+                            # Reset confirmation counter before execution
+                            override_confirm_count = 0
+                            override_candidate_symbol = None
+                            
+                            # CRITICAL FIX: Set flags to prevent race conditions and inform liquidation watcher
+                            global closing_reason, override_execution_in_progress
+                        closing_reason = 'OVERRIDE'
+                        override_execution_in_progress = True
+                        logger.info(f"🔒 OVERRIDE FLAGS SET: closing_reason='OVERRIDE', override_execution_in_progress=True")
+                        
+                        # Close current trade
+                        try:
+                            logger.info(f"🔄 Closing current position: {active_trade.get('symbol')}")
+                            close_all_and_wait()
+                            reset_active_trade()
+                            logger.info(f"✅ Current position closed successfully")
+                        except Exception as e:
+                            logger.exception("❌ Error closing current trade for big spread override: %s", e)
+                            # Reset flags even on error
+                            closing_reason = None
+                            override_execution_in_progress = False
+                            logger.info(f"🔓 OVERRIDE FLAGS RESET (after error)")
+                            continue  # Skip to next iteration
+                        finally:
+                            # Always reset closing_reason after close completes
+                            closing_reason = None
+                            logger.info(f"🔓 closing_reason reset to None (close complete)")
+                            
+                            # CRITICAL: Re-check spread after position close to ensure it's still above threshold
+                            logger.info(f"🔍 Re-checking spread for {sym} after position close to prevent decay")
+                            recheck_success, recheck_spread, recheck_plan, _, _, _, _ = reconfirm_entry_spread(
+                                sym, ku_api_sym, fresh_bin_ask, fresh_bin_bid, fresh_kc_ask, fresh_kc_bid, plan
+                            )
+                            
+                            if not recheck_success or abs(recheck_spread) < BIG_SPREAD_THRESHOLD:
+                                logger.warning(f"❌ Override entry ABORTED: Spread decayed to {recheck_spread:.4f}% < {BIG_SPREAD_THRESHOLD}% after close")
+                                print(f"❌ Override aborted: {sym} spread decayed to {recheck_spread:.4f}%", flush=True)
+                                send_telegram(f"⚠️ *OVERRIDE ABORTED*\\n`{sym}` spread decayed to {recheck_spread:.4f}% < {BIG_SPREAD_THRESHOLD}% after position close\\n{timestamp()}")
+                                override_execution_in_progress = False
+                                logger.info(f"🔓 OVERRIDE FLAGS RESET (spread decay)")
+                                continue  # Skip entry, continue monitoring
+                            
+                            logger.info(f"✅ Spread re-check passed: {sym} @ {recheck_spread:.4f}% >= {BIG_SPREAD_THRESHOLD}%")
+                            print(f"✅ Spread re-check passed: {sym} @ {recheck_spread:.4f}%", flush=True)
+                        
+                        # Check if bot is terminating before attempting entry
+                        if terminate_bot:
+                            logger.warning(f"⚠️ Bot terminating, skipping override entry for {sym}")
+                            override_execution_in_progress = False
+                            logger.info(f"🔓 OVERRIDE FLAGS RESET (bot terminating)")
+                            break
+                        
+                        eval_info = {
+                            'case': 'big_spread_override',
+                            'plan': plan,
+                            'trigger_spread': entry_spread,
+                            'net_fr': 0.0,
+                            'time_left_min': None,
+                            'bin_bid': fresh_bin_bid,
+                            'bin_ask': fresh_bin_ask,
+                            'kc_bid': fresh_kc_bid,
+                            'kc_ask': fresh_kc_ask,
+                            'ku_api_sym': ku_api_sym
+                        }
+                        
+                        logger.info(f"🚀 Attempting override entry for {sym} with 2x notional")
+                        ok = execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=BIG_SPREAD_ENTRY_MULTIPLIER)
+                        
+                        # Reset override flag after execution completes
+                        override_execution_in_progress = False
+                        logger.info(f"🔓 override_execution_in_progress reset to False (execution complete)")
+                        
+                        if ok:
+                            logger.info(f"✅ Override entry SUCCESS for {sym}")
+                        else:
+                            logger.error(f"❌ Override entry FAILED for {sym}")
+                        
+                        time.sleep(1)
+                        continue
             
             # Otherwise: maintenance threads handle averaging/TP; main loop sleeps
             pass
