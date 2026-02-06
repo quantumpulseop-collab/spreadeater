@@ -1982,7 +1982,7 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                 if (prev_bin_abs > ZERO_ABS_THRESHOLD or bin_initial_nonzero) and cur_bin_abs <= ZERO_ABS_THRESHOLD:
                     logger.info(f"{datetime.now().isoformat()} Detected immediate ZERO on Binance (prev non-zero -> now zero).")
                     
-                    # FIXED: Check if this is a planned closure (TP, OVERRIDE, MANUAL) or a real liquidation
+                    # FIXED: Check if this is a planned closure (TP, OVERRIDE) or a real liquidation
                     if closing_reason in ['TP', 'OVERRIDE'] or tp_closing_in_progress:
                         logger.info(f"✅ PLANNED CLOSURE detected for {sym} (reason: {closing_reason or 'TP'}) - liquidation watcher exiting normally, bot continues scanning")
                         break  # Exit watcher, don't terminate bot
@@ -2005,7 +2005,7 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                 if (prev_kc_abs > ZERO_ABS_THRESHOLD or kc_initial_nonzero) and cur_kc_abs <= ZERO_ABS_THRESHOLD:
                     logger.info(f"{datetime.now().isoformat()} Detected immediate ZERO on KuCoin (prev non-zero -> now zero).")
                     
-                    # FIXED: Check if this is a planned closure (TP, OVERRIDE, MANUAL) or a real liquidation
+                    # FIXED: Check if this is a planned closure (TP, OVERRIDE) or a real liquidation
                     if closing_reason in ['TP', 'OVERRIDE'] or tp_closing_in_progress:
                         logger.info(f"✅ PLANNED CLOSURE detected for {sym} (reason: {closing_reason or 'TP'}) - liquidation watcher exiting normally, bot continues scanning")
                         break  # Exit watcher, don't terminate bot
@@ -2041,7 +2041,7 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                 if zero_cnt_bin >= WATCHER_DETECT_CONFIRM:
                     logger.info(f"{datetime.now().isoformat()} Detected sustained ZERO on Binance.")
                     
-                    # FIXED: Check if this is a planned closure (TP, OVERRIDE, MANUAL) or a real liquidation
+                    # FIXED: Check if this is a planned closure (TP, OVERRIDE) or a real liquidation
                     if closing_reason in ['TP', 'OVERRIDE'] or tp_closing_in_progress:
                         logger.info(f"✅ PLANNED CLOSURE detected for {sym} (reason: {closing_reason or 'TP'}) - liquidation watcher exiting normally, bot continues scanning")
                         break  # Exit watcher, don't terminate bot
@@ -2064,7 +2064,7 @@ def _start_liquidation_watcher_for_symbols(sym, bin_sym, kc_ccxt_sym):
                 if zero_cnt_kc >= WATCHER_DETECT_CONFIRM:
                     logger.info(f"{datetime.now().isoformat()} Detected sustained ZERO on KuCoin.")
                     
-                    # FIXED: Check if this is a planned closure (TP, OVERRIDE, MANUAL) or a real liquidation
+                    # FIXED: Check if this is a planned closure (TP, OVERRIDE) or a real liquidation
                     if closing_reason in ['TP', 'OVERRIDE'] or tp_closing_in_progress:
                         logger.info(f"✅ PLANNED CLOSURE detected for {sym} (reason: {closing_reason or 'TP'}) - liquidation watcher exiting normally, bot continues scanning")
                         break  # Exit watcher, don't terminate bot
@@ -2101,8 +2101,6 @@ closing_in_progress = False
 tp_closing_in_progress = False  # NEW: Track if closing for TP (not liquidation)
 closing_reason = None  # NEW: Track WHY we're closing: 'TP', 'LIQUIDATION', 'OVERRIDE', or None
 override_execution_in_progress = False  # NEW: Track if override trade is executing (prevents race conditions)
-override_confirm_count = 0  # NEW: Confirmation counter for override (requires 3 consecutive detections)
-override_candidate_symbol = None  # NEW: Track which symbol is being confirmed for override
 positions = {}
 entry_spreads = {}
 entry_prices = {}
@@ -2156,6 +2154,10 @@ CONFIRM_COUNT = 3
 # NEW: TP confirmation counter (need 3 consecutive confirmations to exit)
 tp_confirm_count = 0
 TP_CONFIRM_COUNT = 3
+
+# NEW: Override confirmation counter (need 3 consecutive confirmations for big spread override)
+override_confirm_count = 0
+OVERRIDE_CONFIRM_COUNT = 3
 
 # Scanner shared candidates
 candidates_shared_lock = threading.Lock()
@@ -3987,60 +3989,48 @@ try:
                             logger.info("🚨 BIG SPREAD OVERRIDE DETECTED: %s spread=%.4f%% >= %.1f%% (current trade %s entry=%.4f%%)", 
                                       sym, max_spread, BIG_SPREAD_THRESHOLD, active_trade.get('symbol'), current_practical_entry)
                             print(f"🚨 OVERRIDE DETECTED: {sym} @ {max_spread:.4f}% (current: {active_trade.get('symbol')} @ {current_practical_entry:.4f}%)", flush=True)
-                            break                # NEW: Confirmation counter logic for override (requires 3 consecutive detections)
-                global override_confirm_count, override_candidate_symbol
+                            break
                 
                 if big_spread_candidate and big_spread_info:
-                    # Check if same candidate as before
-                    if override_candidate_symbol == big_spread_candidate:
-                        override_confirm_count += 1
-                        logger.info(f"🔄 Override confirmation {override_confirm_count}/3 for {big_spread_candidate}")
-                        print(f"🔄 Override confirmation {override_confirm_count}/3 for {big_spread_candidate}", flush=True)
-                    else:
-                        # New candidate, reset counter
-                        override_candidate_symbol = big_spread_candidate
-                        override_confirm_count = 1
-                        logger.info(f"🔄 New override candidate {big_spread_candidate}, starting confirmation 1/3")
-                        print(f"🔄 New override candidate {big_spread_candidate}, confirmation 1/3", flush=True)
+                    global override_confirm_count
                     
-                    # Only execute after 3 consecutive confirmations
-                    if override_confirm_count >= 3:
-                        logger.info("🔍 BIG SPREAD OVERRIDE: %s (main spread=%.4f%%, current trade %s entry=%.4f%%)", 
-                               big_spread_candidate, big_spread_info.get('max_spread'), active_trade.get('symbol'), current_practical_entry)
-                    print(f"🔍 Reconfirming override for {big_spread_candidate}...", flush=True)
+                    # Increment override confirmation counter
+                    override_confirm_count += 1
+                    logger.info(f"⏳ Confirming override for {big_spread_candidate}: {override_confirm_count}/{OVERRIDE_CONFIRM_COUNT} (main_spread={big_spread_info.get('max_spread', 0.0):.4f}%)")
+                    print(f"⏳ Override confirmation {override_confirm_count}/{OVERRIDE_CONFIRM_COUNT} for {big_spread_candidate} @ {big_spread_info.get('max_spread', 0.0):.4f}%", flush=True)
                     
-                    # Get initial prices
-                    sym = big_spread_candidate
-                    ku_api_sym = big_spread_info.get('ku_sym')
-                    bin_bid = big_spread_info.get('bin_bid')
-                    bin_ask = big_spread_info.get('bin_ask')
-                    kc_bid = big_spread_info.get('ku_bid')
-                    kc_ask = big_spread_info.get('ku_ask')
-                    
-                    # Determine expected plan from main spread
-                    if kc_bid > bin_ask:
-                        expected_plan = ('binance', 'kucoin')
-                    else:
-                        expected_plan = ('kucoin', 'binance')
-                    
-                    # CRITICAL FIX: Reconfirm with fresh entry spread
-                    success, entry_spread, plan, fresh_bin_bid, fresh_bin_ask, fresh_kc_bid, fresh_kc_ask = reconfirm_entry_spread(
-                        sym, ku_api_sym, bin_ask, bin_bid, kc_ask, kc_bid, expected_plan
-                    )
-                    
+                    if override_confirm_count >= OVERRIDE_CONFIRM_COUNT:
+                        logger.info(f"✅ OVERRIDE CONFIRMATION COMPLETE for {big_spread_candidate}! Re-evaluating before execution...")
+                        print(f"✅ Override confirmed for {big_spread_candidate}, executing...", flush=True)
+                        
+                        # Get initial prices
+                        sym = big_spread_candidate
+                        ku_api_sym = big_spread_info.get('ku_sym')
+                        bin_bid = big_spread_info.get('bin_bid')
+                        bin_ask = big_spread_info.get('bin_ask')
+                        kc_bid = big_spread_info.get('ku_bid')
+                        kc_ask = big_spread_info.get('ku_ask')
+                        
+                        # Determine expected plan from main spread
+                        if kc_bid > bin_ask:
+                            expected_plan = ('binance', 'kucoin')
+                        else:
+                            expected_plan = ('kucoin', 'binance')
+                        
+                        # CRITICAL FIX: Reconfirm with fresh entry spread
+                        success, entry_spread, plan, fresh_bin_bid, fresh_bin_ask, fresh_kc_bid, fresh_kc_ask = reconfirm_entry_spread(
+                            sym, ku_api_sym, bin_ask, bin_bid, kc_ask, kc_bid, expected_plan
+                        )
+                        
                         if not success:
                             logger.warning(f"❌ Big spread override REJECTED for {sym}: Reconfirmation failed")
-                            print(f"❌ Override reconfirmation failed for {sym}", flush=True)
-                            # Reset confirmation counter
+                            print(f"❌ Override reconfirmation failed for {sym}, resetting confirms", flush=True)
                             override_confirm_count = 0
-                            override_candidate_symbol = None
                             pass  # Continue with active trade monitoring
                         elif abs(entry_spread) < BIG_SPREAD_THRESHOLD:
                             logger.warning(f"❌ Big spread override REJECTED for {sym}: Entry spread {entry_spread:.4f}% < {BIG_SPREAD_THRESHOLD}%")
-                            print(f"❌ Override rejected: {sym} @ {entry_spread:.4f}% < {BIG_SPREAD_THRESHOLD}%", flush=True)
-                            # Reset confirmation counter
+                            print(f"❌ Override rejected: {sym} @ {entry_spread:.4f}% < {BIG_SPREAD_THRESHOLD}%, resetting confirms", flush=True)
                             override_confirm_count = 0
-                            override_candidate_symbol = None
                             pass  # Continue with active trade monitoring
                         else:
                             logger.info(f"✅ Big spread override CONFIRMED for {sym}: Entry spread {entry_spread:.4f}% >= {BIG_SPREAD_THRESHOLD}%")
@@ -4049,85 +4039,96 @@ try:
                             print(f"🔄 Closing {active_trade.get('symbol')} to enter {sym}...", flush=True)
                             send_telegram(f"*BIG SPREAD OVERRIDE*\nClosing `{active_trade.get('symbol')}` (entry={current_practical_entry:.4f}%)\nEntering `{sym}` (main={big_spread_info.get('max_spread', 0.0):.4f}%, entry={entry_spread:.4f}%)\n{timestamp()}")
                             
-                            # Reset confirmation counter before execution
-                            override_confirm_count = 0
-                            override_candidate_symbol = None
-                            
                             # CRITICAL FIX: Set flags to prevent race conditions and inform liquidation watcher
                             global closing_reason, override_execution_in_progress
-                        closing_reason = 'OVERRIDE'
-                        override_execution_in_progress = True
-                        logger.info(f"🔒 OVERRIDE FLAGS SET: closing_reason='OVERRIDE', override_execution_in_progress=True")
-                        
-                        # Close current trade
-                        try:
-                            logger.info(f"🔄 Closing current position: {active_trade.get('symbol')}")
-                            close_all_and_wait()
-                            reset_active_trade()
-                            logger.info(f"✅ Current position closed successfully")
-                        except Exception as e:
-                            logger.exception("❌ Error closing current trade for big spread override: %s", e)
-                            # Reset flags even on error
-                            closing_reason = None
-                            override_execution_in_progress = False
-                            logger.info(f"🔓 OVERRIDE FLAGS RESET (after error)")
-                            continue  # Skip to next iteration
-                        finally:
-                            # Always reset closing_reason after close completes
-                            closing_reason = None
-                            logger.info(f"🔓 closing_reason reset to None (close complete)")
+                            closing_reason = 'OVERRIDE'
+                            override_execution_in_progress = True
+                            override_confirm_count = 0  # Reset counter before execution
+                            logger.info(f"🔒 OVERRIDE FLAGS SET: closing_reason='OVERRIDE', override_execution_in_progress=True")
                             
-                            # CRITICAL: Re-check spread after position close to ensure it's still above threshold
-                            logger.info(f"🔍 Re-checking spread for {sym} after position close to prevent decay")
-                            recheck_success, recheck_spread, recheck_plan, _, _, _, _ = reconfirm_entry_spread(
-                                sym, ku_api_sym, fresh_bin_ask, fresh_bin_bid, fresh_kc_ask, fresh_kc_bid, plan
+                            # Close current trade
+                            try:
+                                logger.info(f"🔄 Closing current position: {active_trade.get('symbol')}")
+                                close_all_and_wait()
+                                reset_active_trade()
+                                logger.info(f"✅ Current position closed successfully")
+                            except Exception as e:
+                                logger.exception("❌ Error closing current trade for big spread override: %s", e)
+                                # Reset flags even on error
+                                closing_reason = None
+                                override_execution_in_progress = False
+                                logger.info(f"🔓 OVERRIDE FLAGS RESET (after error)")
+                                continue  # Skip to next iteration
+                            finally:
+                                # Always reset closing_reason after close completes
+                                closing_reason = None
+                                logger.info(f"🔓 closing_reason reset to None (close complete)")
+                            
+                            # CRITICAL: Re-check spread after close to ensure it hasn't decayed
+                            logger.info(f"🔍 RE-CHECKING SPREAD after position close for {sym}...")
+                            print(f"🔍 Re-checking spread for {sym} after close...", flush=True)
+                            
+                            success_postclose, entry_spread_postclose, plan_postclose, fresh_bin_bid2, fresh_bin_ask2, fresh_kc_bid2, fresh_kc_ask2 = reconfirm_entry_spread(
+                                sym, ku_api_sym, fresh_bin_ask, fresh_bin_bid, fresh_kc_ask, fresh_kc_bid, expected_plan
                             )
                             
-                            if not recheck_success or abs(recheck_spread) < BIG_SPREAD_THRESHOLD:
-                                logger.warning(f"❌ Override entry ABORTED: Spread decayed to {recheck_spread:.4f}% < {BIG_SPREAD_THRESHOLD}% after close")
-                                print(f"❌ Override aborted: {sym} spread decayed to {recheck_spread:.4f}%", flush=True)
-                                send_telegram(f"⚠️ *OVERRIDE ABORTED*\\n`{sym}` spread decayed to {recheck_spread:.4f}% < {BIG_SPREAD_THRESHOLD}% after position close\\n{timestamp()}")
+                            if not success_postclose:
+                                logger.warning(f"❌ POST-CLOSE spread check FAILED for {sym}: Reconfirmation failed after close")
+                                print(f"❌ Spread check failed after close for {sym}, aborting entry", flush=True)
+                                send_telegram(f"⚠️ *OVERRIDE ABORTED*\n`{sym}` spread check failed after closing position\nBot continues scanning\n{timestamp()}")
+                                override_execution_in_progress = False
+                                logger.info(f"🔓 OVERRIDE FLAGS RESET (post-close check failed)")
+                                continue
+                            elif abs(entry_spread_postclose) < BIG_SPREAD_THRESHOLD:
+                                logger.warning(f"❌ POST-CLOSE spread check FAILED for {sym}: Entry spread {entry_spread_postclose:.4f}% < {BIG_SPREAD_THRESHOLD}% (SPREAD DECAY)")
+                                print(f"❌ Spread decayed after close: {sym} @ {entry_spread_postclose:.4f}% < {BIG_SPREAD_THRESHOLD}%, aborting entry", flush=True)
+                                send_telegram(f"⚠️ *OVERRIDE ABORTED - SPREAD DECAY*\n`{sym}` spread fell to {entry_spread_postclose:.4f}% < {BIG_SPREAD_THRESHOLD}%\nBot continues scanning\n{timestamp()}")
                                 override_execution_in_progress = False
                                 logger.info(f"🔓 OVERRIDE FLAGS RESET (spread decay)")
-                                continue  # Skip entry, continue monitoring
+                                continue
+                            else:
+                                logger.info(f"✅ POST-CLOSE spread check PASSED for {sym}: Entry spread {entry_spread_postclose:.4f}% >= {BIG_SPREAD_THRESHOLD}%")
+                                print(f"✅ Spread still valid: {sym} @ {entry_spread_postclose:.4f}%", flush=True)
                             
-                            logger.info(f"✅ Spread re-check passed: {sym} @ {recheck_spread:.4f}% >= {BIG_SPREAD_THRESHOLD}%")
-                            print(f"✅ Spread re-check passed: {sym} @ {recheck_spread:.4f}%", flush=True)
-                        
-                        # Check if bot is terminating before attempting entry
-                        if terminate_bot:
-                            logger.warning(f"⚠️ Bot terminating, skipping override entry for {sym}")
+                            # Check if bot is terminating before attempting entry
+                            if terminate_bot:
+                                logger.warning(f"⚠️ Bot terminating, skipping override entry for {sym}")
+                                override_execution_in_progress = False
+                                logger.info(f"🔓 OVERRIDE FLAGS RESET (bot terminating)")
+                                break
+                            
+                            eval_info = {
+                                'case': 'big_spread_override',
+                                'plan': plan_postclose,
+                                'trigger_spread': entry_spread_postclose,
+                                'net_fr': 0.0,
+                                'time_left_min': None,
+                                'bin_bid': fresh_bin_bid2,
+                                'bin_ask': fresh_bin_ask2,
+                                'kc_bid': fresh_kc_bid2,
+                                'kc_ask': fresh_kc_ask2,
+                                'ku_api_sym': ku_api_sym
+                            }
+                            
+                            logger.info(f"🚀 Attempting override entry for {sym} with 2x notional")
+                            ok = execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=BIG_SPREAD_ENTRY_MULTIPLIER)
+                            
+                            # Reset override flag after execution completes
                             override_execution_in_progress = False
-                            logger.info(f"🔓 OVERRIDE FLAGS RESET (bot terminating)")
-                            break
-                        
-                        eval_info = {
-                            'case': 'big_spread_override',
-                            'plan': plan,
-                            'trigger_spread': entry_spread,
-                            'net_fr': 0.0,
-                            'time_left_min': None,
-                            'bin_bid': fresh_bin_bid,
-                            'bin_ask': fresh_bin_ask,
-                            'kc_bid': fresh_kc_bid,
-                            'kc_ask': fresh_kc_ask,
-                            'ku_api_sym': ku_api_sym
-                        }
-                        
-                        logger.info(f"🚀 Attempting override entry for {sym} with 2x notional")
-                        ok = execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=BIG_SPREAD_ENTRY_MULTIPLIER)
-                        
-                        # Reset override flag after execution completes
-                        override_execution_in_progress = False
-                        logger.info(f"🔓 override_execution_in_progress reset to False (execution complete)")
-                        
-                        if ok:
-                            logger.info(f"✅ Override entry SUCCESS for {sym}")
-                        else:
-                            logger.error(f"❌ Override entry FAILED for {sym}")
-                        
-                        time.sleep(1)
-                        continue
+                            logger.info(f"🔓 override_execution_in_progress reset to False (execution complete)")
+                            
+                            if ok:
+                                logger.info(f"✅ Override entry SUCCESS for {sym}")
+                            else:
+                                logger.error(f"❌ Override entry FAILED for {sym}")
+                            
+                            time.sleep(1)
+                            continue
+                else:
+                    # No big spread candidate detected, reset override confirms
+                    if override_confirm_count > 0:
+                        logger.debug(f"🔄 Resetting override confirms (no candidate)")
+                        override_confirm_count = 0
             
             # Otherwise: maintenance threads handle averaging/TP; main loop sleeps
             pass
