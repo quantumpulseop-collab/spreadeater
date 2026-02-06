@@ -3825,7 +3825,6 @@ print("="*80 + "\n", flush=True)
 try:
     loop_count = 0
     while True:
-        global override_confirm_count, closing_reason, override_execution_in_progress
         loop_count += 1
         if loop_count % 30 == 0:  # Every 30 seconds
             print(f"💓 Main loop heartbeat #{loop_count} - {timestamp()}", flush=True)
