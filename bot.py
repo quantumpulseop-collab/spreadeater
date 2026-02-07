@@ -147,8 +147,17 @@ logger.addHandler(ch2)
 
 # Print to verify logging works
 print("=" * 80, flush=True)
-print("LOGGING INITIALIZED - YOU SHOULD SEE THIS IN RAILWAY", flush=True)
+print("🚀 LOGGING INITIALIZED - FIXED VERSION v2.0", flush=True)
 print("=" * 80, flush=True)
+logger.info("=" * 80)
+logger.info("🚀 BOT STARTED - FIXED VERSION v2.0")
+logger.info("=" * 80)
+logger.info(f"📅 Start Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+logger.info(f"💰 Notional: ${NOTIONAL} | Leverage: {LEVERAGE}x")
+logger.info(f"📊 FR Threshold: {FR_ADVANTAGE_THRESHOLD}% | Min Spread: {MIN_SPREAD_THRESHOLD}%")
+logger.info(f"🎯 Case1: {CASE1_MIN_SPREAD}% | Case2: {CASE2_MULT}x | Case3: {CASE3_MULT}x")
+logger.info(f"📡 Dry Run: {DRY_RUN}")
+logger.info("=" * 80)
 
 def timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2624,47 +2633,83 @@ def get_total_futures_balance():
 
 # Execute pair trade with pre/post balance snapshots and retained finalize behavior
 def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
-    ku_api = eval_info.get('ku_api_sym')
-    plan = eval_info.get('plan')
-    entry_case = eval_info.get('case')
-    bin_bid = eval_info.get('bin_bid'); bin_ask = eval_info.get('bin_ask'); kc_bid = eval_info.get('kc_bid'); kc_ask = eval_info.get('kc_ask')
-    kc_ccxt = resolve_kucoin_trade_symbol(kucoin, ku_api)
-    if not kc_ccxt:
-        logger.warning("Failed to resolve KuCoin CCXT symbol for %s api=%s", sym, ku_api)
+    try:
+        logger.info(f"=" * 80)
+        logger.info(f"🎯 [ENTRY_START] Starting execution for {sym}")
+        logger.info(f"=" * 80)
+        print(f"\n{'=' * 80}\n🎯 EXECUTING TRADE FOR {sym}\n{'=' * 80}", flush=True)
+        
+        ku_api = eval_info.get('ku_api_sym')
+        plan = eval_info.get('plan')
+        entry_case = eval_info.get('case')
+        bin_bid = eval_info.get('bin_bid'); bin_ask = eval_info.get('bin_ask'); kc_bid = eval_info.get('kc_bid'); kc_ask = eval_info.get('kc_ask')
+        
+        logger.info(f"📋 [ENTRY_START] Symbol={sym} Plan={plan} Case={entry_case}")
+        logger.info(f"📋 [ENTRY_START] Prices: Binance bid={bin_bid} ask={bin_ask} | KuCoin bid={kc_bid} ask={kc_ask}")
+        
+        kc_ccxt = resolve_kucoin_trade_symbol(kucoin, ku_api)
+        if not kc_ccxt:
+            logger.error(f"❌ [ENTRY_START] Failed to resolve KuCoin symbol for {sym} (api={ku_api})")
+            return False
+        
+        logger.info(f"✅ [ENTRY_START] KuCoin symbol resolved: {ku_api} -> {kc_ccxt}")
+        
+        # Pre-trade balance snapshot
+        logger.info(f"💰 [ENTRY_STEP_0] Fetching pre-trade balances...")
+        total_pre, bin_pre, kc_pre = get_total_futures_balance()
+        msg_pre = f"*PRE-TRADE BALANCE* — `{sym}`\nTotal: `${total_pre:.2f}` (Binance: `${bin_pre:.2f}` | KuCoin: `${kc_pre:.2f}`)\n{timestamp()}"
+        logger.info(f"✅ [ENTRY_STEP_0] PRE-TRADE: Total=${total_pre:.2f} Binance=${bin_pre:.2f} KuCoin=${kc_pre:.2f}")
+        send_telegram(msg_pre)
+        
+    except Exception as e:
+        logger.exception(f"❌ [ENTRY_START] CRITICAL ERROR in execution setup for {sym}: {e}")
+        print(f"❌ CRITICAL ERROR: {e}", flush=True)
         return False
-    # Pre-trade balance snapshot
-    total_pre, bin_pre, kc_pre = get_total_futures_balance()
-    msg_pre = f"*PRE-TRADE BALANCE* — `{sym}`\nTotal: `${total_pre:.2f}` (Binance: `${bin_pre:.2f}` | KuCoin: `${kc_pre:.2f}`)\n{timestamp()}"
-    logger.info("PRE-TRADE: Total=%s Binance=%s KuCoin=%s", total_pre, bin_pre, kc_pre)
-    send_telegram(msg_pre)
     # set leverage
+    logger.info(f"🔧 [ENTRY_STEP_1] Setting leverage {LEVERAGE}x for {sym} on both exchanges")
+    print(f"🔧 Setting leverage {LEVERAGE}x for {sym}...", flush=True)
     try:
         set_leverage_for_symbol(binance, sym)
         set_leverage_for_symbol(kucoin, kc_ccxt)
-    except Exception:
+        logger.info(f"✅ [ENTRY_STEP_1] Leverage set successfully")
+    except Exception as e:
+        logger.error(f"⚠️  [ENTRY_STEP_1] Leverage setting failed: {e}")
         pass
     # prepare notionals
     # choose price depending on plan for match_base exposure
+    logger.info(f"🧮 [ENTRY_STEP_2] Calculating notional amounts for plan={plan}")
+    print(f"🧮 Calculating order sizes for {sym}...", flush=True)
     if plan == ('binance','kucoin'):
+        logger.info(f"📊 [ENTRY_STEP_2] Plan: LONG Binance @ {bin_ask}, SHORT KuCoin @ {kc_bid}")
         notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL * initial_multiplier, bin_ask, kc_bid)
+        logger.info(f"✅ [ENTRY_STEP_2] Notionals: Binance=${notional_bin:.4f} KuCoin=${notional_kc:.4f}")
         results = {}
-        trigger_time = datetime.now(datetime.UTC)
+        trigger_time = datetime.now(timezone.utc)  # FIXED: Changed from datetime.UTC to timezone.utc
         def exec_kc(): results['kc'] = safe_create_order(kucoin, 'sell', notional_kc, kc_bid, kc_ccxt, trigger_time=trigger_time, trigger_price=kc_bid)
         def exec_bin(): results['bin'] = safe_create_order(binance, 'buy', notional_bin, bin_ask, sym, trigger_time=trigger_time, trigger_price=bin_ask)
     else:
+        logger.info(f"📊 [ENTRY_STEP_2] Plan: SHORT Binance @ {bin_bid}, LONG KuCoin @ {kc_ask}")
         notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL * initial_multiplier, bin_bid, kc_ask)
+        logger.info(f"✅ [ENTRY_STEP_2] Notionals: Binance=${notional_bin:.4f} KuCoin=${notional_kc:.4f}")
         results = {}
-        trigger_time = datetime.now(datetime.UTC)
+        trigger_time = datetime.now(timezone.utc)  # FIXED: Changed from datetime.UTC to timezone.utc
         def exec_kc(): results['kc'] = safe_create_order(kucoin, 'buy', notional_kc, kc_ask, kc_ccxt, trigger_time=trigger_time, trigger_price=kc_ask)
         def exec_bin(): results['bin'] = safe_create_order(binance, 'sell', notional_bin, bin_bid, sym, trigger_time=trigger_time, trigger_price=bin_bid)
     # Execute orders in parallel
+    logger.info(f"🚀 [ENTRY_STEP_3] EXECUTING ORDERS IN PARALLEL for {sym}")
+    print(f"🚀 Placing orders for {sym}...", flush=True)
     t1 = threading.Thread(target=exec_kc)
     t2 = threading.Thread(target=exec_bin)
     t1.start(); t2.start(); t1.join(); t2.join()
+    logger.info(f"✅ [ENTRY_STEP_3] Order threads completed, checking results...")
     ok_kc, exec_price_kc, exec_time_kc, exec_qty_kc = results.get('kc', (False, None, None, None))
     ok_bin, exec_price_bin, exec_time_bin, exec_qty_bin = results.get('bin', (False, None, None, None))
+    logger.info(f"📊 [ENTRY_STEP_3] KuCoin: ok={ok_kc} price={exec_price_kc} qty={exec_qty_kc}")
+    logger.info(f"📊 [ENTRY_STEP_3] Binance: ok={ok_bin} price={exec_price_bin} qty={exec_qty_bin}")
+    print(f"📊 KuCoin: {'✅' if ok_kc else '❌'} | Binance: {'✅' if ok_bin else '❌'}", flush=True)
     if not (ok_kc and ok_bin and exec_price_kc is not None and exec_price_bin is not None):
-        logger.info("Partial/failed execution for %s - closing partials", sym)
+        logger.error(f"❌ [ENTRY_STEP_3] PARTIAL/FAILED EXECUTION for {sym} - closing partials")
+        print(f"❌ Execution failed for {sym}, closing partials...", flush=True)
         close_all_and_wait()
         confirm_counts[sym] = 0
         return False
@@ -2683,8 +2728,9 @@ def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
         expected_kc_qty = exec_qty_kc if exec_qty_kc else 0
     
     # Wait briefly for exchange to process market orders
-    logger.info(f"[ORDER_EXEC] Waiting 2 seconds for exchange settlement...")
-    time.sleep(2.0)
+    logger.info(f"[ORDER_EXEC] Waiting 12 seconds for exchange settlement...")
+    print(f"⏱️  Waiting 12 seconds for position settlement...", flush=True)
+    time.sleep(12.0)  # CHANGED: Increased from 2.0s to 12.0s for more reliable position verification
     
     # Verify positions
     success_verify, actual_bin, actual_kc, error_msg, is_rate_limit = verify_positions_after_order(
@@ -3153,8 +3199,9 @@ def attempt_averaging_if_needed():
             logger.info(f"[AVERAGING] Expected cumulative positions: Binance {expected_bin_qty}, KuCoin {expected_kc_qty}")
             
             # Wait briefly for exchange to process market orders
-            logger.info(f"[AVERAGING] Waiting 2 seconds for exchange settlement...")
-            time.sleep(2.0)
+            logger.info(f"[AVERAGING] Waiting 12 seconds for exchange settlement...")
+            print(f"⏱️  Waiting 12 seconds for averaging settlement...", flush=True)
+            time.sleep(12.0)  # CHANGED: Increased from 2.0s to 12.0s for more reliable position verification
             
             # Verify positions
             success_verify, actual_bin, actual_kc, error_msg, is_rate_limit = verify_positions_after_order(
@@ -4179,7 +4226,14 @@ try:
                 
                 logger.info(f"🚀 Executing big spread entry for {sym} with 2x notional")
                 print(f"🚀 Executing big spread entry: {sym}", flush=True)
-                execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=BIG_SPREAD_ENTRY_MULTIPLIER)
+                try:
+                    logger.info(f"🎯 [BIG_SPREAD] Calling execute_pair_trade_with_snapshots for {sym}")
+                    ok = execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=BIG_SPREAD_ENTRY_MULTIPLIER)
+                    logger.info(f"{'✅' if ok else '❌'} [BIG_SPREAD] Execution result for {sym}: {ok}")
+                except Exception as e:
+                    logger.exception(f"❌ [BIG_SPREAD] CRITICAL ERROR during big spread execution of {sym}: {e}")
+                    print(f"❌ BIG SPREAD ERROR for {sym}: {e}", flush=True)
+                    send_telegram(f"🚨 *BIG SPREAD ERROR*\nSymbol: `{sym}`\nError: `{str(e)[:200]}`\nBot continues scanning\n{timestamp()}")
                 time.sleep(1)
                 continue
             
@@ -4211,7 +4265,15 @@ try:
                         continue
                     print(f"🚀 EXECUTING TRADE: {sym}", flush=True)
                     # execute with pre/post snapshots
-                    ok = execute_pair_trade_with_snapshots(sym, eval_info_refresh, initial_multiplier=1)
+                    try:
+                        logger.info(f"🎯 [MAIN_LOOP] Calling execute_pair_trade_with_snapshots for {sym}")
+                        ok = execute_pair_trade_with_snapshots(sym, eval_info_refresh, initial_multiplier=1)
+                        logger.info(f"{'✅' if ok else '❌'} [MAIN_LOOP] Execution result for {sym}: {ok}")
+                    except Exception as e:
+                        logger.exception(f"❌ [MAIN_LOOP] CRITICAL ERROR during execution of {sym}: {e}")
+                        print(f"❌ CRITICAL ERROR during {sym} execution: {e}", flush=True)
+                        send_telegram(f"🚨 *CRITICAL ERROR*\nSymbol: `{sym}`\nError: `{str(e)[:200]}`\nBot continues scanning\n{timestamp()}")
+                        ok = False
                     confirm_counts[sym] = 0
                     if ok:
                         print(f"✅ Trade executed successfully for {sym}", flush=True)
@@ -4391,11 +4453,35 @@ try:
             
             # Otherwise: maintenance threads handle averaging/TP; main loop sleeps
             pass
+        
+        # Heartbeat logging every 60 iterations (roughly every minute)
+        loop_iteration_count = globals().get('loop_iteration_count', 0) + 1
+        globals()['loop_iteration_count'] = loop_iteration_count
+        if loop_iteration_count % 60 == 0:
+            logger.info(f"💓 HEARTBEAT: Bot alive, iteration {loop_iteration_count}, active_trade={bool(active_trade)}")
+            print(f"💓 Heartbeat: iteration {loop_iteration_count}", flush=True)
+        
         time.sleep(1)
 except KeyboardInterrupt:
+    logger.info("🛑 KeyboardInterrupt received, closing positions...")
+    print("🛑 Shutting down...", flush=True)
+    try:
+        close_all_and_wait()
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
+except Exception as e:
+    logger.exception("❌ UNHANDLED EXCEPTION AT TOP LEVEL")
+    print(f"❌ FATAL ERROR: {e}", flush=True)
+    send_telegram(f"🚨 *BOT CRASHED*\nError: `{str(e)[:200]}`\nCheck logs immediately\n{timestamp()}")
+    # Try to close positions before exiting
     try:
         close_all_and_wait()
     except Exception:
         pass
-except Exception:
-    logger.exception("Unhandled exception at top level")
+finally:
+    logger.info("=" * 80)
+    logger.info("🏁 BOT TERMINATED")
+    logger.info("=" * 80)
+    print("=" * 80, flush=True)
+    print("🏁 BOT TERMINATED", flush=True)
+    print("=" * 80, flush=True)
