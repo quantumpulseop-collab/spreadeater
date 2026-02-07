@@ -8,7 +8,7 @@ import time
 import math
 import requests
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import ccxt
 import logging
