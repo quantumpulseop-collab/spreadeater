@@ -147,10 +147,10 @@ logger.addHandler(ch2)
 
 # Print to verify logging works
 print("=" * 80, flush=True)
-print("🚀 LOGGING INITIALIZED - FIXED VERSION v2.0", flush=True)
+print("🚀 LOGGING INITIALIZED - FIXED VERSION v2.1 (FUNDING FEE FIX)", flush=True)
 print("=" * 80, flush=True)
 logger.info("=" * 80)
-logger.info("🚀 BOT STARTED - FIXED VERSION v2.0")
+logger.info("🚀 BOT STARTED - FIXED VERSION v2.1 (FUNDING FEE FIX)")
 logger.info("=" * 80)
 logger.info(f"📅 Start Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
 logger.info(f"💰 Notional: ${NOTIONAL} | Leverage: {LEVERAGE}x")
@@ -470,21 +470,32 @@ def fetch_kucoin_funding(symbol, max_retries=2):
 # NEW: Functions to fetch ACTUAL funding fee history (real paid/received amounts)
 def fetch_binance_funding_history(symbol, start_time_ms, end_time_ms=None):
     """
-    Fetch actual funding fees paid/received from Binance.
+    FIXED: Fetch actual funding fees paid/received from Binance.
     Returns list of funding fee entries with timestamp and amount in USD.
     
+    CRITICAL FIX: Ensure timestamp filtering doesn't get confused with KuCoin timestamps
+    
     API: GET /fapi/v1/income (incomeType=FUNDING_FEE)
+    
+    NOTE: Binance returns income values where:
+    - Positive values = funding RECEIVED (credited to your account)
+    - Negative values = funding PAID (debited from your account)
     """
     try:
         if end_time_ms is None:
             end_time_ms = int(time.time() * 1000)
         
+        # FIXED: Log the timestamp range we're querying (for debugging)
+        start_dt = datetime.fromtimestamp(start_time_ms / 1000.0).isoformat()
+        end_dt = datetime.fromtimestamp(end_time_ms / 1000.0).isoformat()
+        logger.debug(f"🔍 Fetching Binance funding history for {symbol} from {start_dt} to {end_dt}")
+        
         # Binance requires authenticated request
         params = {
             'symbol': symbol,
             'incomeType': 'FUNDING_FEE',
-            'startTime': start_time_ms,
-            'endTime': end_time_ms,
+            'startTime': int(start_time_ms),  # FIXED: Ensure integer
+            'endTime': int(end_time_ms),      # FIXED: Ensure integer
             'limit': 1000
         }
         
@@ -493,35 +504,59 @@ def fetch_binance_funding_history(symbol, start_time_ms, end_time_ms=None):
         
         funding_fees = []
         for entry in response:
+            # FIXED: Validate timestamp is within our range (防止混淆)
+            entry_timestamp = int(entry['time'])
+            if entry_timestamp < start_time_ms:
+                logger.debug(f"  ⏭️  Skipping Binance entry before start time: {entry_timestamp} < {start_time_ms}")
+                continue
+            if entry_timestamp > end_time_ms:
+                logger.debug(f"  ⏭️  Skipping Binance entry after end time: {entry_timestamp} > {end_time_ms}")
+                continue
+                
             funding_fees.append({
-                'timestamp': entry['time'],
+                'timestamp': entry_timestamp,
                 'symbol': entry['symbol'],
                 'income': float(entry['income']),  # USD amount (positive = received, negative = paid)
                 'asset': entry['asset']
             })
         
-        logger.debug(f"✓ Fetched {len(funding_fees)} Binance funding fee entries for {symbol}")
+        logger.info(f"✅ Binance: Fetched {len(funding_fees)} funding fee entries for {symbol} (range: {start_dt} to {end_dt})")
+        if funding_fees:
+            total_binance = sum(f['income'] for f in funding_fees)
+            logger.info(f"  → Total Binance funding: ${total_binance:+.4f} ({'RECEIVED' if total_binance > 0 else 'PAID'})")
+        
         return funding_fees
         
     except Exception as e:
-        logger.warning(f"Error fetching Binance funding history for {symbol}: {e}")
+        logger.warning(f"❌ Error fetching Binance funding history for {symbol}: {e}")
         return []
 
 def fetch_kucoin_funding_history(symbol, start_time_ms, end_time_ms=None):
     """
-    Fetch actual funding fees paid/received from KuCoin.
+    FIXED: Fetch actual funding fees paid/received from KuCoin.
     Returns list of funding fee entries with timestamp and amount in USD.
     
+    CRITICAL FIX: Ensure timestamp filtering is independent from Binance
+    
     API: GET /api/v1/funding-history (for futures)
+    
+    NOTE: KuCoin returns funding values where:
+    - Positive values = funding RECEIVED (credited to your account)
+    - Negative values = funding PAID (debited from your account)
     """
     try:
         if end_time_ms is None:
             end_time_ms = int(time.time() * 1000)
         
+        # FIXED: Log the timestamp range we're querying (for debugging)
+        start_dt = datetime.fromtimestamp(start_time_ms / 1000.0).isoformat()
+        end_dt = datetime.fromtimestamp(end_time_ms / 1000.0).isoformat()
+        logger.debug(f"🔍 Fetching KuCoin funding history for {symbol} from {start_dt} to {end_dt}")
+        
         params = {
             'symbol': symbol,
-            'startAt': start_time_ms,
-            'endAt': end_time_ms
+            'startAt': int(start_time_ms),  # FIXED: Ensure integer
+            'endAt': int(end_time_ms)       # FIXED: Ensure integer
         }
         
         # Use CCXT to make authenticated request
@@ -532,17 +567,30 @@ def fetch_kucoin_funding_history(symbol, start_time_ms, end_time_ms=None):
         if response.get('code') == '200000' and response.get('data'):
             data_list = response['data'].get('dataList', [])
             for entry in data_list:
+                # FIXED: Validate timestamp is within our range (防止混淆)
+                entry_timestamp = int(entry['timePoint'])
+                if entry_timestamp < start_time_ms:
+                    logger.debug(f"  ⏭️  Skipping KuCoin entry before start time: {entry_timestamp} < {start_time_ms}")
+                    continue
+                if entry_timestamp > end_time_ms:
+                    logger.debug(f"  ⏭️  Skipping KuCoin entry after end time: {entry_timestamp} > {end_time_ms}")
+                    continue
+                    
                 funding_fees.append({
-                    'timestamp': entry['timePoint'],
+                    'timestamp': entry_timestamp,
                     'symbol': entry['symbol'],
                     'income': float(entry['funding']),  # USD amount (positive = received, negative = paid)
                 })
         
-        logger.debug(f"✓ Fetched {len(funding_fees)} KuCoin funding fee entries for {symbol}")
+        logger.info(f"✅ KuCoin: Fetched {len(funding_fees)} funding fee entries for {symbol} (range: {start_dt} to {end_dt})")
+        if funding_fees:
+            total_kucoin = sum(f['income'] for f in funding_fees)
+            logger.info(f"  → Total KuCoin funding: ${total_kucoin:+.4f} ({'RECEIVED' if total_kucoin > 0 else 'PAID'})")
+        
         return funding_fees
         
     except Exception as e:
-        logger.warning(f"Error fetching KuCoin funding history for {symbol}: {e}")
+        logger.warning(f"❌ Error fetching KuCoin funding history for {symbol}: {e}")
         return []
 
 def get_total_funding_fees_since_entry(symbol, ku_api_symbol, entry_timestamp_ms):
@@ -552,7 +600,11 @@ def get_total_funding_fees_since_entry(symbol, ku_api_symbol, entry_timestamp_ms
     FIXED: Now tracks individual funding events by timestamp to prevent double counting.
     Only processes NEW funding events that haven't been seen before.
     
-    Returns net funding amount in USD (positive = we paid, negative = we received).
+    CRITICAL FIX: Ensures Binance and KuCoin timestamp tracking are completely independent.
+    
+    Returns net funding amount in USD:
+    - Positive net_fees_usd = we RECEIVED funding (money came IN)
+    - Negative net_fees_usd = we PAID funding (money went OUT)
     
     Args:
         symbol: Binance symbol (e.g., 'BTCUSDT')
@@ -565,15 +617,19 @@ def get_total_funding_fees_since_entry(symbol, ku_api_symbol, entry_timestamp_ms
     try:
         current_time_ms = int(time.time() * 1000)
         
-        # Fetch funding history from both exchanges
+        logger.debug(f"📊 FUNDING CHECK START for {symbol}/{ku_api_symbol}")
+        logger.debug(f"  Entry time: {datetime.fromtimestamp(entry_timestamp_ms/1000.0).isoformat()}")
+        logger.debug(f"  Current time: {datetime.fromtimestamp(current_time_ms/1000.0).isoformat()}")
+        
+        # Fetch funding history from both exchanges (INDEPENDENT calls with SEPARATE timestamp ranges)
         binance_history = fetch_binance_funding_history(symbol, entry_timestamp_ms, current_time_ms)
         kucoin_history = fetch_kucoin_funding_history(ku_api_symbol, entry_timestamp_ms, current_time_ms)
         
-        # Get previously seen timestamps from active_trade
-        seen_binance_timestamps = active_trade.get('seen_binance_funding_timestamps', set())
-        seen_kucoin_timestamps = active_trade.get('seen_kucoin_funding_timestamps', set())
-        binance_events = active_trade.get('binance_funding_events', [])
-        kucoin_events = active_trade.get('kucoin_funding_events', [])
+        # Get previously seen timestamps from active_trade (SEPARATE tracking for each exchange)
+        seen_binance_timestamps = active_trade.get('seen_binance_funding_timestamps', set()).copy()
+        seen_kucoin_timestamps = active_trade.get('seen_kucoin_funding_timestamps', set()).copy()
+        binance_events = active_trade.get('binance_funding_events', []).copy()
+        kucoin_events = active_trade.get('kucoin_funding_events', []).copy()
         
         # Process NEW Binance funding events only
         new_binance_events = 0
@@ -590,7 +646,7 @@ def get_total_funding_fees_since_entry(symbol, ku_api_symbol, entry_timestamp_ms
                     'datetime': datetime.fromtimestamp(timestamp / 1000.0).isoformat()
                 })
                 new_binance_events += 1
-                logger.info(f"  ✓ NEW Binance funding event at {datetime.fromtimestamp(timestamp / 1000.0)}: ${income:+.4f}")
+                logger.info(f"  ✅ NEW Binance funding event at {datetime.fromtimestamp(timestamp / 1000.0)}: ${income:+.4f} ({'RECEIVED' if income > 0 else 'PAID'})")
         
         # Process NEW KuCoin funding events only
         new_kucoin_events = 0
@@ -607,7 +663,7 @@ def get_total_funding_fees_since_entry(symbol, ku_api_symbol, entry_timestamp_ms
                     'datetime': datetime.fromtimestamp(timestamp / 1000.0).isoformat()
                 })
                 new_kucoin_events += 1
-                logger.info(f"  ✓ NEW KuCoin funding event at {datetime.fromtimestamp(timestamp / 1000.0)}: ${income:+.4f}")
+                logger.info(f"  ✅ NEW KuCoin funding event at {datetime.fromtimestamp(timestamp / 1000.0)}: ${income:+.4f} ({'RECEIVED' if income > 0 else 'PAID'})")
         
         # Calculate total fees from ALL tracked events (not just new ones)
         binance_fees_total = sum(evt['amount'] for evt in binance_events)
@@ -620,9 +676,10 @@ def get_total_funding_fees_since_entry(symbol, ku_api_symbol, entry_timestamp_ms
         active_trade['binance_funding_events'] = binance_events
         active_trade['kucoin_funding_events'] = kucoin_events
         
-        logger.info(f"Funding summary | Binance: {len(binance_events)} events (${binance_fees_total:+.4f}) | "
+        logger.info(f"📊 FUNDING SUMMARY | Binance: {len(binance_events)} events (${binance_fees_total:+.4f}) | "
                    f"KuCoin: {len(kucoin_events)} events (${kucoin_fees_total:+.4f}) | "
-                   f"Net: ${net_fees_usd:+.4f} | New events: {new_binance_events + new_kucoin_events}")
+                   f"Net: ${net_fees_usd:+.4f} ({'RECEIVED' if net_fees_usd > 0 else 'PAID'}) | "
+                   f"New events: {new_binance_events + new_kucoin_events}")
         
         return {
             'binance_fees_usd': binance_fees_total,
@@ -635,7 +692,7 @@ def get_total_funding_fees_since_entry(symbol, ku_api_symbol, entry_timestamp_ms
         }
         
     except Exception as e:
-        logger.exception(f"Error calculating total funding fees: {e}")
+        logger.exception(f"❌ Error calculating total funding fees: {e}")
         return {
             'binance_fees_usd': 0.0,
             'kucoin_fees_usd': 0.0,
@@ -3390,7 +3447,10 @@ def check_take_profit_or_close_conditions():
             should_exit = True
             exit_reason = f"TAKE PROFIT (convergence={spread_convergence:.4f}% >= target={target_convergence_pct:.4f}%)"
         else:
-            # PURE USD COMPARISON: Compare expenses (USD) vs profit target (USD)
+            # SIMPLIFIED LOGIC: Check if total expenses exceed target
+            # NOTE: Entry fees (0.4%) are ALWAYS less than profit target (min 0.9% from 1.8% spread)
+            # Therefore, if expenses > target, it MUST be because we've PAID funding
+            # (Receiving funding would DECREASE expenses, keeping them below target)
             if accumulated_expenses_usd > target_profit_usd:
                 # CRITICAL: Check if spread is still > 1.5x entry (wide enough for averaging)
                 # If spread > 1.5x entry, DON'T close - averaging might be triggered
@@ -3404,22 +3464,12 @@ def check_take_profit_or_close_conditions():
                                accumulated_expenses_usd, target_profit_usd, current_spread, spread_ratio, avg_entry_spread)
                 else:
                     # Spread has narrowed (< 1.5x entry) and expenses exceed target
-                    # Close position - no more averaging opportunity and expenses too high
+                    # This means we've paid too much funding - close for safety
+                    funding_paid = abs(active_trade.get('funding_accumulated_usd', 0.0))
                     should_exit = True
-                    exit_reason = f"EXPENSE LIMIT (expenses=${accumulated_expenses_usd:.4f} > target=${target_profit_usd:.4f}, spread={current_spread:.4f}% = {spread_ratio:.2f}x entry)"
-                    logger.warning("CLOSING DUE TO EXPENSES: expenses=$%.4f > target=$%.4f | current_spread=%.4f%% (%.2fx entry %.4f%%) - spread too narrow for averaging", 
-                                 accumulated_expenses_usd, target_profit_usd, current_spread, spread_ratio, avg_entry_spread)
-            else:
-                # Also check funding accumulation as backup (in USD)
-                funding_acc_usd = active_trade.get('funding_accumulated_usd', 0.0)
-                
-                # Only close if NET PAID funding exceeds target
-                if funding_acc_usd > 0 and funding_acc_usd > target_profit_usd:
-                    # Check spread ratio - only close if spread < 1.5x entry (no averaging opportunity)
-                    spread_ratio = abs(current_spread) / abs(avg_entry_spread) if avg_entry_spread != 0 else 0
-                    if spread_ratio <= 1.5:
-                        should_exit = True
-                        exit_reason = f"FUNDING LOSS (net paid=${funding_acc_usd:.4f} > target=${target_profit_usd:.4f}, spread={spread_ratio:.2f}x entry)"
+                    exit_reason = f"EXPENSE LIMIT (expenses=${accumulated_expenses_usd:.4f} > target=${target_profit_usd:.4f}, paid_funding=${funding_paid:.4f}, spread={current_spread:.4f}% = {spread_ratio:.2f}x entry)"
+                    logger.warning("CLOSING DUE TO EXPENSES: expenses=$%.4f > target=$%.4f (paid funding=$%.4f) | current_spread=%.4f%% (%.2fx entry %.4f%%) - spread too narrow for averaging", 
+                                 accumulated_expenses_usd, target_profit_usd, funding_paid, current_spread, spread_ratio, avg_entry_spread)
     
     # NEW: 3-confirmation logic for exit
     if should_exit:
@@ -3722,8 +3772,14 @@ def funding_round_accounting_loop():
             kucoin_entry_fees = (TRADING_FEE_PCT_PER_EXCHANGE / 100.0) * kc_notional
             total_entry_fees_usd = binance_entry_fees + kucoin_entry_fees
             
-            # New accumulated expenses = entry fees + cumulative funding (all deduplicated)
-            new_accumulated_expenses_usd = total_entry_fees_usd + net_fees_usd
+            # CRITICAL FIX: Calculate accumulated expenses correctly
+            # Exchange APIs return funding income where:
+            #   - NEGATIVE income = you PAID funding (should INCREASE expenses)
+            #   - POSITIVE income = you RECEIVED funding (should DECREASE expenses)
+            # Therefore, we SUBTRACT net_fees_usd to get the correct sign:
+            #   - If net_fees_usd is -0.0617 (paid), subtracting gives +0.0617 (increases expenses) ✓
+            #   - If net_fees_usd is +0.0617 (received), subtracting gives -0.0617 (decreases expenses) ✓
+            new_accumulated_expenses_usd = total_entry_fees_usd - net_fees_usd
             
             # Calculate change since last check
             old_expenses = active_trade.get('accumulated_expenses_usd', total_entry_fees_usd)
@@ -3734,13 +3790,14 @@ def funding_round_accounting_loop():
             active_trade['funding_accumulated_usd'] = net_fees_usd  # Store funding portion separately
             active_trade['last_funding_check_ms'] = current_time_ms
             
-            # FIXED: Determine status (negative = paid/debit, positive = received/credit)
-            # When net_fees_usd is NEGATIVE (like -0.0617), money LEFT your account = PAID
-            # When net_fees_usd is POSITIVE (like +0.0617), money ENTERED your account = RECEIVED
+            # FIXED: Determine status based on exchange income convention
+            # Exchange APIs return funding income where:
+            #   - NEGATIVE income = you PAID funding (money LEFT your account)
+            #   - POSITIVE income = you RECEIVED funding (money ENTERED your account)
             if net_fees_usd > 0:
-                funding_status = "RECEIVED"  # Positive = credit to account
+                funding_status = "RECEIVED"  # Positive income = credit to account
             elif net_fees_usd < 0:
-                funding_status = "PAID"  # Negative = debit from account
+                funding_status = "PAID"  # Negative income = debit from account
             else:
                 funding_status = "NEUTRAL"
             
