@@ -1019,36 +1019,82 @@ def _get_signed_from_binance_pos(pos):
     return float(magnitude or 0.0)
 
 def _get_signed_from_kucoin_pos(pos):
+    """
+    CRITICAL FIX: Properly handles contract_size when reading KuCoin positions
+    Priority: currentQty > contracts×contract_size > fallback
+    
+    KuCoin API may return:
+    - currentQty: Actual quantity (e.g., 160)
+    - contracts: Number of contracts (e.g., 16)
+    - contractSize: Size per contract (e.g., 10)
+    
+    We need to read currentQty first, or calculate from contracts × contractSize
+    """
     info = pos.get('info') or {}
-    for fld in ('currentQty',):
-        v = info.get(fld)
-        if v not in (None, ''):
+    
+    # STEP 1: Try to get actual quantity directly from multiple possible fields
+    # These fields contain the ACTUAL quantity (not contracts)
+    for fld in ('currentQty', 'qty', 'positionAmt', 'amount'):
+        v = info.get(fld) or pos.get(fld)
+        if v not in (None, '', '0', 0):  # Skip None, empty string, "0", or 0
             try:
-                return float(v)
+                qty = float(v)
+                if abs(qty) > 0.0001:  # Non-zero position
+                    # Already has correct sign from API
+                    return qty
             except Exception:
                 try:
-                    return float(str(v).replace(',', ''))
+                    qty = float(str(v).replace(',', ''))
+                    if abs(qty) > 0.0001:
+                        return qty
                 except Exception:
                     pass
-    magnitude = 0.0
-    for k in ('contracts', 'size', 'positionAmt', 'amount'):
+    
+    # STEP 2: Fallback - calculate from contracts × contract_size
+    # This is needed when currentQty is not available or is zero
+    contracts = None
+    for k in ('contracts', 'size'):
         v = pos.get(k) or info.get(k)
-        if v not in (None, ''):
+        if v not in (None, '', '0', 0):
             try:
-                magnitude = float(v)
-                break
+                contracts = float(v)
+                if abs(contracts) > 0.0001:
+                    break
             except Exception:
                 pass
-    side_field = ''
-    for candidate in (pos.get('side'), info.get('side'), info.get('positionSide'), info.get('type')):
-        if candidate:
-            side_field = str(candidate).lower()
-            break
-    if side_field in ('short', 'sell', 'shortside'):
-        return -abs(magnitude)
-    if side_field in ('long', 'buy'):
-        return abs(magnitude)
-    return float(magnitude or 0.0)
+    
+    if contracts is not None and abs(contracts) > 0.0001:
+        # Get contract size from multiple possible field names
+        contract_size = 1.0
+        for k in ('contractSize', 'contract_size', 'multiplier'):
+            cs = info.get(k) or pos.get(k)
+            if cs not in (None, '', '0', 0):
+                try:
+                    contract_size = float(cs)
+                    break
+                except Exception:
+                    pass
+        
+        # Calculate actual quantity: contracts × contract_size
+        magnitude = abs(contracts) * contract_size
+        
+        # Apply sign based on side
+        side_field = ''
+        for candidate in (pos.get('side'), info.get('side'), info.get('positionSide'), info.get('type')):
+            if candidate:
+                side_field = str(candidate).lower()
+                break
+        
+        if side_field in ('short', 'sell', 'shortside'):
+            return -magnitude
+        elif side_field in ('long', 'buy', 'longside'):
+            return magnitude
+        else:
+            # Unknown side, return unsigned
+            return magnitude
+    
+    # No position found
+    return 0.0
 
 def _get_signed_position_amount(pos):
     try:
@@ -1897,17 +1943,19 @@ def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_s
     # STEP 1: Calculate target base quantity from desired USDT
     target_base_qty = desired_usdt / ref_price
     
-    # STEP 2: Calculate KuCoin contracts (round down to exchange precision)
+    # STEP 2: Calculate KuCoin contracts and FORCE integer rounding
     # KuCoin contracts are in bundles (e.g., 1 contract = 100 qty)
+    # CRITICAL FIX: Contracts must ALWAYS be whole numbers (integers)
     if kc_contract_size and kc_contract_size > 0:
         kc_contracts_float = target_base_qty / kc_contract_size
-        # Round down to KuCoin's precision
-        kc_contracts = round_down(kc_contracts_float, kc_prec) if kc_prec is not None else kc_contracts_float
+        # CRITICAL: Always round down to INTEGER (contracts cannot be fractional!)
+        kc_contracts = math.floor(kc_contracts_float)
     else:
         kc_contracts = round_down(target_base_qty, kc_prec) if kc_prec is not None else target_base_qty
     
-    # STEP 3: Calculate actual KuCoin quantity after rounding
+    # STEP 3: Calculate actual KuCoin quantity AFTER integer rounding
     # This is the TRUE quantity KuCoin will execute
+    # Now uses the ROUNDED contract count, not the float!
     kc_actual_qty = kc_contracts * kc_contract_size
     
     # STEP 4: Set Binance quantity to EXACTLY MATCH KuCoin's quantity
@@ -2890,17 +2938,22 @@ def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
             logger.warning(f"[ORDER_EXEC] Continuing with entry assuming orders filled correctly")
             send_telegram(f"*ENTRY WARNING* `{sym}`\n⚠️ Could not verify positions (rate limited)\nAssuming orders filled correctly\nMonitor positions manually\n{timestamp()}")
         else:
-            # Real mismatch error - close positions for safety
+            # Real mismatch error - close positions for safety AND STOP BOT
             logger.error(f"[ORDER_EXEC] ❌ POSITION VERIFICATION FAILED: {error_msg}")
             logger.error(f"[ORDER_EXEC] One or both entry orders may have been cancelled by the exchange")
             logger.error(f"[ORDER_EXEC] Closing all positions for safety")
-            send_telegram(f"*ENTRY FAILED* `{sym}`\n❌ Position verification failed\n{error_msg}\nOrders reported filled but positions don't match\nClosing for safety\n{timestamp()}")
+            logger.error(f"[ORDER_EXEC] 🛑 STOPPING BOT to prevent multiple retries and balance depletion")
+            send_telegram(f"*ENTRY FAILED* `{sym}`\n❌ Position verification failed\n{error_msg}\nOrders reported filled but positions don't match\nClosing for safety\n🛑 BOT STOPPED to prevent retries\nPlease investigate and restart manually\n{timestamp()}")
             try:
                 close_all_and_wait()
                 reset_active_trade()
             except Exception as e:
                 logger.exception(f"Error closing positions after entry verification failure: {e}")
             confirm_counts[sym] = 0
+            # CRITICAL: Stop bot to prevent multiple retries that deplete balance
+            global terminate_bot
+            terminate_bot = True
+            logger.error(f"[ORDER_EXEC] 🛑 Bot terminated due to position verification failure")
             return False
     else:
         logger.info(f"[ORDER_EXEC] ✅ Position verification passed, finalizing entry...")
