@@ -82,6 +82,10 @@ TELEGRAM_CHAT_IDS = ["5054484162", "497819952"]
 # Live mode (per your request)
 DRY_RUN = False
 
+# EXCEPTION LIST: Coins to skip in scanning/trading (Binance format, e.g., "FLOWUSDT")
+# Add coin symbols here that you want to completely exclude from consideration
+EXCEPTION_LIST = []  # Example: ["FLOWUSDT", "BTCUSDT"] to skip these coins
+
 # Exchanges
 binance = ccxt.binance({
     'apiKey': os.getenv('BINANCE_API_KEY'),
@@ -239,6 +243,17 @@ def get_common_symbols():
     bin_set = {normalize(s) for s in bin_syms}
     ku_set = {normalize(s) for s in ku_syms}
     common = bin_set.intersection(ku_set)
+    
+    # FILTER OUT EXCEPTION LIST: Remove coins that user wants to skip
+    if EXCEPTION_LIST:
+        original_count = len(common)
+        # Normalize exception list symbols for matching
+        exceptions_normalized = {normalize(sym) for sym in EXCEPTION_LIST}
+        common = common - exceptions_normalized
+        filtered_count = original_count - len(common)
+        if filtered_count > 0:
+            logger.info(f"🚫 EXCEPTION LIST: Filtered out {filtered_count} symbols: {EXCEPTION_LIST}")
+    
     ku_map = {}
     dup_count = 0
     for s in ku_syms:
@@ -1831,12 +1846,28 @@ def safe_create_order(exchange, side, notional, price, symbol, trigger_time=None
         return False, None, None, None
 
 def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_symbol, desired_usdt, bin_price, kc_price):
+    """
+    CHANGED: Now matches QUANTITY instead of NOTIONAL for true spread capture.
+    
+    Strategy:
+    1. Calculate target quantity based on desired_usdt
+    2. Round KuCoin contracts first (they're in bundles, e.g., 1 contract = 100 qty)
+    3. Calculate exact Binance quantity to match KuCoin's actual quantity
+    4. This ensures SAME quantity on both exchanges for accurate spread capture
+    
+    Example:
+    - Target: 3068 qty
+    - KC: 30.6 contracts (but exchanges only allow 30 contracts = 3000 qty)
+    - BIN: Buy exactly 3000 qty to match KC
+    - Result: Perfect quantity match, true spread capture
+    """
     m_bin = get_market(bin_exchange, bin_symbol)
     m_kc = get_market(kc_exchange, kc_symbol)
     bin_prec = None
     kc_prec = None
     bin_contract_size = 1.0
     kc_contract_size = 1.0
+    
     try:
         if m_bin:
             prec = m_bin.get('precision')
@@ -1845,6 +1876,7 @@ def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_s
             bin_contract_size = float(m_bin.get('contractSize') or m_bin.get('info', {}).get('contractSize') or 1.0)
     except Exception:
         pass
+    
     try:
         if m_kc:
             prec = m_kc.get('precision')
@@ -1853,20 +1885,50 @@ def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_s
             kc_contract_size = float(m_kc.get('contractSize') or m_kc.get('info', {}).get('contractSize') or 1.0)
     except Exception:
         pass
+    
+    # Calculate reference price for target quantity calculation
     try:
         ref_price = (float(bin_price) + float(kc_price)) / 2.0
         if ref_price <= 0:
             ref_price = float(bin_price) or float(kc_price) or 1.0
     except Exception:
         ref_price = float(bin_price) or float(kc_price) or 1.0
-    target_base = desired_usdt / ref_price
-    bin_base_amount = round_down(target_base, bin_prec) if bin_prec is not None else target_base
+    
+    # STEP 1: Calculate target base quantity from desired USDT
+    target_base_qty = desired_usdt / ref_price
+    
+    # STEP 2: Calculate KuCoin contracts (round down to exchange precision)
+    # KuCoin contracts are in bundles (e.g., 1 contract = 100 qty)
     if kc_contract_size and kc_contract_size > 0:
-        kc_contracts = round_down(target_base / kc_contract_size, kc_prec) if kc_prec is not None else (target_base / kc_contract_size)
+        kc_contracts_float = target_base_qty / kc_contract_size
+        # Round down to KuCoin's precision
+        kc_contracts = round_down(kc_contracts_float, kc_prec) if kc_prec is not None else kc_contracts_float
     else:
-        kc_contracts = round_down(target_base, kc_prec) if kc_prec is not None else target_base
+        kc_contracts = round_down(target_base_qty, kc_prec) if kc_prec is not None else target_base_qty
+    
+    # STEP 3: Calculate actual KuCoin quantity after rounding
+    # This is the TRUE quantity KuCoin will execute
+    kc_actual_qty = kc_contracts * kc_contract_size
+    
+    # STEP 4: Set Binance quantity to EXACTLY MATCH KuCoin's quantity
+    # This ensures perfect quantity match for true spread capture
+    bin_base_amount = kc_actual_qty
+    
+    # CRITICAL: Also account for Binance contract size!
+    # Convert quantity to contracts, round, then back to quantity
+    if bin_contract_size and bin_contract_size > 0:
+        bin_contracts_float = bin_base_amount / bin_contract_size
+        bin_contracts = round_down(bin_contracts_float, bin_prec) if bin_prec is not None else bin_contracts_float
+        bin_base_amount = bin_contracts * bin_contract_size
+    else:
+        # If contract_size = 1.0, just round the quantity directly
+        bin_base_amount = round_down(bin_base_amount, bin_prec) if bin_prec is not None else bin_base_amount
+    
+    # Calculate implied notionals (for logging/verification purposes only)
     notional_bin = bin_base_amount * float(bin_price)
     notional_kc = kc_contracts * float(kc_contract_size) * float(kc_price)
+    
+    # Safety check: ensure minimum sizes
     if bin_base_amount <= 0:
         step_bin = (bin_contract_size * bin_price) if bin_contract_size and bin_price else (desired_usdt * 0.001)
         if bin_prec is not None:
@@ -1874,6 +1936,7 @@ def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_s
         else:
             bin_base_amount = step_bin / bin_price
         notional_bin = bin_base_amount * float(bin_price)
+    
     if kc_contracts <= 0:
         step_kc = (kc_contract_size * kc_price) if kc_contract_size and kc_price else (desired_usdt * 0.001)
         if kc_prec is not None:
@@ -1881,6 +1944,15 @@ def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_s
         else:
             kc_contracts = (step_kc / kc_contract_size) if kc_contract_size else step_kc
         notional_kc = kc_contracts * float(kc_contract_size) * float(kc_price)
+    
+    # Log the quantity matching with detailed contract size info
+    logger.info(f"💎 QTY MATCH | Symbol: {bin_symbol}/{kc_symbol}")
+    logger.info(f"💎 QTY MATCH | Contract sizes: Binance={bin_contract_size}, KuCoin={kc_contract_size}")
+    logger.info(f"💎 QTY MATCH | KuCoin: {kc_contracts:.4f} contracts × {kc_contract_size} = {kc_actual_qty:.2f} qty")
+    logger.info(f"💎 QTY MATCH | Binance: {bin_base_amount:.2f} qty (matched to KuCoin)")
+    logger.info(f"💎 QTY MATCH | Quantity match: {abs(bin_base_amount - kc_actual_qty) < 0.01} (diff: {abs(bin_base_amount - kc_actual_qty):.4f})")
+    logger.info(f"💎 QTY MATCH | Notionals: Binance=${notional_bin:.4f}, KuCoin=${notional_kc:.4f}")
+    
     return float(notional_bin), float(notional_kc), float(bin_base_amount), float(kc_contracts)
 
 def get_prices_for_symbol(sym, ku_api_sym):
@@ -2774,15 +2846,32 @@ def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
     # CRITICAL FIX: Verify positions actually changed as expected before finalizing
     logger.info(f"[ORDER_EXEC] Initial entry orders reported as executed, verifying actual positions...")
     
-    # Calculate expected positions based on plan
+    # CRITICAL FIX: Get contract sizes to convert contracts to quantities
+    try:
+        bin_market = get_market(binance, sym)
+        kc_market = get_market(kucoin, kc_ccxt)
+        bin_contract_size = float(bin_market.get('contractSize') or bin_market.get('info', {}).get('contractSize') or 1.0) if bin_market else 1.0
+        kc_contract_size = float(kc_market.get('contractSize') or kc_market.get('info', {}).get('contractSize') or 1.0) if kc_market else 1.0
+        
+        logger.info(f"[ORDER_EXEC] Contract sizes: Binance={bin_contract_size}, KuCoin={kc_contract_size}")
+        logger.info(f"[ORDER_EXEC] Executed contracts: Binance={exec_qty_bin}, KuCoin={exec_qty_kc}")
+    except Exception as e:
+        logger.error(f"[ORDER_EXEC] Failed to get contract sizes: {e}, defaulting to 1.0")
+        bin_contract_size = 1.0
+        kc_contract_size = 1.0
+    
+    # Calculate expected QUANTITIES (not contracts!) based on plan
+    # exec_qty_bin and exec_qty_kc are in CONTRACTS, need to multiply by contract_size for actual qty
     if plan == ('binance', 'kucoin'):
         # Long binance, short kucoin
-        expected_bin_qty = exec_qty_bin if exec_qty_bin else 0
-        expected_kc_qty = -exec_qty_kc if exec_qty_kc else 0  # Negative for short
+        expected_bin_qty = exec_qty_bin * bin_contract_size if exec_qty_bin else 0
+        expected_kc_qty = -(exec_qty_kc * kc_contract_size) if exec_qty_kc else 0  # Negative for short
     else:
         # Short binance, long kucoin
-        expected_bin_qty = -exec_qty_bin if exec_qty_bin else 0  # Negative for short
-        expected_kc_qty = exec_qty_kc if exec_qty_kc else 0
+        expected_bin_qty = -(exec_qty_bin * bin_contract_size) if exec_qty_bin else 0  # Negative for short
+        expected_kc_qty = exec_qty_kc * kc_contract_size if exec_qty_kc else 0
+    
+    logger.info(f"[ORDER_EXEC] Expected QUANTITIES (contracts × contract_size): Binance={expected_bin_qty:.2f}, KuCoin={expected_kc_qty:.2f}")
     
     # Wait briefly for exchange to process market orders
     logger.info(f"[ORDER_EXEC] Waiting 12 seconds for exchange settlement...")
@@ -2880,7 +2969,23 @@ def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, 
     active_trade['case'] = case
     active_trade['entry_spread'] = trigger_spread
     active_trade['avg_entry_spread'] = practical_entry_spread  # FIXED: Now preserves sign
-    active_trade['entry_prices'] = {'binance': {'price': exec_price_bin, 'qty': exec_qty_bin, 'implied': implied_bin_amt}, 'kucoin': {'price': exec_price_kc, 'qty': exec_qty_kc, 'implied': implied_kc_amt}}
+    
+    # CRITICAL FIX: Store SIGNED quantities in entry_prices for averaging calculations
+    # For plan ('binance', 'kucoin'): Binance is LONG (+), KuCoin is SHORT (-)
+    # For plan ('kucoin', 'binance'): Binance is SHORT (-), KuCoin is LONG (+)
+    if plan == ('binance', 'kucoin'):
+        # Long Binance, Short KuCoin
+        bin_signed_qty = float(exec_qty_bin)  # Positive for LONG
+        kc_signed_qty = -float(exec_qty_kc)  # Negative for SHORT
+    else:
+        # Short Binance, Long KuCoin
+        bin_signed_qty = -float(exec_qty_bin)  # Negative for SHORT
+        kc_signed_qty = float(exec_qty_kc)  # Positive for LONG
+    
+    active_trade['entry_prices'] = {
+        'binance': {'price': exec_price_bin, 'qty': bin_signed_qty, 'qty_unsigned': exec_qty_bin, 'implied': implied_bin_amt}, 
+        'kucoin': {'price': exec_price_kc, 'qty': kc_signed_qty, 'qty_unsigned': exec_qty_kc, 'implied': implied_kc_amt}
+    }
     active_trade['notional'] = NOTIONAL
     active_trade['averages_done'] = 0
     active_trade['final_implied_notional'] = {'bin': implied_bin_amt, 'kc': implied_kc_amt}
@@ -3225,35 +3330,106 @@ def attempt_averaging_if_needed():
             # CRITICAL FIX: Verify positions actually changed as expected
             logger.info(f"[AVERAGING] Orders reported as executed, verifying actual positions...")
             
-            # Calculate expected new cumulative positions
-            # Get current positions from active_trade
-            prev_bin_qty = 0
-            prev_kc_qty = 0
+            # CRITICAL FIX: Get contract sizes first for proper quantity calculation
             try:
-                # Try to get from entry_prices first
-                prev_bin_qty = active_trade.get('entry_prices', {}).get('binance', {}).get('qty', 0)
-                prev_kc_qty = active_trade.get('entry_prices', {}).get('kucoin', {}).get('qty', 0)
+                bin_market = get_market(binance, sym)
+                kc_market = get_market(kucoin, kc_ccxt)
+                bin_contract_size = float(bin_market.get('contractSize') or bin_market.get('info', {}).get('contractSize') or 1.0) if bin_market else 1.0
+                kc_contract_size = float(kc_market.get('contractSize') or kc_market.get('info', {}).get('contractSize') or 1.0) if kc_market else 1.0
                 
-                # If not available, fetch current positions
-                if prev_bin_qty == 0 and prev_kc_qty == 0:
-                    prev_bin_qty = _fetch_signed_binance(sym)
-                    prev_kc_qty = _fetch_signed_kucoin(kc_ccxt)
+                logger.info(f"[AVERAGING] Contract sizes: Binance={bin_contract_size}, KuCoin={kc_contract_size}")
+                logger.info(f"[AVERAGING] Executed contracts: Binance={exec_qty_bin}, KuCoin={exec_qty_kc}")
             except Exception as e:
-                logger.warning(f"[AVERAGING] Could not get previous positions, using 0: {e}")
-                prev_bin_qty = 0
-                prev_kc_qty = 0
+                logger.error(f"[AVERAGING] Failed to get contract sizes: {e}, defaulting to 1.0")
+                bin_contract_size = 1.0
+                kc_contract_size = 1.0
+            
+            # CRITICAL FIX: Get CURRENT SIGNED positions from exchange (NOT from entry_prices!)
+            # entry_prices only has initial entry data and doesn't track cumulative positions
+            prev_bin_qty = None
+            prev_kc_qty = None
+            bin_rate_limited = False
+            kc_rate_limited = False
+            
+            # Fetch Binance position
+            try:
+                prev_bin_qty = _fetch_signed_binance(sym)
+            except Exception as e:
+                error_str = str(e).lower()
+                if 'rate' in error_str or 'limit' in error_str or '429' in error_str:
+                    bin_rate_limited = True
+                    logger.warning(f"[AVERAGING] Binance rate limited when fetching position: {e}")
+                else:
+                    logger.error(f"[AVERAGING] Error fetching Binance position: {e}")
+                    send_telegram(f"*AVERAGING ABORTED* `{sym}`\n❌ Cannot fetch Binance position\n{str(e)}\n{timestamp()}")
+                    return
+            
+            # Fetch KuCoin position
+            try:
+                prev_kc_qty = _fetch_signed_kucoin(kc_ccxt)
+            except Exception as e:
+                error_str = str(e).lower()
+                if 'rate' in error_str or 'limit' in error_str or '429' in error_str:
+                    kc_rate_limited = True
+                    logger.warning(f"[AVERAGING] KuCoin rate limited when fetching position: {e}")
+                else:
+                    logger.error(f"[AVERAGING] Error fetching KuCoin position: {e}")
+                    send_telegram(f"*AVERAGING ABORTED* `{sym}`\n❌ Cannot fetch KuCoin position\n{str(e)}\n{timestamp()}")
+                    return
+            
+            # If BOTH exchanges are rate limited, skip averaging this time
+            if bin_rate_limited and kc_rate_limited:
+                logger.warning(f"[AVERAGING] ⚠️ Both exchanges rate limited, skipping averaging this cycle")
+                logger.info(f"[AVERAGING] Will retry on next averaging check")
+                return
+            
+            # If ONE is rate limited, we can still proceed if we have the other
+            # But we need both positions for cumulative calculation, so abort if either is missing
+            if bin_rate_limited or kc_rate_limited or prev_bin_qty is None or prev_kc_qty is None:
+                logger.warning(f"[AVERAGING] ⚠️ Cannot get both positions (Bin rate limited: {bin_rate_limited}, KC rate limited: {kc_rate_limited})")
+                logger.info(f"[AVERAGING] Skipping averaging this cycle, will retry later")
+                return
+            
+            logger.info(f"[AVERAGING] Current SIGNED positions before this avg: Binance={prev_bin_qty}, KuCoin={prev_kc_qty}")
+            
+            # Sanity check: positions should exist and be reasonable
+            if abs(prev_bin_qty) < 1 or abs(prev_kc_qty) < 1:
+                logger.error(f"[AVERAGING] CRITICAL: Fetched positions too small! Binance={prev_bin_qty}, KuCoin={prev_kc_qty}")
+                logger.error(f"[AVERAGING] This likely means averaging was attempted without an existing position")
+                send_telegram(f"*AVERAGING ABORTED* `{sym}`\n❌ No existing position found\nBinance={prev_bin_qty}, KuCoin={prev_kc_qty}\n{timestamp()}")
+                return
+            
+            # CRITICAL FIX: Convert executed CONTRACTS to QUANTITIES using contract_size
+            exec_bin_qty_actual = exec_qty_bin * bin_contract_size if exec_qty_bin else 0
+            exec_kc_qty_actual = exec_qty_kc * kc_contract_size if exec_qty_kc else 0
+            
+            logger.info(f"[AVERAGING] Averaging order QUANTITIES (contracts × contract_size): Binance={exec_bin_qty_actual:.2f}, KuCoin={exec_kc_qty_actual:.2f}")
             
             # Calculate expected cumulative positions after this average
             if plan == ('binance', 'kucoin'):
                 # Long binance, short kucoin
-                expected_bin_qty = prev_bin_qty + exec_qty_bin if exec_qty_bin else prev_bin_qty
-                expected_kc_qty = prev_kc_qty - exec_qty_kc if exec_qty_kc else prev_kc_qty  # More negative
+                expected_bin_qty = prev_bin_qty + exec_bin_qty_actual
+                expected_kc_qty = prev_kc_qty - exec_kc_qty_actual  # More negative
             else:
                 # Short binance, long kucoin
-                expected_bin_qty = prev_bin_qty - exec_qty_bin if exec_qty_bin else prev_bin_qty  # More negative
-                expected_kc_qty = prev_kc_qty + exec_qty_kc if exec_qty_kc else prev_kc_qty
+                expected_bin_qty = prev_bin_qty - exec_bin_qty_actual  # More negative
+                expected_kc_qty = prev_kc_qty + exec_kc_qty_actual
             
-            logger.info(f"[AVERAGING] Expected cumulative positions: Binance {expected_bin_qty}, KuCoin {expected_kc_qty}")
+            logger.info(f"[AVERAGING] Expected cumulative positions AFTER averaging: Binance={expected_bin_qty:.2f}, KuCoin={expected_kc_qty:.2f}")
+            
+            # SANITY CHECK: Expected position change should make sense (using ACTUAL quantities)
+            bin_change = abs(expected_bin_qty - prev_bin_qty)
+            kc_change = abs(expected_kc_qty - prev_kc_qty)
+            
+            if bin_change > abs(exec_bin_qty_actual) * 1.5:
+                logger.error(f"[AVERAGING] SANITY CHECK FAILED: Binance position change {bin_change:.2f} exceeds 1.5x order qty {exec_bin_qty_actual:.2f}")
+                logger.error(f"[AVERAGING] This indicates a calculation error - aborting")
+                return
+                
+            if kc_change > abs(exec_kc_qty_actual) * 1.5:
+                logger.error(f"[AVERAGING] SANITY CHECK FAILED: KuCoin position change {kc_change:.2f} exceeds 1.5x order qty {exec_kc_qty_actual:.2f}")
+                logger.error(f"[AVERAGING] This indicates a calculation error - aborting")
+                return
             
             # Wait briefly for exchange to process market orders
             logger.info(f"[AVERAGING] Waiting 12 seconds for exchange settlement...")
@@ -3385,18 +3561,21 @@ def check_take_profit_or_close_conditions():
         tp_confirm_count = 0
         return
     
-    # FIXED: Calculate current spread using the PLAN direction (not entry spread sign)
-    # For plan ('binance', 'kucoin'): long bin, short kc → use (kc_bid - bin_ask) / bin_ask
-    # For plan ('kucoin', 'binance'): short bin, long kc → use (bin_bid - kc_ask) / kc_ask
+    # CRITICAL FIX: Use EXIT spread for TP decisions (not entry spread!)
+    # When closing positions, we cross the bid-ask spread in the OPPOSITE direction from entry
+    # For plan ('binance', 'kucoin'): entered long bin/short kc → exit by selling bin at BID, buying kc at ASK
+    # For plan ('kucoin', 'binance'): entered short bin/long kc → exit by buying bin at ASK, selling kc at BID
     plan = active_trade.get('plan')
     if plan == ('binance', 'kucoin'):
-        # Long binance, short kucoin (negative spread)
-        current_spread = 100 * (kc_bid - bin_ask) / bin_ask if bin_ask > 0 else 0.0
+        # Entry direction: long bin, short kc → (kc_bid - bin_ask) / bin_ask
+        # EXIT direction: close long bin (sell at bid), close short kc (buy at ask)
+        current_spread = 100 * (kc_ask - bin_bid) / bin_bid if bin_bid > 0 else 0.0
     else:
-        # Short binance, long kucoin (positive spread)
-        current_spread = 100 * (bin_bid - kc_ask) / kc_ask if kc_ask > 0 else 0.0
+        # Entry direction: short bin, long kc → (bin_bid - kc_ask) / kc_ask
+        # EXIT direction: close short bin (buy at ask), close long kc (sell at bid)
+        current_spread = 100 * (bin_ask - kc_bid) / kc_bid if kc_bid > 0 else 0.0
     
-    logger.info("TP CHECK | sym=%s | entry_spread=%.4f%% current_spread=%.4f%%", 
+    logger.info("TP CHECK | sym=%s | entry_spread=%.4f%% current_exit_spread=%.4f%%", 
                 sym, avg_entry_spread, current_spread)
     
     # FIXED: Check for sign reversal (spread flipped direction = big profit)
@@ -3440,7 +3619,7 @@ def check_take_profit_or_close_conditions():
         # Get accumulated expenses in USD (already tracked in pure USD)
         accumulated_expenses_usd = active_trade.get('accumulated_expenses_usd', 0.0)
         
-        logger.info("TP CHECK (PURE USD) | entry=%.4f%% current=%.4f%% | Target profit: $%.4f (%.2f%% of $%.2f) | Expenses: $%.4f",
+        logger.info("TP CHECK (PURE USD) | entry=%.4f%% current_exit=%.4f%% | Target profit: $%.4f (%.2f%% of $%.2f) | Expenses: $%.4f",
                    avg_entry_spread, current_spread, target_profit_usd, target_convergence_pct, profit_base_notional, accumulated_expenses_usd)
         
         if spread_convergence >= target_convergence_pct:
