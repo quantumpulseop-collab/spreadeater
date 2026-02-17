@@ -1020,81 +1020,86 @@ def _get_signed_from_binance_pos(pos):
 
 def _get_signed_from_kucoin_pos(pos):
     """
-    CRITICAL FIX: Properly handles contract_size when reading KuCoin positions
-    Priority: currentQty > contracts×contract_size > fallback
+    ROOT CAUSE FIX: KuCoin's currentQty field = NUMBER OF CONTRACTS, NOT actual quantity!
     
-    KuCoin API may return:
-    - currentQty: Actual quantity (e.g., 160)
-    - contracts: Number of contracts (e.g., 16)
-    - contractSize: Size per contract (e.g., 10)
+    KuCoin API returns:
+    - info.currentQty: -3  ← This is CONTRACTS (e.g. 3 contracts), NOT qty (30)!
+    - pos.contracts:    3  ← CCXT standardized: also contracts
+    - info.contractSize: 10 ← Size per contract
+    - pos.contractSize: 10
     
-    We need to read currentQty first, or calculate from contracts × contractSize
+    CORRECT calculation: contracts × contractSize = actual quantity
+    e.g. 3 contracts × 10 = 30 qty
+    
+    WRONG (old approach): trusting currentQty directly = returns 3 instead of 30!
     """
     info = pos.get('info') or {}
-    
-    # STEP 1: Try to get actual quantity directly from multiple possible fields
-    # These fields contain the ACTUAL quantity (not contracts)
-    for fld in ('currentQty', 'qty', 'positionAmt', 'amount'):
-        v = info.get(fld) or pos.get(fld)
-        if v not in (None, '', '0', 0):  # Skip None, empty string, "0", or 0
+
+    # STEP 1: Get contract_size first — needed for ALL calculations
+    contract_size = 1.0
+    for k in ('contractSize', 'contract_size', 'multiplier'):
+        cs = info.get(k) or pos.get(k)
+        if cs not in (None, '', '0', 0):
             try:
-                qty = float(v)
-                if abs(qty) > 0.0001:  # Non-zero position
-                    # Already has correct sign from API
-                    return qty
-            except Exception:
-                try:
-                    qty = float(str(v).replace(',', ''))
-                    if abs(qty) > 0.0001:
-                        return qty
-                except Exception:
-                    pass
-    
-    # STEP 2: Fallback - calculate from contracts × contract_size
-    # This is needed when currentQty is not available or is zero
-    contracts = None
-    for k in ('contracts', 'size'):
-        v = pos.get(k) or info.get(k)
-        if v not in (None, '', '0', 0):
-            try:
-                contracts = float(v)
-                if abs(contracts) > 0.0001:
+                contract_size = float(cs)
+                if contract_size > 0:
                     break
             except Exception:
                 pass
-    
-    if contracts is not None and abs(contracts) > 0.0001:
-        # Get contract size from multiple possible field names
-        contract_size = 1.0
-        for k in ('contractSize', 'contract_size', 'multiplier'):
-            cs = info.get(k) or pos.get(k)
-            if cs not in (None, '', '0', 0):
+
+    # STEP 2: Get number of contracts (signed or unsigned)
+    # Priority: info.currentQty → pos.contracts → pos.size
+    # NOTE: ALL of these are in CONTRACTS, not qty — must multiply by contract_size!
+    raw_contracts = None
+
+    # Try info.currentQty (KuCoin raw field — signed contracts, e.g. -3 for short)
+    v = info.get('currentQty')
+    if v not in (None, ''):
+        try:
+            raw_contracts = float(v)
+        except Exception:
+            try:
+                raw_contracts = float(str(v).replace(',', ''))
+            except Exception:
+                pass
+
+    # Try CCXT standardised contracts field (unsigned)
+    if raw_contracts is None:
+        for k in ('contracts', 'size'):
+            v = pos.get(k) or info.get(k)
+            if v not in (None, '', '0', 0):
                 try:
-                    contract_size = float(cs)
-                    break
+                    raw_contracts = float(v)
+                    if abs(raw_contracts) > 0.0001:
+                        break
                 except Exception:
                     pass
-        
-        # Calculate actual quantity: contracts × contract_size
-        magnitude = abs(contracts) * contract_size
-        
-        # Apply sign based on side
-        side_field = ''
-        for candidate in (pos.get('side'), info.get('side'), info.get('positionSide'), info.get('type')):
-            if candidate:
-                side_field = str(candidate).lower()
-                break
-        
-        if side_field in ('short', 'sell', 'shortside'):
-            return -magnitude
-        elif side_field in ('long', 'buy', 'longside'):
-            return magnitude
-        else:
-            # Unknown side, return unsigned
-            return magnitude
-    
-    # No position found
-    return 0.0
+
+    if raw_contracts is None or abs(raw_contracts) < 0.0001:
+        return 0.0
+
+    # STEP 3: Convert contracts → actual quantity
+    actual_qty = abs(raw_contracts) * contract_size
+
+    # STEP 4: Apply sign
+    # If currentQty is negative it already tells us direction (short)
+    if raw_contracts < 0:
+        return -actual_qty
+
+    # Otherwise determine side from side field
+    side_field = ''
+    for candidate in (pos.get('side'), info.get('side'), info.get('positionSide'), info.get('type')):
+        if candidate:
+            side_field = str(candidate).lower()
+            break
+
+    if side_field in ('short', 'sell', 'shortside'):
+        return -actual_qty
+    elif side_field in ('long', 'buy', 'longside'):
+        return actual_qty
+
+    # Fallback: return unsigned
+    return actual_qty
 
 def _get_signed_position_amount(pos):
     try:
