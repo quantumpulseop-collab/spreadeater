@@ -3365,7 +3365,62 @@ def attempt_averaging_if_needed():
             kc_ccxt = resolve_kucoin_trade_symbol(kucoin, active_trade.get('ku_api') or sym + "M")
             active_trade['ku_ccxt'] = kc_ccxt
         
-        # FIXED: Use plan direction for order placement (not entry spread sign)
+        # CRITICAL FIX #1: Get CURRENT positions BEFORE executing averaging orders!
+        # This must happen BEFORE orders are placed, otherwise we'll read positions that already include the new averaging orders!
+        prev_bin_qty = None
+        prev_kc_qty = None
+        bin_rate_limited = False
+        kc_rate_limited = False
+        
+        # Fetch Binance position BEFORE averaging
+        try:
+            prev_bin_qty = _fetch_signed_binance(sym)
+        except Exception as e:
+            error_str = str(e).lower()
+            if 'rate' in error_str or 'limit' in error_str or '429' in error_str:
+                bin_rate_limited = True
+                logger.warning(f"[AVERAGING] Binance rate limited when fetching position: {e}")
+            else:
+                logger.error(f"[AVERAGING] Error fetching Binance position: {e}")
+                send_telegram(f"*AVERAGING ABORTED* `{sym}`\n❌ Cannot fetch Binance position\n{str(e)}\n{timestamp()}")
+                return
+        
+        # Fetch KuCoin position BEFORE averaging
+        try:
+            prev_kc_qty = _fetch_signed_kucoin(kc_ccxt)
+        except Exception as e:
+            error_str = str(e).lower()
+            if 'rate' in error_str or 'limit' in error_str or '429' in error_str:
+                kc_rate_limited = True
+                logger.warning(f"[AVERAGING] KuCoin rate limited when fetching position: {e}")
+            else:
+                logger.error(f"[AVERAGING] Error fetching KuCoin position: {e}")
+                send_telegram(f"*AVERAGING ABORTED* `{sym}`\n❌ Cannot fetch KuCoin position\n{str(e)}\n{timestamp()}")
+                return
+        
+        # If BOTH exchanges are rate limited, skip averaging this time
+        if bin_rate_limited and kc_rate_limited:
+            logger.warning(f"[AVERAGING] ⚠️ Both exchanges rate limited, skipping averaging this cycle")
+            logger.info(f"[AVERAGING] Will retry on next averaging check")
+            return
+        
+        # If ONE is rate limited, we can still proceed if we have the other
+        # But we need both positions for cumulative calculation, so abort if either is missing
+        if bin_rate_limited or kc_rate_limited or prev_bin_qty is None or prev_kc_qty is None:
+            logger.warning(f"[AVERAGING] ⚠️ Cannot get both positions (Bin rate limited: {bin_rate_limited}, KC rate limited: {kc_rate_limited})")
+            logger.info(f"[AVERAGING] Skipping averaging this cycle, will retry later")
+            return
+        
+        logger.info(f"[AVERAGING] Current SIGNED positions BEFORE averaging: Binance={prev_bin_qty}, KuCoin={prev_kc_qty}")
+        
+        # Sanity check: positions should exist and be reasonable
+        if abs(prev_bin_qty) < 1 or abs(prev_kc_qty) < 1:
+            logger.error(f"[AVERAGING] CRITICAL: Fetched positions too small! Binance={prev_bin_qty}, KuCoin={prev_kc_qty}")
+            logger.error(f"[AVERAGING] This likely means averaging was attempted without an existing position")
+            send_telegram(f"*AVERAGING ABORTED* `{sym}`\n❌ No existing position found\nBinance={prev_bin_qty}, KuCoin={prev_kc_qty}\n{timestamp()}")
+            return
+        
+        # Now execute averaging orders
         if plan == ('binance', 'kucoin'):
             # Long binance, short kucoin
             notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL, bin_ask, kc_bid)
@@ -3402,62 +3457,7 @@ def attempt_averaging_if_needed():
                 bin_contract_size = 1.0
                 kc_contract_size = 1.0
             
-            # CRITICAL FIX: Get CURRENT SIGNED positions from exchange (NOT from entry_prices!)
-            # entry_prices only has initial entry data and doesn't track cumulative positions
-            prev_bin_qty = None
-            prev_kc_qty = None
-            bin_rate_limited = False
-            kc_rate_limited = False
-            
-            # Fetch Binance position
-            try:
-                prev_bin_qty = _fetch_signed_binance(sym)
-            except Exception as e:
-                error_str = str(e).lower()
-                if 'rate' in error_str or 'limit' in error_str or '429' in error_str:
-                    bin_rate_limited = True
-                    logger.warning(f"[AVERAGING] Binance rate limited when fetching position: {e}")
-                else:
-                    logger.error(f"[AVERAGING] Error fetching Binance position: {e}")
-                    send_telegram(f"*AVERAGING ABORTED* `{sym}`\n❌ Cannot fetch Binance position\n{str(e)}\n{timestamp()}")
-                    return
-            
-            # Fetch KuCoin position
-            try:
-                prev_kc_qty = _fetch_signed_kucoin(kc_ccxt)
-            except Exception as e:
-                error_str = str(e).lower()
-                if 'rate' in error_str or 'limit' in error_str or '429' in error_str:
-                    kc_rate_limited = True
-                    logger.warning(f"[AVERAGING] KuCoin rate limited when fetching position: {e}")
-                else:
-                    logger.error(f"[AVERAGING] Error fetching KuCoin position: {e}")
-                    send_telegram(f"*AVERAGING ABORTED* `{sym}`\n❌ Cannot fetch KuCoin position\n{str(e)}\n{timestamp()}")
-                    return
-            
-            # If BOTH exchanges are rate limited, skip averaging this time
-            if bin_rate_limited and kc_rate_limited:
-                logger.warning(f"[AVERAGING] ⚠️ Both exchanges rate limited, skipping averaging this cycle")
-                logger.info(f"[AVERAGING] Will retry on next averaging check")
-                return
-            
-            # If ONE is rate limited, we can still proceed if we have the other
-            # But we need both positions for cumulative calculation, so abort if either is missing
-            if bin_rate_limited or kc_rate_limited or prev_bin_qty is None or prev_kc_qty is None:
-                logger.warning(f"[AVERAGING] ⚠️ Cannot get both positions (Bin rate limited: {bin_rate_limited}, KC rate limited: {kc_rate_limited})")
-                logger.info(f"[AVERAGING] Skipping averaging this cycle, will retry later")
-                return
-            
-            logger.info(f"[AVERAGING] Current SIGNED positions before this avg: Binance={prev_bin_qty}, KuCoin={prev_kc_qty}")
-            
-            # Sanity check: positions should exist and be reasonable
-            if abs(prev_bin_qty) < 1 or abs(prev_kc_qty) < 1:
-                logger.error(f"[AVERAGING] CRITICAL: Fetched positions too small! Binance={prev_bin_qty}, KuCoin={prev_kc_qty}")
-                logger.error(f"[AVERAGING] This likely means averaging was attempted without an existing position")
-                send_telegram(f"*AVERAGING ABORTED* `{sym}`\n❌ No existing position found\nBinance={prev_bin_qty}, KuCoin={prev_kc_qty}\n{timestamp()}")
-                return
-            
-            # CRITICAL FIX: Convert executed CONTRACTS to QUANTITIES using contract_size
+            # Convert executed CONTRACTS to QUANTITIES using contract_size
             exec_bin_qty_actual = exec_qty_bin * bin_contract_size if exec_qty_bin else 0
             exec_kc_qty_actual = exec_qty_kc * kc_contract_size if exec_qty_kc else 0
             
