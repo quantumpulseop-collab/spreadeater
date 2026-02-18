@@ -3043,7 +3043,7 @@ def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
         logger.info(f"[ORDER_EXEC] ✅ Position verification passed, finalizing entry...")
     
     # Finalize entry (reuse finalize_entry logic but minimal side-effects already included)
-    success = finalize_entry_postexec(sym, ku_api, kc_ccxt, entry_case, eval_info.get('trigger_spread'), exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc, notional_bin, notional_kc, eval_info.get('net_fr'), eval_info)
+    success = finalize_entry_postexec(sym, ku_api, kc_ccxt, entry_case, eval_info.get('trigger_spread'), exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc, notional_bin, notional_kc, eval_info.get('net_fr'), eval_info, current_notional)
     if success:
         # Post-entry balance snapshot
         total_post, bin_post, kc_post = get_total_futures_balance()
@@ -3055,7 +3055,7 @@ def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
         return False
 
 # We'll reuse finalize logic but as a separate function to avoid duplicate side-effects
-def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc, implied_bin, implied_kc, net_fr, eval_info):
+def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, exec_price_bin, exec_price_kc, exec_qty_bin, exec_qty_kc, implied_bin, implied_kc, net_fr, eval_info, current_notional):
     """
     FIXED: Now properly stores the entry spread with correct sign (preserving negative for negative spreads)
     so that exit logic can correctly compare spreads
