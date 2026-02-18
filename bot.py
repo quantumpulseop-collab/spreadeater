@@ -75,6 +75,15 @@ MONITOR_POLL = 2
 MAX_WORKERS = 12
 SCANNER_FULL_INTERVAL = 120
 
+# NEW FEATURES: Double notional on accumulated expense streak
+ACCUMULATED_EXPENSE_STREAK = 0  # Track consecutive accumulated expense closures
+MAX_NOTIONAL_DOUBLINGS = 3      # Maximum times to double (10 → 20 → 40 → reset)
+
+# NEW FEATURES: Cooldown after profit capture on low spread
+symbol_cooldowns = {}  # {symbol: cooldown_end_timestamp}
+PROFIT_CAPTURE_COOLDOWN_SECONDS = 600  # 10 minutes cooldown
+LOW_SPREAD_COOLDOWN_THRESHOLD = 3.0    # 3% spread threshold
+
 # Telegram (kept)
 TELEGRAM_TOKEN = "8589870096:AAHahTpg6LNXbUwUMdt3q2EqVa2McIo14h8"
 TELEGRAM_CHAT_IDS = ["5054484162", "497819952"]
@@ -165,6 +174,72 @@ logger.info("=" * 80)
 
 def timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def get_current_notional():
+    """
+    NEW FEATURE: Calculate current notional based on accumulated expense streak
+    
+    Returns multiplied notional based on consecutive accumulated expense closures:
+    - Streak 0: 1x NOTIONAL (e.g., $10)
+    - Streak 1: 2x NOTIONAL (e.g., $20) - after 1st accumulated expense
+    - Streak 2: 4x NOTIONAL (e.g., $40) - after 2nd accumulated expense
+    - Streak 3+: Reset to 1x NOTIONAL
+    """
+    global ACCUMULATED_EXPENSE_STREAK, MAX_NOTIONAL_DOUBLINGS
+    
+    if ACCUMULATED_EXPENSE_STREAK >= MAX_NOTIONAL_DOUBLINGS:
+        # Reset after 3 consecutive accumulated expenses
+        logger.info(f"[NOTIONAL] Streak reached {ACCUMULATED_EXPENSE_STREAK}, resetting to base notional")
+        return NOTIONAL
+    elif ACCUMULATED_EXPENSE_STREAK == 0:
+        # Normal notional
+        return NOTIONAL
+    else:
+        # Double for each streak level: 2^streak
+        multiplier = 2 ** ACCUMULATED_EXPENSE_STREAK
+        current_notional = NOTIONAL * multiplier
+        logger.info(f"[NOTIONAL] Accumulated expense streak: {ACCUMULATED_EXPENSE_STREAK}, using {multiplier}x notional = ${current_notional:.2f}")
+        return current_notional
+
+def is_symbol_in_cooldown(symbol):
+    """
+    NEW FEATURE: Check if symbol is in cooldown period after profit capture
+    
+    Returns True if symbol should be skipped due to cooldown
+    """
+    global symbol_cooldowns
+    
+    if symbol not in symbol_cooldowns:
+        return False
+    
+    cooldown_end = symbol_cooldowns[symbol]
+    now = datetime.now(timezone.utc).timestamp()
+    
+    if now < cooldown_end:
+        remaining = int(cooldown_end - now)
+        logger.debug(f"[COOLDOWN] {symbol} in cooldown for {remaining}s more")
+        return True
+    else:
+        # Cooldown expired, remove it
+        del symbol_cooldowns[symbol]
+        return False
+
+def set_symbol_cooldown(symbol, current_spread):
+    """
+    NEW FEATURE: Set cooldown for symbol after profit capture on low spread
+    
+    Only sets cooldown if current spread is below threshold (3%)
+    """
+    global symbol_cooldowns, PROFIT_CAPTURE_COOLDOWN_SECONDS, LOW_SPREAD_COOLDOWN_THRESHOLD
+    
+    if current_spread < LOW_SPREAD_COOLDOWN_THRESHOLD:
+        cooldown_end = datetime.now(timezone.utc).timestamp() + PROFIT_CAPTURE_COOLDOWN_SECONDS
+        symbol_cooldowns[symbol] = cooldown_end
+        logger.info(f"[COOLDOWN] {symbol} cooldown set for {PROFIT_CAPTURE_COOLDOWN_SECONDS}s (spread {current_spread:.2f}% < {LOW_SPREAD_COOLDOWN_THRESHOLD}%)")
+        send_telegram(f"*COOLDOWN SET* `{symbol}`\n📊 Spread: {current_spread:.2f}% (below {LOW_SPREAD_COOLDOWN_THRESHOLD}%)\n⏱️ Cooldown: {PROFIT_CAPTURE_COOLDOWN_SECONDS//60} minutes\n{timestamp()}")
+    else:
+        logger.info(f"[COOLDOWN] {symbol} no cooldown (spread {current_spread:.2f}% >= {LOW_SPREAD_COOLDOWN_THRESHOLD}%)")
+
 
 def send_telegram(message, chat_ids=None):
     if chat_ids is None:
@@ -2858,12 +2933,16 @@ def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
         logger.error(f"⚠️  [ENTRY_STEP_1] Leverage setting failed: {e}")
         pass
     # prepare notionals
+    # NEW FEATURE: Use streak-based notional (doubles on accumulated expense)
+    current_notional = get_current_notional()
+    logger.info(f"🧮 [ENTRY_STEP_2] Using notional: ${current_notional:.2f} (base=${NOTIONAL:.2f}, streak={ACCUMULATED_EXPENSE_STREAK})")
+    
     # choose price depending on plan for match_base exposure
     logger.info(f"🧮 [ENTRY_STEP_2] Calculating notional amounts for plan={plan}")
     print(f"🧮 Calculating order sizes for {sym}...", flush=True)
     if plan == ('binance','kucoin'):
         logger.info(f"📊 [ENTRY_STEP_2] Plan: LONG Binance @ {bin_ask}, SHORT KuCoin @ {kc_bid}")
-        notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL * initial_multiplier, bin_ask, kc_bid)
+        notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, current_notional * initial_multiplier, bin_ask, kc_bid)
         logger.info(f"✅ [ENTRY_STEP_2] Notionals: Binance=${notional_bin:.4f} KuCoin=${notional_kc:.4f}")
         results = {}
         trigger_time = datetime.now(timezone.utc)  # FIXED: Changed from datetime.UTC to timezone.utc
@@ -2871,7 +2950,7 @@ def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
         def exec_bin(): results['bin'] = safe_create_order(binance, 'buy', notional_bin, bin_ask, sym, trigger_time=trigger_time, trigger_price=bin_ask)
     else:
         logger.info(f"📊 [ENTRY_STEP_2] Plan: SHORT Binance @ {bin_bid}, LONG KuCoin @ {kc_ask}")
-        notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL * initial_multiplier, bin_bid, kc_ask)
+        notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, current_notional * initial_multiplier, bin_bid, kc_ask)
         logger.info(f"✅ [ENTRY_STEP_2] Notionals: Binance=${notional_bin:.4f} KuCoin=${notional_kc:.4f}")
         results = {}
         trigger_time = datetime.now(timezone.utc)  # FIXED: Changed from datetime.UTC to timezone.utc
@@ -3044,7 +3123,8 @@ def finalize_entry_postexec(sym, ku_api_sym, kc_ccxt_sym, case, trigger_spread, 
         'binance': {'price': exec_price_bin, 'qty': bin_signed_qty, 'qty_unsigned': exec_qty_bin, 'implied': implied_bin_amt}, 
         'kucoin': {'price': exec_price_kc, 'qty': kc_signed_qty, 'qty_unsigned': exec_qty_kc, 'implied': implied_kc_amt}
     }
-    active_trade['notional'] = NOTIONAL
+    active_trade['notional'] = NOTIONAL  # Base notional for reference
+    active_trade['initial_entry_notional'] = current_notional  # ACTUAL notional used (may be 2x or 4x due to streak)
     active_trade['averages_done'] = 0
     active_trade['final_implied_notional'] = {'bin': implied_bin_amt, 'kc': implied_kc_amt}
     active_trade['funding_accumulated_pct'] = 0.0
@@ -3421,15 +3501,20 @@ def attempt_averaging_if_needed():
             return
         
         # Now execute averaging orders
+        # CRITICAL: Use the SAME notional as the initial entry for this trade
+        # NOT the base NOTIONAL, but the actual notional used (which might be 2x or 4x due to streak)
+        initial_entry_notional = active_trade.get('initial_entry_notional', NOTIONAL)
+        logger.info(f"[AVERAGING] Using same notional as initial entry: ${initial_entry_notional:.2f}")
+        
         if plan == ('binance', 'kucoin'):
             # Long binance, short kucoin
-            notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL, bin_ask, kc_bid)
+            notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, initial_entry_notional, bin_ask, kc_bid)
             results = {}
             def exec_kc(): results['kc'] = safe_create_order(kucoin, 'sell', notional_kc, kc_bid, kc_ccxt)
             def exec_bin(): results['bin'] = safe_create_order(binance, 'buy', notional_bin, bin_ask, sym)
         else:
             # Short binance, long kucoin
-            notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, NOTIONAL, bin_bid, kc_ask)
+            notional_bin, notional_kc, _, _ = match_base_exposure_per_exchange(binance, kucoin, sym, kc_ccxt, initial_entry_notional, bin_bid, kc_ask)
             results = {}
             def exec_kc(): results['kc'] = safe_create_order(kucoin, 'buy', notional_kc, kc_ask, kc_ccxt)
             def exec_bin(): results['bin'] = safe_create_order(binance, 'sell', notional_bin, bin_bid, sym)
@@ -3912,6 +3997,33 @@ def check_take_profit_or_close_conditions():
                 )
             
             send_telegram(msg)
+            
+            # NEW FEATURE #1: Update accumulated expense streak
+            global ACCUMULATED_EXPENSE_STREAK
+            if "EXPENSE LIMIT" in exit_reason:
+                # Accumulated expense triggered - increment streak
+                ACCUMULATED_EXPENSE_STREAK += 1
+                logger.info(f"[NOTIONAL_STREAK] Accumulated expense triggered, streak now: {ACCUMULATED_EXPENSE_STREAK}")
+                
+                # Check if need to reset streak
+                if ACCUMULATED_EXPENSE_STREAK >= MAX_NOTIONAL_DOUBLINGS:
+                    send_telegram(f"*STREAK RESET* 📊\nAccumulated expense streak: {ACCUMULATED_EXPENSE_STREAK}\nResetting to base notional ${NOTIONAL:.2f}\n{timestamp()}")
+                    ACCUMULATED_EXPENSE_STREAK = 0
+                else:
+                    next_notional = NOTIONAL * (2 ** ACCUMULATED_EXPENSE_STREAK)
+                    send_telegram(f"*NOTIONAL DOUBLED* 📈\nStreak: {ACCUMULATED_EXPENSE_STREAK}\nNext trade: ${next_notional:.2f} ({2**ACCUMULATED_EXPENSE_STREAK}x)\n{timestamp()}")
+            else:
+                # Profit capture or other exit - reset streak
+                if ACCUMULATED_EXPENSE_STREAK > 0:
+                    logger.info(f"[NOTIONAL_STREAK] Profit captured after {ACCUMULATED_EXPENSE_STREAK} streak, resetting to 0")
+                    send_telegram(f"*STREAK RESET* ✅\nProfit captured! Streak was: {ACCUMULATED_EXPENSE_STREAK}\nNext trade: ${NOTIONAL:.2f} (base)\n{timestamp()}")
+                ACCUMULATED_EXPENSE_STREAK = 0
+            
+            # NEW FEATURE #2: Set cooldown if profit capture on low spread
+            if "TAKE PROFIT" in exit_reason or "SPREAD SIGN REVERSAL" in exit_reason:
+                # This is a profit capture exit
+                set_symbol_cooldown(sym, abs(exit_trigger_spread))
+            
             reset_active_trade()
             tp_confirm_count = 0
     else:
@@ -4545,6 +4657,13 @@ try:
                 if not eval_info:
                     confirm_counts[sym] = 0
                     continue
+                
+                # NEW FEATURE: Check if symbol is in cooldown after profit capture
+                if is_symbol_in_cooldown(sym):
+                    logger.info(f"[COOLDOWN] Skipping {sym} - in cooldown period after profit capture")
+                    confirm_counts[sym] = 0
+                    continue
+                
                 # Increment confirm counter
                 confirm_counts[sym] = confirm_counts.get(sym, 0) + 1
                 print(f"⏳ Confirming {sym}: {confirm_counts[sym]}/{CONFIRM_COUNT} (spread={eval_info.get('trigger_spread'):.4f}%)", flush=True)
