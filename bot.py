@@ -78,6 +78,7 @@ SCANNER_FULL_INTERVAL = 120
 # NEW FEATURES: Double notional on accumulated expense streak
 ACCUMULATED_EXPENSE_STREAK = 0  # Track consecutive accumulated expense closures
 MAX_NOTIONAL_DOUBLINGS = 3      # Maximum times to double (10 → 20 → 40 → reset)
+LAST_CLOSED_POSITION_TOTAL = None  # Track the total notional of last closed position (for proper doubling)
 
 # NEW FEATURES: Cooldown after profit capture on low spread
 symbol_cooldowns = {}  # {symbol: cooldown_end_timestamp}
@@ -179,13 +180,18 @@ def get_current_notional():
     """
     NEW FEATURE: Calculate current notional based on accumulated expense streak
     
+    CRITICAL: Uses the TOTAL notional of the last closed position (including averaging)
+    This ensures proper recovery scaling:
+    - If last trade was $10 entry + $10 averaging = $20 total → next is $40 (2x $20)
+    - NOT $20 (2x base $10)
+    
     Returns multiplied notional based on consecutive accumulated expense closures:
     - Streak 0: 1x NOTIONAL (e.g., $10)
-    - Streak 1: 2x NOTIONAL (e.g., $20) - after 1st accumulated expense
-    - Streak 2: 4x NOTIONAL (e.g., $40) - after 2nd accumulated expense
+    - Streak 1: 2x of last closed total (e.g., if last was $20 → $40)
+    - Streak 2: 4x of last closed total
     - Streak 3+: Reset to 1x NOTIONAL
     """
-    global ACCUMULATED_EXPENSE_STREAK, MAX_NOTIONAL_DOUBLINGS
+    global ACCUMULATED_EXPENSE_STREAK, MAX_NOTIONAL_DOUBLINGS, LAST_CLOSED_POSITION_TOTAL
     
     if ACCUMULATED_EXPENSE_STREAK >= MAX_NOTIONAL_DOUBLINGS:
         # Reset after 3 consecutive accumulated expenses
@@ -195,10 +201,12 @@ def get_current_notional():
         # Normal notional
         return NOTIONAL
     else:
-        # Double for each streak level: 2^streak
+        # Double based on LAST CLOSED POSITION'S TOTAL (not base NOTIONAL!)
+        # This accounts for averaging: if last trade was $10+$10=$20, next is $40 (not $20)
+        base_for_doubling = LAST_CLOSED_POSITION_TOTAL if LAST_CLOSED_POSITION_TOTAL is not None else NOTIONAL
         multiplier = 2 ** ACCUMULATED_EXPENSE_STREAK
-        current_notional = NOTIONAL * multiplier
-        logger.info(f"[NOTIONAL] Accumulated expense streak: {ACCUMULATED_EXPENSE_STREAK}, using {multiplier}x notional = ${current_notional:.2f}")
+        current_notional = base_for_doubling * multiplier
+        logger.info(f"[NOTIONAL] Accumulated expense streak: {ACCUMULATED_EXPENSE_STREAK}, last closed total: ${base_for_doubling:.2f}, using {multiplier}x = ${current_notional:.2f}")
         return current_notional
 
 def is_symbol_in_cooldown(symbol):
@@ -3654,10 +3662,16 @@ def attempt_averaging_if_needed():
                 old_total_notional = active_trade['total_notional']
                 active_trade['total_notional'] = new_total_notional
                 
+                # NOTE: initial_entry_notional is NOT updated here intentionally.
+                # Averaging always uses the same notional as the original entry (e.g. $10 each time).
+                # The TOTAL position notional (total_notional) is tracked separately and is what gets
+                # stored in LAST_CLOSED_POSITION_TOTAL at close, so accumulated expense recovery
+                # correctly doubles the full position size ($20 total → next trade $40).
+                
                 # Add the additional fees to accumulated expenses (in USD)
                 active_trade['accumulated_expenses_usd'] += total_additional_fees_dollars
                 
-                logger.info(f"AVERAGING UPDATE | New Notional: ${new_total_notional:.2f} (was ${old_total_notional:.2f}) | Additional Fees: ${total_additional_fees_dollars:.4f} (Bin: ${binance_additional_fees_dollars:.4f} + KC: ${kucoin_additional_fees_dollars:.4f}) | Total Expenses: ${active_trade['accumulated_expenses_usd']:.4f}")
+                logger.info(f"AVERAGING UPDATE | New Notional: ${new_total_notional:.2f} (was ${old_total_notional:.2f}) | initial_entry_notional unchanged: ${active_trade['initial_entry_notional']:.2f} | Additional Fees: ${total_additional_fees_dollars:.4f} (Bin: ${binance_additional_fees_dollars:.4f} + KC: ${kucoin_additional_fees_dollars:.4f}) | Total Expenses: ${active_trade['accumulated_expenses_usd']:.4f}")
                 
                 try_place_stops_after_entry(sym, kc_ccxt, exec_price_bin or None, exec_price_kc or None, None, None)
                 send_telegram(f"*AVERAGE ADDED* `{sym}` → new avg spread `{new_avg:.4f}%` (averages_done={active_trade['averages_done']})\nBin: `{exec_price_bin:.6f}` | KC: `{exec_price_kc:.6f}`\n📊 New Notional: `${new_total_notional:.2f}`\n📊 Additional Fees: `${total_additional_fees_dollars:.4f}`\n💰 Total Expenses: `${active_trade['accumulated_expenses_usd']:.4f}`\n{timestamp()}")
@@ -3999,25 +4013,32 @@ def check_take_profit_or_close_conditions():
             send_telegram(msg)
             
             # NEW FEATURE #1: Update accumulated expense streak
-            global ACCUMULATED_EXPENSE_STREAK
+            global ACCUMULATED_EXPENSE_STREAK, LAST_CLOSED_POSITION_TOTAL
+            
+            # Store the total notional of this closed position (including any averaging)
+            closed_position_total = active_trade.get('total_notional', NOTIONAL)
+            
             if "EXPENSE LIMIT" in exit_reason:
                 # Accumulated expense triggered - increment streak
                 ACCUMULATED_EXPENSE_STREAK += 1
-                logger.info(f"[NOTIONAL_STREAK] Accumulated expense triggered, streak now: {ACCUMULATED_EXPENSE_STREAK}")
+                LAST_CLOSED_POSITION_TOTAL = closed_position_total  # Store for next entry calculation
+                logger.info(f"[NOTIONAL_STREAK] Accumulated expense triggered, closed position total: ${closed_position_total:.2f}, streak now: {ACCUMULATED_EXPENSE_STREAK}")
                 
                 # Check if need to reset streak
                 if ACCUMULATED_EXPENSE_STREAK >= MAX_NOTIONAL_DOUBLINGS:
-                    send_telegram(f"*STREAK RESET* 📊\nAccumulated expense streak: {ACCUMULATED_EXPENSE_STREAK}\nResetting to base notional ${NOTIONAL:.2f}\n{timestamp()}")
+                    send_telegram(f"*STREAK RESET* 📊\nAccumulated expense streak: {ACCUMULATED_EXPENSE_STREAK}\nClosed position: ${closed_position_total:.2f}\nResetting to base notional ${NOTIONAL:.2f}\n{timestamp()}")
                     ACCUMULATED_EXPENSE_STREAK = 0
+                    LAST_CLOSED_POSITION_TOTAL = None
                 else:
-                    next_notional = NOTIONAL * (2 ** ACCUMULATED_EXPENSE_STREAK)
-                    send_telegram(f"*NOTIONAL DOUBLED* 📈\nStreak: {ACCUMULATED_EXPENSE_STREAK}\nNext trade: ${next_notional:.2f} ({2**ACCUMULATED_EXPENSE_STREAK}x)\n{timestamp()}")
+                    next_notional = closed_position_total * (2 ** ACCUMULATED_EXPENSE_STREAK)
+                    send_telegram(f"*NOTIONAL DOUBLED* 📈\nClosed position: ${closed_position_total:.2f}\nStreak: {ACCUMULATED_EXPENSE_STREAK}\nNext trade: ${next_notional:.2f} ({2**ACCUMULATED_EXPENSE_STREAK}x of ${closed_position_total:.2f})\n{timestamp()}")
             else:
                 # Profit capture or other exit - reset streak
                 if ACCUMULATED_EXPENSE_STREAK > 0:
                     logger.info(f"[NOTIONAL_STREAK] Profit captured after {ACCUMULATED_EXPENSE_STREAK} streak, resetting to 0")
                     send_telegram(f"*STREAK RESET* ✅\nProfit captured! Streak was: {ACCUMULATED_EXPENSE_STREAK}\nNext trade: ${NOTIONAL:.2f} (base)\n{timestamp()}")
                 ACCUMULATED_EXPENSE_STREAK = 0
+                LAST_CLOSED_POSITION_TOTAL = None
             
             # NEW FEATURE #2: Set cooldown if profit capture on low spread
             if "TAKE PROFIT" in exit_reason or "SPREAD SIGN REVERSAL" in exit_reason:
