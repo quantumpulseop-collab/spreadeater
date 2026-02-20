@@ -1328,6 +1328,26 @@ def close_single_exchange_position(exchange, symbol):
         qty = abs(raw_signed)
         market = get_market(exchange, symbol)
         prec = market.get('precision', {}).get('amount') if market else None
+        # BUG #1 FIX: For KuCoin, _get_signed_from_kucoin_pos returns actual qty
+        # (contracts × contractSize, e.g. 150 qty for 15 contracts × size 10).
+        # But KuCoin's create_order expects NUMBER OF CONTRACTS (e.g. 15), NOT qty.
+        # We ALWAYS divide by contract_size for KuCoin:
+        #   contractSize=10 (e.g. OMUSDT):  150 qty / 10 = 15 contracts ✅
+        #   contractSize=1  (most others):   15 qty / 1  = 15 contracts ✅ (no-op, safe)
+        # The old code did NOT divide here at all — that was the root bug.
+        if exchange.id != 'binance':
+            kc_contract_size = 1.0
+            if market:
+                cs = market.get('contractSize') or (market.get('info') or {}).get('contractSize')
+                if cs:
+                    try:
+                        kc_contract_size = float(cs)
+                    except Exception:
+                        kc_contract_size = 1.0
+            if kc_contract_size > 0:
+                contracts_qty = qty / kc_contract_size
+                logger.info(f"[BUG1_FIX] KuCoin {symbol}: qty={qty} / contract_size={kc_contract_size} = {contracts_qty} contracts to order")
+                qty = contracts_qty
         qty_rounded = round_down(qty, prec) if prec is not None else qty
         if qty_rounded > 0:
             try:
@@ -1460,7 +1480,42 @@ def close_all_and_wait(timeout_s=20, poll_interval=0.5):
             logger.exception("Error checking open positions in close_all_and_wait")
         time.sleep(poll_interval)
     closing_in_progress = False
-    logger.info("Timeout waiting for positions to close.")
+
+    # BUG #2 FIX: Determine which exchanges still have open positions after timeout.
+    # This status is used by callers to decide whether it is safe to reset active_trade.
+    bin_still_open = False
+    kc_still_open = False
+    try:
+        bin_check = binance.fetch_positions()
+        for p in bin_check:
+            qty = abs(float(_get_signed_from_binance_pos(p) or 0))
+            if qty > 0:
+                bin_still_open = True
+                logger.error(f"🚨 STILL OPEN after timeout: Binance {p.get('symbol')} has {qty} qty")
+    except Exception:
+        pass
+    try:
+        kc_check = kucoin.fetch_positions()
+        for p in kc_check:
+            qty = abs(float(_get_signed_from_kucoin_pos(p) or 0))
+            if qty > 0:
+                kc_still_open = True
+                logger.error(f"🚨 STILL OPEN after timeout: KuCoin {p.get('symbol')} has {qty} qty")
+    except Exception:
+        pass
+
+    if bin_still_open or kc_still_open:
+        logger.error(f"🚨 TIMEOUT: Positions did NOT close within {timeout_s}s! Binance_open={bin_still_open} KuCoin_open={kc_still_open}")
+        send_telegram(
+            f"🚨 *PARTIAL/FAILED CLOSE*\n"
+            f"Binance still open: `{bin_still_open}`\n"
+            f"KuCoin still open: `{kc_still_open}`\n"
+            f"⚠️ active_trade NOT reset — manual check required!\n{timestamp()}"
+        )
+        # Return special False-like sentinel so callers can detect partial close
+        return 'PARTIAL'
+    else:
+        logger.info("Timeout but positions appear closed now.")
     return False
 
 def cancel_all_open_orders_aggressive(target_sym):
@@ -1620,24 +1675,38 @@ def close_all_and_wait_with_tracking(target_sym, timeout_s=10, poll_interval=0.3
     closing_in_progress = False
     logger.error("🚨 TIMEOUT: Positions did not close within %ds after %d checks!", timeout_s, check_count)
     
-    # Log which positions are still open
+    # BUG #2 FIX: Determine which exchanges still have open positions.
+    bin_still_open = False
+    kc_still_open = False
     try:
         bin_check = binance.fetch_positions()
         for p in bin_check:
             qty = abs(float(_get_signed_from_binance_pos(p) or 0))
             if qty > 0:
-                logger.error(f"🚨 STILL OPEN: Binance {p.get('symbol')} has {qty} contracts")
+                bin_still_open = True
+                logger.error(f"🚨 STILL OPEN: Binance {p.get('symbol')} has {qty} qty")
     except Exception:
         pass
-    
     try:
         kc_check = kucoin.fetch_positions()
         for p in kc_check:
             qty = abs(float(_get_signed_from_kucoin_pos(p) or 0))
             if qty > 0:
-                logger.error(f"🚨 STILL OPEN: KuCoin {p.get('symbol')} has {qty} contracts")
+                kc_still_open = True
+                logger.error(f"🚨 STILL OPEN: KuCoin {p.get('symbol')} has {qty} qty")
     except Exception:
         pass
+
+    if bin_still_open or kc_still_open:
+        logger.error(f"🚨 PARTIAL CLOSE DETECTED: Binance_open={bin_still_open} KuCoin_open={kc_still_open} — NOT safe to reset active_trade!")
+        send_telegram(
+            f"🚨 *PARTIAL CLOSE DETECTED*\n"
+            f"Binance still open: `{bin_still_open}`\n"
+            f"KuCoin still open: `{kc_still_open}`\n"
+            f"⚠️ active_trade NOT reset — bot is blocked from new entries!\n"
+            f"Manual intervention required.\n{timestamp()}"
+        )
+        result['partial_close'] = True  # Signal to caller: do NOT reset active_trade
     
     return result
 
@@ -2897,12 +2966,64 @@ def get_total_futures_balance():
         return 0.0, 0.0, 0.0
 
 # Execute pair trade with pre/post balance snapshots and retained finalize behavior
+def check_for_orphaned_positions():
+    """
+    BUG #3 FIX: Before entering any new trade, verify that NO open positions exist
+    on either exchange. If any orphaned positions are found, block the entry.
+    
+    This prevents the scenario where:
+    1. KuCoin failed to close (Bug #1)
+    2. active_trade was wrongly reset (Bug #2)
+    3. Bot enters a NEW trade while old position still consumes margin
+    """
+    try:
+        orphaned = []
+        try:
+            bin_positions = binance.fetch_positions()
+            for p in (bin_positions or []):
+                qty = abs(float(_get_signed_from_binance_pos(p) or 0))
+                if qty > 0.001:
+                    orphaned.append(f"Binance:{p.get('symbol')}:{qty}qty")
+        except Exception as e:
+            logger.warning(f"[ORPHAN_CHECK] Error fetching Binance positions: {e}")
+        
+        try:
+            kc_positions = kucoin.fetch_positions()
+            for p in (kc_positions or []):
+                qty = abs(float(_get_signed_from_kucoin_pos(p) or 0))
+                if qty > 0.001:
+                    orphaned.append(f"KuCoin:{p.get('symbol')}:{qty}qty")
+        except Exception as e:
+            logger.warning(f"[ORPHAN_CHECK] Error fetching KuCoin positions: {e}")
+        
+        if orphaned:
+            logger.error(f"🚨 [ORPHAN_CHECK] ORPHANED POSITIONS DETECTED: {orphaned}")
+            send_telegram(
+                f"🚨 *ORPHANED POSITIONS DETECTED*\n"
+                f"{chr(10).join(orphaned)}\n"
+                f"⛔ Blocking new entry! Manual close required.\n{timestamp()}"
+            )
+            return True  # Block entry
+        
+        return False  # Safe to enter
+    except Exception as e:
+        logger.error(f"[ORPHAN_CHECK] Exception in orphan check: {e} — blocking entry to be safe")
+        return True  # If check fails, be conservative and block
+
+
 def execute_pair_trade_with_snapshots(sym, eval_info, initial_multiplier=1):
     try:
         logger.info(f"=" * 80)
         logger.info(f"🎯 [ENTRY_START] Starting execution for {sym}")
         logger.info(f"=" * 80)
         print(f"\n{'=' * 80}\n🎯 EXECUTING TRADE FOR {sym}\n{'=' * 80}", flush=True)
+        
+        # BUG #3 FIX: Check for orphaned positions before EVERY entry.
+        # This catches the case where active_trade was wrongly reset after a partial close.
+        if check_for_orphaned_positions():
+            logger.error(f"🚨 [BUG3_FIX] ENTRY BLOCKED for {sym} — orphaned positions detected!")
+            print(f"🚨 ENTRY BLOCKED: Orphaned positions exist on exchange(s). Fix manually.", flush=True)
+            return False
         
         ku_api = eval_info.get('ku_api_sym')
         plan = eval_info.get('plan')
@@ -3982,7 +4103,13 @@ def check_take_profit_or_close_conditions():
                         f"{exit_trigger_time}"
                     )
             else:
-                close_all_and_wait()
+                close_result2 = close_all_and_wait()
+                # BUG #2 FIX: Don't reset if partial close
+                if close_result2 == 'PARTIAL':
+                    logger.error("🚨 PARTIAL CLOSE (fallback path) - NOT resetting active_trade! Bot blocked from new entries.")
+                    tp_closing_in_progress = False
+                    tp_confirm_count = 0
+                    return  # Exit watcher loop without resetting — positions still open
                 # NEW: Add averaging information
                 avg_count = active_trade.get('avg_count', 0)
                 averaging_info = ""
@@ -4045,7 +4172,15 @@ def check_take_profit_or_close_conditions():
                 # This is a profit capture exit
                 set_symbol_cooldown(sym, abs(exit_trigger_spread))
             
-            reset_active_trade()
+            # BUG #2 FIX: Only reset active_trade if BOTH exchanges confirmed closed.
+            # If close_result has partial_close=True, KuCoin (or Binance) is still open.
+            # Resetting active_trade with an open position would allow a new trade entry
+            # while the orphaned position consumes margin — this is what caused the cascade.
+            _partial = isinstance(close_result, dict) and close_result.get('partial_close', False)
+            if _partial:
+                logger.error("🚨 [BUG2_FIX] Partial close detected — NOT calling reset_active_trade()! Bot is blocked from new entries until manual fix.")
+            else:
+                reset_active_trade()
             tp_confirm_count = 0
     else:
         # Reset confirmation counter if condition not met
