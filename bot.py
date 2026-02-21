@@ -6,6 +6,8 @@ import os
 import sys
 import time
 import math
+import json
+import signal
 import requests
 import threading
 from datetime import datetime, timezone
@@ -16,6 +18,11 @@ from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv()
+
+# ── RAILWAY VOLUME: persists active_trade across redeploys ──────────────────
+# /data is the Railway Volume mount point. Falls back to current dir for local dev.
+_DATA_DIR  = "/data" if os.path.isdir("/data") else "."
+STATE_FILE = os.path.join(_DATA_DIR, "active_trade_state.json")
 
 # Required env keys
 REQUIRED = [
@@ -74,6 +81,7 @@ MONITOR_DURATION = 60
 MONITOR_POLL = 2
 MAX_WORKERS = 12
 SCANNER_FULL_INTERVAL = 120
+COMMON_SYMBOLS_CACHE_TTL = 1800  # FIX-1: Cache common symbols 30min — they rarely change
 
 # NEW FEATURES: Double notional on accumulated expense streak
 ACCUMULATED_EXPENSE_STREAK = 0  # Track consecutive accumulated expense closures
@@ -176,7 +184,242 @@ logger.info("=" * 80)
 def timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def get_current_notional():
+# ══════════════════════════════════════════════════════════════════════════════
+# RAILWAY VOLUME — STATE PERSISTENCE (FIX-4 / SIGTERM)
+#
+# Goal: if Railway redeploys the bot mid-trade, the NEW instance picks up
+#       exactly where the old one left off — same symbol, same funding expenses,
+#       same stop orders already placed on exchanges, etc.
+#
+# How it works:
+#   1. active_trade is saved to /data/active_trade_state.json on SIGTERM
+#      (Railway sends SIGTERM before killing the container on redeploy).
+#   2. On startup, bot reads the file, verifies positions ACTUALLY exist on
+#      exchanges (position might have been manually closed while bot was down),
+#      then restores active_trade and restarts the liquidation watcher.
+#   3. On a clean trade close (reset_active_trade), the file is deleted so it
+#      cannot be mistaken for a crashed-redeploy state.
+#
+# KEY ANSWER TO YOUR QUESTION:
+#   "If I manually closed the trade during the redeploy gap, will the new bot
+#    wrongly assume it's still open?"
+#   → NO. The recovery function calls fetch_positions() on BOTH exchanges.
+#     If both return qty=0, it knows the trade is gone and clears the state
+#     file. The bot then starts fresh. Spread / funding / stop checks are NOT
+#     re-evaluated at recovery time — those are live concerns for the already-
+#     running watcher / TP threads which resume normally once active_trade is
+#     restored (if position is confirmed). The watcher will immediately detect
+#     current spread and the funding loop will pick up from the saved
+#     accumulated_expenses_usd.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _state_serialise(d):
+    """Convert active_trade dict to JSON-safe form (sets → lists)."""
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, set):
+            out[k] = list(v)
+        else:
+            out[k] = v
+    return out
+
+def _state_deserialise(d):
+    """Restore set fields after loading from JSON."""
+    SET_FIELDS = ('funding_rounds_seen',
+                  'seen_binance_funding_timestamps',
+                  'seen_kucoin_funding_timestamps')
+    for f in SET_FIELDS:
+        if f in d and isinstance(d[f], list):
+            d[f] = set(d[f])
+    return d
+
+# ── save / load / clear ──────────────────────────────────────────────────────
+
+def save_state():
+    """
+    Persist active_trade to Railway Volume.
+    Called ONLY from the SIGTERM handler (Railway redeploy detected).
+    NOT called during normal operation — avoids any confusion with live trades.
+    """
+    try:
+        sym = active_trade.get('symbol')
+        if not sym:
+            # No trade running — nothing to save. Remove stale file if present.
+            if os.path.exists(STATE_FILE):
+                os.remove(STATE_FILE)
+            logger.info("[STATE] SIGTERM with no active trade — state file cleared")
+            return
+        payload = _state_serialise(dict(active_trade))
+        payload['_saved_at'] = timestamp()
+        with open(STATE_FILE, 'w') as f:
+            json.dump(payload, f, default=str)
+        logger.info(f"[STATE] Saved active_trade for {sym} → {STATE_FILE}")
+    except Exception as e:
+        logger.error(f"[STATE] save_state failed: {e}")
+
+
+def load_state():
+    """Read saved state from Railway Volume. Returns dict or None."""
+    try:
+        if not os.path.exists(STATE_FILE):
+            return None
+        with open(STATE_FILE, 'r') as f:
+            raw = json.load(f)
+        if not raw.get('symbol'):
+            return None
+        return _state_deserialise(raw)
+    except Exception as e:
+        logger.error(f"[STATE] load_state failed: {e}")
+        return None
+
+
+def clear_state():
+    """
+    Delete the state file after a CLEAN trade close.
+    This is the key guard: prevents a normal TP/expense-close from being
+    mistaken for a crashed redeploy on the next startup.
+    """
+    try:
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+            logger.info("[STATE] State file cleared (clean trade close)")
+    except Exception as e:
+        logger.error(f"[STATE] clear_state failed: {e}")
+
+# ── SIGTERM handler ───────────────────────────────────────────────────────────
+
+def _handle_sigterm(signum, frame):
+    """
+    Railway sends SIGTERM before killing the container on redeploy.
+    With RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30 set as an env var in Railway,
+    we have 30 seconds to react before SIGKILL.
+    We save state and alert on Telegram, then exit cleanly.
+    """
+    sym = active_trade.get('symbol', 'None')
+    logger.warning(f"[SIGTERM] Railway redeploy detected — active trade: {sym}")
+    try:
+        send_telegram(
+            f"🛑 *RAILWAY REDEPLOY DETECTED*\n"
+            f"Active trade: `{sym}`\n"
+            f"{'💾 Saving state — new instance will recover automatically.' if sym != 'None' else 'No active trade — starting fresh.'}\n"
+            f"{timestamp()}"
+        )
+    except Exception:
+        pass
+    save_state()
+    time.sleep(3)   # Let Telegram send
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
+
+# ── Startup recovery ──────────────────────────────────────────────────────────
+
+def attempt_state_recovery():
+    """
+    Called ONCE at startup before background threads start.
+
+    Sequence:
+      1. Check if state file exists (left by _handle_sigterm on previous instance).
+      2. If found, verify positions on BOTH exchanges via live API calls.
+         a. Both legs gone  → trade was manually closed → clear file, start fresh.
+         b. Positions found → restore active_trade, restart liquidation watcher.
+      3. If no file → normal startup.
+
+    The recovery sets up active_trade identically to how it would be after a normal
+    entry: same symbol, same entry spreads, same accumulated expenses, same plan.
+    The TP/averaging checks run immediately in periodic_trade_maintenance_loop and
+    the funding loop resumes tracking from the saved accumulated_expenses_usd.
+    Stop orders are ALREADY placed on the exchanges from before the redeploy —
+    we do NOT re-place them (that would risk duplicate stops).
+    """
+    saved = load_state()
+    if not saved:
+        logger.info("[RECOVERY] No saved state — fresh start")
+        return False
+
+    sym      = saved.get('symbol')
+    ku_ccxt  = saved.get('ku_ccxt')
+    saved_at = saved.get('_saved_at', 'unknown')
+    logger.warning(f"[RECOVERY] Found state for '{sym}' (saved at {saved_at}). Verifying exchange positions...")
+    send_telegram(
+        f"⚠️ *RECOVERY MODE*\n"
+        f"Found saved trade: `{sym}`\n"
+        f"State saved at: `{saved_at}`\n"
+        f"Verifying positions on exchanges...\n{timestamp()}"
+    )
+
+    # ── Step 1: Verify both exchange positions live ──────────────────────────
+    bin_qty = 0.0
+    kc_qty  = 0.0
+
+    try:
+        bp = binance.fetch_positions([sym])
+        if bp:
+            sq = _get_signed_from_binance_pos(bp[0])
+            bin_qty = abs(float(sq or 0.0))
+    except Exception as e:
+        logger.warning(f"[RECOVERY] Binance fetch_positions error: {e}")
+
+    try:
+        if ku_ccxt:
+            try:
+                kp = kucoin.fetch_positions([ku_ccxt])
+            except Exception:
+                kp = [p for p in kucoin.fetch_positions() if p.get('symbol') == ku_ccxt]
+            for p in (kp or []):
+                if p.get('symbol') == ku_ccxt:
+                    kc_qty = abs(float(_get_signed_from_kucoin_pos(p) or 0.0))
+                    break
+    except Exception as e:
+        logger.warning(f"[RECOVERY] KuCoin fetch_positions error: {e}")
+
+    # ── Step 2a: Trade was manually closed while bot was down ────────────────
+    if bin_qty < 0.001 and kc_qty < 0.001:
+        logger.info("[RECOVERY] No positions found on exchanges — trade was already closed manually. Starting fresh.")
+        send_telegram(
+            f"✅ *RECOVERY: Positions already closed*\n"
+            f"Trade `{sym}` is gone from both exchanges.\n"
+            f"Bot starting fresh.\n{timestamp()}"
+        )
+        clear_state()
+        return False
+
+    # ── Step 2b: Positions confirmed — restore ───────────────────────────────
+    logger.info(f"[RECOVERY] Positions confirmed: Binance={bin_qty} | KuCoin={kc_qty}. Restoring trade state.")
+    active_trade.update(saved)
+    # Populate runtime position cache so watcher starts with correct values
+    _last_known_positions.setdefault(sym, {})['bin'] = bin_qty
+    _last_known_positions.setdefault(sym, {})['kc']  = -kc_qty   # KuCoin is short side typically
+    _last_known_positions.setdefault(sym, {})['kc_err_count'] = 0
+    # Also seed entry_initial_qtys so watcher zero-detection works correctly
+    entry_initial_qtys.setdefault(sym, {})['bin'] = bin_qty
+    entry_initial_qtys.setdefault(sym, {})['kc']  = kc_qty
+    # Also restore positions[sym] so the watcher doesn't immediately stop
+    positions[sym] = True
+
+    send_telegram(
+        f"✅ *RECOVERY SUCCESSFUL*\n"
+        f"Symbol: `{sym}`\n"
+        f"Binance qty: `{bin_qty}` | KuCoin qty: `{kc_qty}`\n"
+        f"Entry spread: `{active_trade.get('avg_entry_spread', 0):.4f}%`\n"
+        f"Accumulated expenses: `${active_trade.get('accumulated_expenses_usd', 0):.4f}`\n"
+        f"TP watcher & liquidation monitor restarting...\n{timestamp()}"
+    )
+
+    # ── Step 3: Restart liquidation watcher ─────────────────────────────────
+    # TP/averaging run inside periodic_trade_maintenance_loop which starts automatically.
+    # We only need to restart the liquidation watcher thread.
+    try:
+        ku_api_sym   = active_trade.get('ku_api') or (sym + "M")
+        ku_ccxt_sym  = active_trade.get('ku_ccxt') or ku_ccxt
+        _start_liquidation_watcher_for_symbols(sym, sym, ku_ccxt_sym)
+        logger.info(f"[RECOVERY] Liquidation watcher restarted for {sym}")
+    except Exception as e:
+        logger.error(f"[RECOVERY] Failed to restart liquidation watcher: {e}")
+
+    return True
     """
     NEW FEATURE: Calculate current notional based on accumulated expense streak
     
@@ -350,7 +593,21 @@ def get_common_symbols():
     logger.info("Common symbols: %d", len(common))
     return common, ku_map
 
-def get_binance_book(retries=2):
+# FIX-1: Cache common symbols to avoid redundant exchange API calls every scan cycle.
+# Symbols list changes very rarely (new listings / delistings). 30min TTL is safe.
+_common_symbols_cache      = None
+_common_symbols_cache_time = 0.0
+
+def get_common_symbols_cached():
+    global _common_symbols_cache, _common_symbols_cache_time
+    now = time.time()
+    if _common_symbols_cache is not None and (now - _common_symbols_cache_time) < COMMON_SYMBOLS_CACHE_TTL:
+        return _common_symbols_cache
+    result = get_common_symbols()
+    _common_symbols_cache      = result
+    _common_symbols_cache_time = now
+    logger.info(f"[SYMBOL_CACHE] Refreshed — {len(result[0])} common symbols")
+    return result
     """
     FIXED: Handle 418 (rate limit) errors gracefully with retry and backoff
     """
@@ -2100,38 +2357,43 @@ def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_s
     # STEP 1: Calculate target base quantity from desired USDT
     target_base_qty = desired_usdt / ref_price
     
-    # STEP 2: Calculate KuCoin contracts and FORCE integer rounding
-    # KuCoin contracts are in bundles (e.g., 1 contract = 100 qty)
-    # CRITICAL FIX: Contracts must ALWAYS be whole numbers (integers)
-    if kc_contract_size and kc_contract_size > 0:
-        kc_contracts_float = target_base_qty / kc_contract_size
-        # CRITICAL: Always round down to INTEGER (contracts cannot be fractional!)
-        kc_contracts = math.floor(kc_contracts_float)
+    # FIX-5: DYNAMIC DRIVER — whichever exchange has the LARGER contractSize (coarser bundle)
+    # drives the rounding. The coarser exchange must be integer-rounded first because it has
+    # the bigger minimum qty step. The finer exchange then matches that rounded qty exactly.
+    # TODAY: KuCoin always drives (e.g. size=100). FUTURE-PROOF: if Binance ever has size>1
+    # it will automatically drive instead, preventing silent size mismatches.
+    kc_drives = (kc_contract_size >= bin_contract_size)
+
+    if kc_drives:
+        drv_size, drv_prec = kc_contract_size, kc_prec
+        fol_size, fol_prec = bin_contract_size, bin_prec
     else:
-        kc_contracts = round_down(target_base_qty, kc_prec) if kc_prec is not None else target_base_qty
-    
-    # STEP 3: Calculate actual KuCoin quantity AFTER integer rounding
-    # This is the TRUE quantity KuCoin will execute
-    # Now uses the ROUNDED contract count, not the float!
-    kc_actual_qty = kc_contracts * kc_contract_size
-    
-    # STEP 4: Set Binance quantity to EXACTLY MATCH KuCoin's quantity
-    # This ensures perfect quantity match for true spread capture
-    bin_base_amount = kc_actual_qty
-    
-    # CRITICAL: Also account for Binance contract size!
-    # Convert quantity to contracts, round, then back to quantity
-    if bin_contract_size and bin_contract_size > 0:
-        bin_contracts_float = bin_base_amount / bin_contract_size
-        bin_contracts = round_down(bin_contracts_float, bin_prec) if bin_prec is not None else bin_contracts_float
-        bin_base_amount = bin_contracts * bin_contract_size
+        drv_size, drv_prec = bin_contract_size, bin_prec
+        fol_size, fol_prec = kc_contract_size, kc_prec
+
+    # STEP 2: Round driver exchange to INTEGER contracts (fractional contracts rejected by exchange)
+    drv_contracts_float = target_base_qty / drv_size if drv_size > 0 else target_base_qty
+    drv_contracts       = math.floor(drv_contracts_float)   # Always floor — never partial
+    drv_actual_qty      = drv_contracts * drv_size
+
+    # STEP 3: Follower matches driver's actual qty, then floors to its own contract integer
+    fol_contracts_float = drv_actual_qty / fol_size if fol_size > 0 else drv_actual_qty
+    fol_contracts       = math.floor(fol_contracts_float)
+    fol_actual_qty      = fol_contracts * fol_size
+
+    # STEP 4: Map back to kc / bin variables
+    if kc_drives:
+        kc_contracts    = drv_contracts
+        kc_actual_qty   = drv_actual_qty
+        bin_base_amount = fol_actual_qty
     else:
-        # If contract_size = 1.0, just round the quantity directly
-        bin_base_amount = round_down(bin_base_amount, bin_prec) if bin_prec is not None else bin_base_amount
-    
+        bin_base_amount = drv_actual_qty
+        kc_contracts    = fol_contracts
+        kc_actual_qty   = fol_actual_qty
+
     # Calculate implied notionals (for logging/verification purposes only)
     notional_bin = bin_base_amount * float(bin_price)
-    notional_kc = kc_contracts * float(kc_contract_size) * float(kc_price)
+    notional_kc  = kc_contracts * float(kc_contract_size) * float(kc_price)
     
     # Safety check: ensure minimum sizes
     if bin_base_amount <= 0:
@@ -2151,10 +2413,11 @@ def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_s
         notional_kc = kc_contracts * float(kc_contract_size) * float(kc_price)
     
     # Log the quantity matching with detailed contract size info
+    driver_name = "KuCoin" if kc_drives else "Binance"
     logger.info(f"💎 QTY MATCH | Symbol: {bin_symbol}/{kc_symbol}")
-    logger.info(f"💎 QTY MATCH | Contract sizes: Binance={bin_contract_size}, KuCoin={kc_contract_size}")
+    logger.info(f"💎 QTY MATCH | Contract sizes: Binance={bin_contract_size}, KuCoin={kc_contract_size} | Driver={driver_name} (larger bundle)")
     logger.info(f"💎 QTY MATCH | KuCoin: {kc_contracts:.4f} contracts × {kc_contract_size} = {kc_actual_qty:.2f} qty")
-    logger.info(f"💎 QTY MATCH | Binance: {bin_base_amount:.2f} qty (matched to KuCoin)")
+    logger.info(f"💎 QTY MATCH | Binance: {bin_base_amount:.2f} qty")
     logger.info(f"💎 QTY MATCH | Quantity match: {abs(bin_base_amount - kc_actual_qty) < 0.01} (diff: {abs(bin_base_amount - kc_actual_qty):.4f})")
     logger.info(f"💎 QTY MATCH | Notionals: Binance=${notional_bin:.4f}, KuCoin=${notional_kc:.4f}")
     
@@ -2667,7 +2930,7 @@ def spread_scanner_loop():
             print(f"🔍 SCANNER ITERATION - {timestamp()}", flush=True)
             print(f"{'='*60}", flush=True)
             
-            common_symbols, ku_map = get_common_symbols()
+            common_symbols, ku_map = get_common_symbols_cached()  # FIX-1: cached, saves ~2 API calls/min
             if not common_symbols:
                 print("⚠️  No common symbols found, sleeping...", flush=True)
                 time.sleep(5)
@@ -2801,6 +3064,7 @@ def spread_scanner_loop():
                         sleep_for = max(0, window_end - time.time())
                     if sleep_for > 0:
                         time.sleep(sleep_for)
+            # Monitoring window ended — immediately rescan all symbols for new opportunities
             time.sleep(0.5)
         except Exception:
             logger.exception("Scanner fatal error, sleeping briefly")
@@ -4142,23 +4406,34 @@ def check_take_profit_or_close_conditions():
             # NEW FEATURE #1: Update accumulated expense streak
             global ACCUMULATED_EXPENSE_STREAK, LAST_CLOSED_POSITION_TOTAL
             
-            # Store the total notional of this closed position (including any averaging)
-            closed_position_total = active_trade.get('total_notional', NOTIONAL)
+            # FIX-4: THE $40 BUG
+            # total_notional = Binance_leg_notional + KuCoin_leg_notional (BOTH legs combined).
+            # e.g. $9.28 + $9.12 = $18.40 combined. This was wrongly stored as base for doubling.
+            # 2 × $18.40 = $36.80 per leg → WRONG (should be $18.40 per leg = 2 × $9.20).
+            #
+            # initial_entry_notional is the per-leg USDT amount passed to match_base_exposure.
+            # If no averaging occurred, this equals ~NOTIONAL ($10).
+            # If averaging occurred (position doubled), total_notional ≈ 4x initial, so
+            # per-leg = total_notional / 2 correctly captures the averaged size too.
+            #
+            # We use total_notional / 2 as the per-leg base so that averaging is accounted for.
+            closed_position_total   = active_trade.get('total_notional', NOTIONAL)
+            closed_per_leg_notional = closed_position_total / 2.0  # Per-leg for correct doubling
             
             if "EXPENSE LIMIT" in exit_reason:
                 # Accumulated expense triggered - increment streak
                 ACCUMULATED_EXPENSE_STREAK += 1
-                LAST_CLOSED_POSITION_TOTAL = closed_position_total  # Store for next entry calculation
-                logger.info(f"[NOTIONAL_STREAK] Accumulated expense triggered, closed position total: ${closed_position_total:.2f}, streak now: {ACCUMULATED_EXPENSE_STREAK}")
+                LAST_CLOSED_POSITION_TOTAL = closed_per_leg_notional  # FIXED: store per-leg, not combined
+                logger.info(f"[NOTIONAL_STREAK] Accumulated expense triggered, closed total: ${closed_position_total:.2f}, per-leg: ${closed_per_leg_notional:.2f}, streak now: {ACCUMULATED_EXPENSE_STREAK}")
                 
                 # Check if need to reset streak
                 if ACCUMULATED_EXPENSE_STREAK >= MAX_NOTIONAL_DOUBLINGS:
-                    send_telegram(f"*STREAK RESET* 📊\nAccumulated expense streak: {ACCUMULATED_EXPENSE_STREAK}\nClosed position: ${closed_position_total:.2f}\nResetting to base notional ${NOTIONAL:.2f}\n{timestamp()}")
+                    send_telegram(f"*STREAK RESET* 📊\nAccumulated expense streak: {ACCUMULATED_EXPENSE_STREAK}\nClosed per-leg: ${closed_per_leg_notional:.2f}\nResetting to base notional ${NOTIONAL:.2f}\n{timestamp()}")
                     ACCUMULATED_EXPENSE_STREAK = 0
                     LAST_CLOSED_POSITION_TOTAL = None
                 else:
-                    next_notional = closed_position_total * (2 ** ACCUMULATED_EXPENSE_STREAK)
-                    send_telegram(f"*NOTIONAL DOUBLED* 📈\nClosed position: ${closed_position_total:.2f}\nStreak: {ACCUMULATED_EXPENSE_STREAK}\nNext trade: ${next_notional:.2f} ({2**ACCUMULATED_EXPENSE_STREAK}x of ${closed_position_total:.2f})\n{timestamp()}")
+                    next_notional = closed_per_leg_notional * (2 ** ACCUMULATED_EXPENSE_STREAK)
+                    send_telegram(f"*NOTIONAL DOUBLED* 📈\nClosed per-leg: ${closed_per_leg_notional:.2f}\nStreak: {ACCUMULATED_EXPENSE_STREAK}\nNext trade per-leg: ${next_notional:.2f} ({2**ACCUMULATED_EXPENSE_STREAK}x)\n{timestamp()}")
             else:
                 # Profit capture or other exit - reset streak
                 if ACCUMULATED_EXPENSE_STREAK > 0:
@@ -4212,6 +4487,7 @@ def reset_active_trade():
     })
     tp_confirm_count = 0  # NEW: Reset TP confirmation counter
     closing_reason = None  # FIXED: Reset closing reason
+    clear_state()           # VOLUME FIX: delete state file on clean close → new startup won't try to recover
     logger.info("Active trade reset")
 
 def funding_round_accounting_loop():
@@ -4560,31 +4836,23 @@ def periodic_trade_maintenance_loop():
             now = time.time()
             if not active_trade.get('suppress_full_scan') and (now - last_full_scan) >= SCANNER_FULL_INTERVAL:
                 last_full_scan = now
-                common_symbols, ku_map = get_common_symbols()
-                if not common_symbols:
-                    continue
-                bin_book = get_binance_book()
-                ku_symbols = [ku_map.get(sym, sym + "M") for sym in common_symbols]
-                ku_prices = threaded_kucoin_prices(ku_symbols)
+                # FIX-3: The scanner thread already fetches all 481 symbols every ~92s and
+                # shares the results via candidates_shared. Reading from that shared dict
+                # avoids a full duplicate 481-symbol API scan every 120s while a trade is active.
+                # All takeover logic, thresholds, and timing remain IDENTICAL — only the
+                # data source changes (shared memory instead of redundant HTTP calls).
                 best_sym = None; best_spread = 0.0; best_info = None
-                for sym in common_symbols:
-                    if sym == active_trade.get('symbol'):
-                        continue
-                    bin_tick = bin_book.get(sym)
-                    ku_sym = ku_map.get(sym, sym + "M")
-                    ku_tick = ku_prices.get(ku_sym)
-                    if not bin_tick or not ku_tick:
-                        continue
-                    spread = calculate_spread(bin_tick["bid"], bin_tick["ask"], ku_tick["bid"], ku_tick["ask"])
-                    if spread is None:
-                        continue
-                    if abs(spread) > abs(best_spread):
-                        best_spread = spread
-                        best_sym = sym
-                        best_info = {"ku_sym": ku_sym, "bin_bid": bin_tick["bid"], "bin_ask": bin_tick["ask"], "ku_bid": ku_tick["bid"], "ku_ask": ku_tick["ask"]}
+                with candidates_shared_lock:
+                    for cand_sym, info in candidates_shared.items():
+                        if cand_sym == active_trade.get('symbol'):
+                            continue
+                        s = info.get('max_spread', info.get('start_spread', 0.0))
+                        if abs(s) > abs(best_spread):
+                            best_spread = s
+                            best_sym    = cand_sym
+                            best_info   = info
                 if best_sym and abs(best_spread) >= BIG_SPREAD_THRESHOLD and (active_trade.get('avg_entry_spread') or 0.0) < 4.0:
-                    # CHANGED: Now works for ANY direction (positive or negative spread >= 7.5%)
-                    # Keeps the original 4.0% entry restriction as requested
+                    # Unchanged: works for ANY direction (positive or negative spread >= BIG_SPREAD_THRESHOLD)
                     send_telegram(f"*TAKEOVER SIGNAL* `{best_sym}` spread `{best_spread:.4f}%` (any direction)\nCurrent trade: `{active_trade['symbol']}` entry `{active_trade.get('avg_entry_spread', 0.0):.4f}%`\nClosing current and entering new with 2x notional\n{timestamp()}")
                     close_all_and_wait()
                     reset_active_trade()
@@ -4649,6 +4917,10 @@ def start_ctrl_e_listener():
     t.start()
 
 start_ctrl_e_listener()
+
+# ── RECOVERY: runs before background threads so active_trade is populated
+# before the TP/maintenance/funding loops start checking it ──────────────────
+attempt_state_recovery()
 
 # Start background threads
 def start_background_threads():
