@@ -39,7 +39,7 @@ if missing:
 
 # Config (defaults)
 NOTIONAL = float(os.getenv('NOTIONAL', "10.0"))
-LEVERAGE = int(os.getenv('LEVERAGE', "5"))
+LEVERAGE = int(os.getenv('LEVERAGE', "15"))
 WATCHER_POLL_INTERVAL = float(os.getenv('WATCHER_POLL_INTERVAL', "2.0"))  # FIXED: Increased from 0.5s to 2s to reduce API calls
 WATCHER_DETECT_CONFIRM = int(os.getenv('WATCHER_DETECT_CONFIRM', "2"))
 MAX_NOTIONAL_MISMATCH_PCT = float(os.getenv('MAX_NOTIONAL_MISMATCH_PCT', "0.5"))
